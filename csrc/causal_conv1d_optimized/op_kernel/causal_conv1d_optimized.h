@@ -305,8 +305,8 @@ __aicore__ inline void CausalConv1dOptimized<T>::WriteBackState(int32_t cacheIdx
     LocalTensor<T> ring = inBuf.Get<T>();
 
     for (int32_t pos = 0; pos < (MAX_WIDTH - 1); ++pos) {
-        // OPT2: Fixed state index - changed from (MAX_WIDTH - 2) to (MAX_WIDTH - 1)
-        const int32_t tap = (MAX_WIDTH - 1) - pos;
+        // Reverted to original logic: (MAX_WIDTH - 2)
+        const int32_t tap = (MAX_WIDTH - 2) - pos;
         const int32_t slot = (tap == 0) ? SlotCurr(lastT) : SlotHist(lastT, tap);
         const int64_t stateOffset = static_cast<int64_t>(cacheIdx) * stateLen * dim +
                                     static_cast<int64_t>(pos) * dim + c0;
