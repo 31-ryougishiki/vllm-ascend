@@ -7,7 +7,6 @@ import torch.nn.functional as F
 from vllm_ascend.ops.triton.mamba.causal_conv1d_optimized import (
     PAD_SLOT_ID,
     causal_conv1d_ref,
-    causal_conv1d_optimized_fn,
     causal_conv1d_optimized_fn_pytorch,
 )
 from vllm_ascend.utils import enable_custom_op
@@ -219,18 +218,21 @@ def test_ascend_causal_conv1d_optimized(dim, width, extra_state_len, seq_len, ha
         cache_indices=cache_indices,
         query_start_loc=query_start_loc)
 
-    # Call optimized NPU kernel
-    out = causal_conv1d_optimized_fn(
-        x,
-        weight,
-        bias=bias,
+    # Call optimized NPU kernel directly
+    x_origin = x.transpose(-1, -2)
+    weight_origin = weight.transpose(-1, -2)
+    conv_states_origin = conv_states.transpose(-1, -2)
+    out = torch.ops._C_ascend.causal_conv1d_optimized_fn(
+        x_origin,
+        weight_origin,
+        bias,
         activation=activation,
-        conv_states=conv_states,
+        conv_state=conv_states_origin,
         has_initial_state=has_initial_state_tensor,
-        cache_indices=cache_indices,
-        query_start_loc=query_start_loc,
+        non_spec_state_indices_tensor=cache_indices,
+        non_spec_query_start_loc=query_start_loc,
         pad_slot_id=PAD_SLOT_ID,
-    )
+    ).transpose(-1, -2)
 
     validate_cmp(out, out_ref, itype)
     validate_cmp(conv_states, conv_states_ref, itype)
@@ -295,17 +297,21 @@ def test_causal_conv1d_optimized(dim, width, extra_state_len, seq_len, has_bias,
         cache_indices=cache_indices,
         query_start_loc=query_start_loc)
 
-    out = causal_conv1d_optimized_fn(
-        x,
-        weight,
-        bias=bias,
+    # Call optimized NPU kernel directly
+    x_origin = x.transpose(-1, -2)
+    weight_origin = weight.transpose(-1, -2)
+    conv_states_origin = conv_states.transpose(-1, -2)
+    out = torch.ops._C_ascend.causal_conv1d_optimized_fn(
+        x_origin,
+        weight_origin,
+        bias,
         activation=activation,
-        conv_states=conv_states,
+        conv_state=conv_states_origin,
         has_initial_state=has_initial_state_tensor,
-        cache_indices=cache_indices,
-        query_start_loc=query_start_loc,
+        non_spec_state_indices_tensor=cache_indices,
+        non_spec_query_start_loc=query_start_loc,
         pad_slot_id=PAD_SLOT_ID,
-    )
+    ).transpose(-1, -2)
 
     validate_cmp(out, out_ref, itype)
     validate_cmp(conv_states, conv_states_ref, itype)
@@ -374,17 +380,20 @@ def test_causal_conv1d_optimized_compare_with_pytorch(
         query_start_loc=query_start_loc)
 
     # Get optimized kernel result
-    out_optimized = causal_conv1d_optimized_fn(
-        x,
-        weight,
-        bias=bias,
+    x_origin = x.transpose(-1, -2)
+    weight_origin = weight.transpose(-1, -2)
+    conv_states_origin = conv_states.transpose(-1, -2)
+    out_optimized = torch.ops._C_ascend.causal_conv1d_optimized_fn(
+        x_origin,
+        weight_origin,
+        bias,
         activation=activation,
-        conv_states=conv_states,
+        conv_state=conv_states_origin,
         has_initial_state=has_initial_state_tensor,
-        cache_indices=cache_indices,
-        query_start_loc=query_start_loc,
+        non_spec_state_indices_tensor=cache_indices,
+        non_spec_query_start_loc=query_start_loc,
         pad_slot_id=PAD_SLOT_ID,
-    )
+    ).transpose(-1, -2)
 
     # Validate optimized kernel matches pytorch reference
     validate_cmp(out_optimized, out_pytorch, itype)
