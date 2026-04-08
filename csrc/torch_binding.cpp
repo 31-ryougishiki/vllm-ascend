@@ -636,7 +636,7 @@ at::Tensor causal_conv1d_fn(
     const at::Tensor& mixed_qkv_non_spec_T,
     const at::Tensor& conv_weights,
     const c10::optional<at::Tensor>& bias_opt,
-    c10::string_view activation, 
+    c10::string_view activation,
     const at::Tensor& conv_state,
     const at::Tensor&  has_initial_state,
     const at::Tensor& non_spec_state_indices_tensor,
@@ -655,17 +655,55 @@ at::Tensor causal_conv1d_fn(
 
     at::Tensor output = at::empty(mixed_qkv_non_spec_T.sizes(), mixed_qkv_non_spec_T.options());
     EXEC_NPU_CMD(aclnnCausalConv1d,
-                    x,                 
+                    x,
                     weight,
-                    biasOptional,                  
-                    convStates,             
-                    queryStartLoc,                     
+                    biasOptional,
+                    convStates,
+                    queryStartLoc,
                     cacheIndices,
-                    hasInitialState,  
-                    activationMode,    
-                    padSlotId,            
+                    hasInitialState,
+                    activationMode,
+                    padSlotId,
                     output
-                ); 
+                );
+
+    return output;
+}
+
+at::Tensor causal_conv1d_optimized_fn(
+    const at::Tensor& mixed_qkv_non_spec_T,
+    const at::Tensor& conv_weights,
+    const c10::optional<at::Tensor>& bias_opt,
+    c10::string_view activation,
+    const at::Tensor& conv_state,
+    const at::Tensor&  has_initial_state,
+    const at::Tensor& non_spec_state_indices_tensor,
+    const at::Tensor& non_spec_query_start_loc,
+    int64_t  pad_slot_id)
+{
+    at::Tensor x=mixed_qkv_non_spec_T;
+    at::Tensor weight=conv_weights;
+    c10::optional<at::Tensor> biasOptional =bias_opt;
+    at::Tensor convStates= conv_state;
+    at::Tensor queryStartLoc=non_spec_query_start_loc;
+    at::Tensor cacheIndices=non_spec_state_indices_tensor;
+    at::Tensor hasInitialState=has_initial_state;
+    int64_t activationMode=(activation.empty()?0:1);
+    int64_t padSlotId=pad_slot_id;
+
+    at::Tensor output = at::empty(mixed_qkv_non_spec_T.sizes(), mixed_qkv_non_spec_T.options());
+    EXEC_NPU_CMD(aclnnCausalConv1dOptimized,
+                    x,
+                    weight,
+                    biasOptional,
+                    convStates,
+                    queryStartLoc,
+                    cacheIndices,
+                    hasInitialState,
+                    activationMode,
+                    padSlotId,
+                    output
+                );
 
     return output;
 }
@@ -894,7 +932,7 @@ TORCH_LIBRARY_EXPAND(CONCAT(_C, _ascend), ops)
         "Tensor out_is_masked_token_mask, Tensor out_new_token_indices, Tensor out_hidden_state_mapping)"
     );
     ops.impl("npu_copy_and_expand_eagle_inputs", torch::kPrivateUse1, &vllm_ascend::npu_copy_and_expand_eagle_inputs);
-    // causal_conv1d_fn    
+    // causal_conv1d_fn
     ops.def(
         "causal_conv1d_fn(Tensor mixed_qkv_non_spec_T, "
         "                         Tensor conv_weights, "
@@ -906,6 +944,18 @@ TORCH_LIBRARY_EXPAND(CONCAT(_C, _ascend), ops)
         "                         Tensor non_spec_query_start_loc, "
         "                         int pad_slot_id) -> (Tensor output)");
     ops.impl("causal_conv1d_fn", torch::kPrivateUse1, &vllm_ascend::causal_conv1d_fn);
+    // causal_conv1d_optimized_fn
+    ops.def(
+        "causal_conv1d_optimized_fn(Tensor mixed_qkv_non_spec_T, "
+        "                         Tensor conv_weights, "
+        "                         Tensor? bias_opt, "
+        "                         str activation, "
+        "                         Tensor conv_state, "
+        "                         Tensor has_initial_state, "
+        "                         Tensor non_spec_state_indices_tensor, "
+        "                         Tensor non_spec_query_start_loc, "
+        "                         int pad_slot_id) -> (Tensor output)");
+    ops.impl("causal_conv1d_optimized_fn", torch::kPrivateUse1, &vllm_ascend::causal_conv1d_optimized_fn);
     ops.def(
         "moe_grouped_matmul("
             "Tensor x,"
