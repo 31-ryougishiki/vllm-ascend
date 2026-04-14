@@ -37,7 +37,7 @@ struct Qwen3NextQKVPreprocessTilingData {
     float epsilon;
 };
 
-constexpr uint32_t QQBUFFER_NUM = 2;
+constexpr uint32_t QBUFFER_NUM = 2;
 
 template <typename T>
 class KernelQwen3NextQKVPreprocess {
