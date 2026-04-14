@@ -3,13 +3,19 @@
  * This file is a part of the CANN Open Software.
  * Licensed under CANN Open Software License Agreement Version 1.0 (the "License").
  * Please refer to the License for the details. You may not use this file except in compliance with the License.
- * THIS SOFTWARE IS PROVIDED ON AN "AS IS" BASIS, WITHOUT WARRANTIES OF ANY KIND, EITHER EXPRESS OR IMPLIED,
- * INCLUDING BUT NOT LIMITED TO NON-INFRINGEMENT, MERCHANTABILITY, OR FITNESS FOR A PARTICULAR PURPOSE.
- * See LICENSE in the root of the software repository for the full text of the License.
+ * THIS SOFTWARE IS PROVIDED ON AN "AS IS" BASIS, WITHOUT WARRANTIES OF ANY KIND, EITHER
+ * INCLUDING BUT NOT LIMITED TO NON-INFRINGEMENT, MERCHANTABILITY, OR FITNESS FOR A PARTICULAR
+ * PURPOSE. See LICENSE in the root of the software repository for the full text of the License.
+ */
+
+/*!
+ * \file qwen3_next_qkv_preprocess_tiling.cpp
+ * \brief Tiling strategy for Qwen3NextQKVPreprocess
  */
 
 #include "qwen3_next_qkv_preprocess_tiling.h"
 #include "log/ops_log.h"
+#include "error_log.h"
 #include "tiling/platform/platform_ascendc.h"
 
 namespace optiling {
@@ -49,7 +55,7 @@ static bool CheckInputOutputShape(const gert::TilingContext* context)
     OP_CHECK_NULL_WITH_CONTEXT(context, qkv_shape);
     OP_CHECK_NULL_WITH_CONTEXT(context, output_shape);
 
-    size_t qkvDimNum = qkv_shape->GetDimNum();
+    size_t qkvDimNum = qkv_shape->GetStorageShape().GetDimNum();
     OP_CHECK_IF(
         qkvDimNum < 2,
         OP_LOGE(context, "QKV tensor must have at least 2 dimensions."),
@@ -68,7 +74,6 @@ static void GetCompileParameters(
         numCore = ascendc_platform.GetCoreNumAiv();
         ascendc_platform.GetCoreMemSize(platform_ascendc::CoreMemType::UB, ubSize);
     } else {
-        // Use default values if compile info is not available
         auto ascendc_platform = platform_ascendc::PlatformAscendC(context->GetPlatformInfo());
         qwen3NextQKVPreprocessSocVersion = ascendc_platform.GetSocVersion();
         numCore = ascendc_platform.GetCoreNumAiv();
@@ -88,15 +93,12 @@ static void CalculateTilingParameters(
     uint32_t qkvSize = qkv_shape.GetDim(qkv_shape.GetDimNum() - 1);
     uint32_t hiddenSize = output_shape.GetDim(output_shape.GetDimNum() - 1);
 
-    // These values should come from model configuration passed via attributes
-    // For now, we use placeholder values that need to be set by the caller
     auto attrs = context->GetAttrs();
     float epsilon = 1e-6f;
-    if (attrs != nullptr && attrs->GetSize() > 0) {
+    if (attrs != nullptr) {
         epsilon = *attrs->GetFloat(0);
     }
 
-    // Calculate block distribution
     uint32_t blockFactor = 1;
     uint32_t tokensPerCore = CeilDiv(numTokens, numCore);
     blockFactor = tokensPerCore;
@@ -105,23 +107,23 @@ static void CalculateTilingParameters(
     tiling->set_block_dim(numCore);
     tiling->set_epsilon(epsilon);
 
-    OP_LOGI(context, "Tiling: numTokens=%u, qkvSize=%u, hiddenSize=%u, blockDim=%u",
-            numTokens, qkvSize, hiddenSize, numCore);
+    OPS_LOG_I(context, "Tiling: numTokens=%u, qkvSize=%u, hiddenSize=%u, blockDim=%u",
+              numTokens, qkvSize, hiddenSize, numCore);
 }
 
 static void SaveTilingData(
     gert::TilingContext* context, Qwen3NextQKVPreprocessTilingData* tiling, uint32_t dtypeKey)
 {
-    // Use dtype key as part of tiling key
-    uint32_t tilingKey = dtypeKey * 10;  // Base tiling key
+    uint32_t tilingKey = dtypeKey * 10;
     context->SetTilingKey(tilingKey);
-    tiling->SaveToBuffer(context->GetRawTilingData()->GetData(), context->GetRawTilingData()->GetCapacity());
+    uint8_t* tilingData = reinterpret_cast<uint8_t*>(context->GetRawTilingData()->GetData());
+    tiling->SaveToBuffer(tilingData, context->GetRawTilingData()->GetCapacity());
     context->GetRawTilingData()->SetDataSize(tiling->GetDataSize());
 }
 
 static void SetWorkspaceSize(gert::TilingContext* context)
 {
-    constexpr size_t sysWorkspaceSize = 16 * 1024 * 1024;  // 16MB
+    constexpr size_t sysWorkspaceSize = 16 * 1024 * 1024;
     constexpr size_t usrSize = 256;
     size_t* currentWorkspace = context->GetWorkspaceSizes(1);
     currentWorkspace[0] = usrSize + sysWorkspaceSize;
@@ -141,7 +143,6 @@ static ge::graphStatus Tiling4Qwen3NextQKVPreprocess(gert::TilingContext* contex
     OP_LOGI("Tiling4Qwen3NextQKVPreprocess", "Enter Tiling4Qwen3NextQKVPreprocess");
     OPS_LOG_D(context, "Tiling4Qwen3NextQKVPreprocess running.");
 
-    // Check input/output shape
     OP_CHECK_IF(
         !CheckInputOutputShape(context),
         OP_LOGE(context, "Input shape invalid."),
@@ -153,16 +154,13 @@ static ge::graphStatus Tiling4Qwen3NextQKVPreprocess(gert::TilingContext* contex
     uint64_t ubSize;
     GetCompileParameters(context, numCore, ubSize);
 
-    // Set data type parameters
     uint32_t dtypeKey;
     uint32_t dataPerBlock;
     ge::DataType dataType = context->GetInputDesc(0)->GetDataType();
     SetByDtype(dataType, dtypeKey, dataPerBlock);
 
-    // Calculate tiling parameters
     CalculateTilingParameters(context, &tiling, numCore);
 
-    // Save tiling data
     SaveTilingData(context, &tiling, dtypeKey);
     SetWorkspaceSize(context);
     LogTilingResults(context, &tiling, dtypeKey);
