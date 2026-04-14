@@ -13,10 +13,10 @@
  * \brief Tiling strategy for Qwen3NextQKVPreprocess
  */
 
-#include "qwen3_next_qkv_preprocess_tiling.h"
 #include "log/ops_log.h"
-#include "error_log.h"
-#include "tiling/platform/platform_ascendc.h"
+#include "../tiling_base/tiling_templates_registry.h"
+#include "../tiling_base/tiling_util.h"
+#include "qwen3_next_qkv_preprocess_tiling.h"
 
 namespace optiling {
 
@@ -67,7 +67,7 @@ static bool CheckInputOutputShape(const gert::TilingContext* context)
 static void GetCompileParameters(
     gert::TilingContext* context, uint32_t& numCore, uint64_t& ubSize)
 {
-    auto ptrCompileInfo = reinterpret_cast<const void*>(context->GetCompileInfo());
+    auto ptrCompileInfo = context->GetCompileInfo<void>();
     if (ptrCompileInfo == nullptr) {
         auto ascendc_platform = platform_ascendc::PlatformAscendC(context->GetPlatformInfo());
         qwen3NextQKVPreprocessSocVersion = ascendc_platform.GetSocVersion();
@@ -182,6 +182,8 @@ static ge::graphStatus TilingPrepare4Qwen3NextQKVPreprocess(gert::TilingParseCon
     return ge::GRAPH_SUCCESS;
 }
 
-IMPL_OP_OPTILING(Qwen3NextQKVPreprocess).Tiling(Tiling4Qwen3NextQKVPreprocess).TilingParse<void>(TilingPrepare4Qwen3NextQKVPreprocess);
+IMPL_OP_OPTILING(Qwen3NextQKVPreprocess)
+    .Tiling(Tiling4Qwen3NextQKVPreprocess)
+    .TilingParse<void>(TilingPrepare4Qwen3NextQKVPreprocess);
 
 }  // namespace optiling
