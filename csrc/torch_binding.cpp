@@ -42,6 +42,7 @@
 #include "moe_gating_top_k/moe_gating_top_k_torch_adpt.h"
 #include "moe_init_routing_custom/moe_init_routing_custom_torch_adpt.h"
 #include "sparse_flash_attention/sparse_flash_attention_torch_adpt.h"
+#include "qwen3_next_qkv_preprocess/qwen3_next_qkv_preprocess_torch_adpt.h"
 #include <c10/core/Device.h>
 #include <c10/util/Exception.h>
 #include <c10/util/Logging.h>
@@ -968,4 +969,24 @@ TORCH_LIBRARY_EXPAND(CONCAT(_C, _ascend), ops)
         "-> Tensor[]"
     );
     ops.impl("moe_grouped_matmul", torch::kPrivateUse1,&vllm_ascend::moe_grouped_matmul);
+
+    ops.def(
+        "npu_qwen3_next_qkv_preprocess(Tensor hiddenStates, "
+        "Tensor qNormWeight, "
+        "Tensor kNormWeight, "
+        "Tensor qCos, "
+        "Tensor qSin, "
+        "Tensor kCos, "
+        "Tensor kSin, "
+        "float epsilon=1e-6, "
+        "int numTokens=0, "
+        "int numHeads=0, "
+        "int numKvHeads=0, "
+        "int headDim=0, "
+        "int qSize=0, "
+        "int kvSize=0, "
+        "int qkvSize=0, "
+        "bool attnOutputGate=False) -> (Tensor qOut, Tensor kOut, Tensor vOut, Tensor gateOut)"
+    );
+    ops.impl("npu_qwen3_next_qkv_preprocess", torch::kPrivateUse1, &vllm_ascend::npu_qwen3_next_qkv_preprocess);
 }
