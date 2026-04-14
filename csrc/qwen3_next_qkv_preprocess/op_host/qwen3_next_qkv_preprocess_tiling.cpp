@@ -89,7 +89,6 @@ static void CalculateTilingParameters(
 
     // Read all shape and attribute parameters from op attributes
     auto attrs = context->GetAttrs();
-    OP_CHECK_NULL_WITH_CONTEXT(context, attrs);
 
     float epsilon = 1e-6f;
     uint32_t numHeads = 0;
