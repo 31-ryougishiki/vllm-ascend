@@ -48,7 +48,7 @@ namespace ops {
 
 static ge::graphStatus InferShape4Qwen3NextQKVPreprocess(gert::InferShapeContext* context)
 {
-    OP_LOGD(context, "Begin InferShape4Qwen3NextQKVPreprocess");
+    OPS_LOG_D(context, "Begin InferShape4Qwen3NextQKVPreprocess");
 
     // Get input shape
     const gert::Shape* qkvShape = context->GetInputShape(0);
@@ -100,7 +100,7 @@ static ge::graphStatus InferShape4Qwen3NextQKVPreprocess(gert::InferShapeContext
         gateOutShape->SetDim(0, 0);
     }
 
-    OP_LOGD(context, "InferShape done: qOut=[%ld, %ld], kOut=[%ld, %ld], "
+    OPS_LOG_D(context, "InferShape done: qOut=[%ld, %ld], kOut=[%ld, %ld], "
             "vOut=[%ld, %ld], gateOut=%s",
             numTokens, qSize, numTokens, kvSize, numTokens, kvSize,
             attnOutputGate != 0 ? "[numTokens, qSize]" : "[]");
