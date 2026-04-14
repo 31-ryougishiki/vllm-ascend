@@ -166,8 +166,9 @@ __aicore__ inline void ReduceSumFP32(
     if (g_coreType == AIV) {
         WholeReduceSum<float, false>(dst_local, work_local, MASK_PLACEHOLDER, 1, 0, 1, 0);
     }
-#elif !(defined(__NPU_ARCH__) && __NPU_ARCH__ == 3003)
-    WholeReduceSum<float, false>(dst_local, work_local, MASK_PLACEHOLDER, 1, 1, 1, DEFAULT_REPEAT_STRIDE);
+#else
+    // For ascend910b and other architectures, use BlockReduceSum for intra-core reduction
+    BlockReduceSum(dst_local, work_local, 1, mask, 1, 1, DEFAULT_REPEAT_STRIDE);
 #endif
     PipeBarrier<PIPE_V>();
 }
