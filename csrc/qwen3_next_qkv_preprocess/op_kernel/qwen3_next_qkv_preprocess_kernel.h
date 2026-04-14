@@ -69,7 +69,7 @@ public:
         blockIdx_ = GetBlockIdx();
 
         // Work distribution across cores
-        uint32_t tokensPerCore = CeilDiv(numTokens, GetBlockNum());
+        uint32_t tokensPerCore = CeilDiv(numTokens, static_cast<uint32_t>(GetBlockNum()));
         this->startToken = blockIdx_ * tokensPerCore;
         this->endToken = startToken + tokensPerCore;
         if (this->endToken > numTokens) {
@@ -251,12 +251,7 @@ private:
             PipeBarrier<PIPE_V>();
 
             // Cast result back to T
-            if constexpr (is_same<T, float>::value) {
-                // Already float, copy directly
-                DataCopyCustom<T>(qNormLocal[headOffset], qNormBuf, headDim);
-            } else {
-                Cast(qNormLocal[headOffset], qNormBuf, RoundMode::CAST_NONE, headDim);
-            }
+            Cast(qNormLocal[headOffset], qNormBuf, RoundMode::CAST_NONE, headDim);
             PipeBarrier<PIPE_V>();
         }
 
@@ -324,11 +319,7 @@ private:
             PipeBarrier<PIPE_V>();
 
             // Cast result back to T
-            if constexpr (is_same<T, float>::value) {
-                DataCopyCustom<T>(kNormLocal[headOffset], kNormBuf, headDim);
-            } else {
-                Cast(kNormLocal[headOffset], kNormBuf, RoundMode::CAST_NONE, headDim);
-            }
+            Cast(kNormLocal[headOffset], kNormBuf, RoundMode::CAST_NONE, headDim);
             PipeBarrier<PIPE_V>();
         }
 
@@ -390,11 +381,7 @@ private:
             PipeBarrier<PIPE_V>();
 
             // Cast result back to T and copy to output
-            if constexpr (is_same<T, float>::value) {
-                DataCopyCustom<T>(qRotLocal[baseOffset], qBuf[baseOffset], headDim);
-            } else {
-                Cast(qRotLocal[baseOffset], qBuf[baseOffset], RoundMode::CAST_NONE, headDim);
-            }
+            Cast(qRotLocal[baseOffset], qBuf[baseOffset], RoundMode::CAST_NONE, headDim);
             PipeBarrier<PIPE_V>();
         }
 
@@ -453,11 +440,7 @@ private:
             PipeBarrier<PIPE_V>();
 
             // Cast result back to T
-            if constexpr (is_same<T, float>::value) {
-                DataCopyCustom<T>(kRotLocal[baseOffset], kBuf[baseOffset], headDim);
-            } else {
-                Cast(kRotLocal[baseOffset], kBuf[baseOffset], RoundMode::CAST_NONE, headDim);
-            }
+            Cast(kRotLocal[baseOffset], kBuf[baseOffset], RoundMode::CAST_NONE, headDim);
             PipeBarrier<PIPE_V>();
         }
 
