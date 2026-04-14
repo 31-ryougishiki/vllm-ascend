@@ -54,7 +54,7 @@ public:
     __aicore__ inline void Init(
         GM_ADDR qkv, GM_ADDR qNormWeight, GM_ADDR kNormWeight,
         GM_ADDR qCos, GM_ADDR qSin, GM_ADDR kCos, GM_ADDR kSin,
-        GM_ADDR qOut, GM_ADDR kOut, GM_ADDR vOut, GM_ADDR gateOut,
+        GM_ADDR gate, GM_ADDR qOut, GM_ADDR kOut, GM_ADDR vOut, GM_ADDR gateOut,
         const Qwen3NextQKVPreprocessTilingData* tiling)
     {
         ASSERT(GetBlockNum() != 0 && "Block dim can not be zero!");
@@ -83,13 +83,13 @@ public:
 
         // Global buffers
         qkvGm.SetGlobalBuffer((__gm__ T*)qkv + startToken * qkvSize, tokenWork * qkvSize);
+        if (attnOutputGate) {
+            gateGm.SetGlobalBuffer((__gm__ T*)gate + startToken * qSize, tokenWork * qSize);
+            gateOutGm.SetGlobalBuffer((__gm__ T*)gateOut + startToken * qSize, tokenWork * qSize);
+        }
         qOutGm.SetGlobalBuffer((__gm__ T*)qOut + startToken * qSize, tokenWork * qSize);
         kOutGm.SetGlobalBuffer((__gm__ T*)kOut + startToken * kvSize, tokenWork * kvSize);
         vOutGm.SetGlobalBuffer((__gm__ T*)vOut + startToken * kvSize, tokenWork * kvSize);
-
-        if (attnOutputGate) {
-            gateOutGm.SetGlobalBuffer((__gm__ T*)gateOut + startToken * qSize, tokenWork * qSize);
-        }
 
         // RMSNorm weights - shape [headDim]
         qNormWeightGm.SetGlobalBuffer((__gm__ T*)qNormWeight, headDim);
@@ -153,24 +153,24 @@ private:
         uint32_t qkvOffset = tokenIdx * qkvSize;
 
         if (attnOutputGate) {
-            // QKV layout when attnOutputGate=true: [q_gate(2*qSize), k(kvSize), v(kvSize)]
-            // q occupies first qSize elements, gate occupies second qSize elements
+            // QKV layout when attnOutputGate=true: [q(qSize), k(kvSize), v(kvSize)]
+            // gate comes from separate input
 
             LocalTensor<T> qLocal = inQueueQkv.AllocTensor<T>();
             DataCopyCustom<T>(qLocal, qkvGm[qkvOffset], qSize);
             inQueueQkv.EnQue(qLocal);
 
             LocalTensor<T> gateLocal = inQueueGate.AllocTensor<T>();
-            DataCopyCustom<T>(gateLocal, qkvGm[qkvOffset + qSize], qSize);
+            DataCopyCustom<T>(gateLocal, gateGm[tokenIdx * qSize], qSize);
             inQueueGate.EnQue(gateLocal);
 
             LocalTensor<T> kLocal = inQueueQkv.AllocTensor<T>();
-            DataCopyCustom<T>(kLocal, qkvGm[qkvOffset + qSize * 2], kvSize);
+            DataCopyCustom<T>(kLocal, qkvGm[qkvOffset + qSize], kvSize);
             inQueueQkv.EnQue(kLocal);
 
             // V goes to outQueueV directly - no processing needed
             LocalTensor<T> vLocal = outQueueV.AllocTensor<T>();
-            DataCopyCustom<T>(vLocal, qkvGm[qkvOffset + qSize * 2 + kvSize], kvSize);
+            DataCopyCustom<T>(vLocal, qkvGm[qkvOffset + qSize + kvSize], kvSize);
             outQueueV.EnQue(vLocal);
         } else {
             // QKV layout when attnOutputGate=false: [q(qSize), k(kvSize), v(kvSize)]
@@ -501,6 +501,7 @@ private:
 
     // Global tensors
     GlobalTensor<T> qkvGm;
+    GlobalTensor<T> gateGm;       // external gate input (when attnOutputGate=true)
     GlobalTensor<T> qOutGm;
     GlobalTensor<T> kOutGm;
     GlobalTensor<T> vOutGm;

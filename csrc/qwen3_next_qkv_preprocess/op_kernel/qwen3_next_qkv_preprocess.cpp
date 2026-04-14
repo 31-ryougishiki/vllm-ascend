@@ -16,14 +16,14 @@ using namespace AscendC;
     do {                                       \
         templateClass<__VA_ARGS__> op(&pipe);  \
         op.Init(qkv, qNormWeight, kNormWeight, qCos, qSin, kCos, kSin, \
-                qOut, kOut, vOut, gateOut, &tilingData);   \
+                gate, qOut, kOut, vOut, gateOut, &tilingData);   \
         op.Process();                          \
     } while (0)
 
 extern "C" __global__ __aicore__ void qwen3_next_qkv_preprocess(
     GM_ADDR qkv, GM_ADDR qNormWeight, GM_ADDR kNormWeight,
     GM_ADDR qCos, GM_ADDR qSin, GM_ADDR kCos, GM_ADDR kSin,
-    GM_ADDR qOut, GM_ADDR kOut, GM_ADDR vOut, GM_ADDR gateOut,
+    GM_ADDR gate, GM_ADDR qOut, GM_ADDR kOut, GM_ADDR vOut, GM_ADDR gateOut,
     GM_ADDR workspace, GM_ADDR tiling)
 {
     TPipe pipe;
