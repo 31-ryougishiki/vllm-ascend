@@ -118,22 +118,22 @@ static void CalculateTilingParameters(
 
     uint32_t tokensPerCore = CeilDiv(numTokens, numCore);
 
-    tiling->set_num_tokens(numTokens);
-    tiling->set_num_heads(numHeads);
-    tiling->set_num_kv_heads(numKvHeads);
-    tiling->set_head_dim(headDim);
-    tiling->set_q_size(qSize);
-    tiling->set_kv_size(kvSize);
-    tiling->set_hidden_size(hiddenSize);
-    tiling->set_qkv_size(qSize * 2 + kvSize * 2);  // attnOutputGate=true layout
-    tiling->set_block_dim(numCore);
-    tiling->set_attn_output_gate(attnOutputGate);
+    tiling->set_numTokens(numTokens);
+    tiling->set_numHeads(numHeads);
+    tiling->set_numKvHeads(numKvHeads);
+    tiling->set_headDim(headDim);
+    tiling->set_qSize(qSize);
+    tiling->set_kvSize(kvSize);
+    tiling->set_hiddenSize(hiddenSize);
+    tiling->set_qkvSize(qSize * 2 + kvSize * 2);  // attnOutputGate=true layout
+    tiling->set_blockDim(numCore);
+    tiling->set_attnOutputGate(attnOutputGate);
     tiling->set_epsilon(epsilon);
 
     OPS_LOG_I(context, "Tiling: numTokens=%u, numHeads=%u, numKvHeads=%u, headDim=%u, "
               "qSize=%u, kvSize=%u, qkvSize=%u, attnOutputGate=%u, blockDim=%u",
               numTokens, numHeads, numKvHeads, headDim, qSize, kvSize,
-              tiling->get_qkv_size(), attnOutputGate, numCore);
+              tiling->get_qkvSize(), attnOutputGate, numCore);
 }
 
 static void SaveTilingData(
@@ -158,12 +158,12 @@ static void LogTilingResults(
     gert::TilingContext* context, Qwen3NextQKVPreprocessTilingData* tiling, uint32_t dtypeKey)
 {
     OPS_LOG_I(context, "Tiling Key: %u", dtypeKey * 10);
-    OPS_LOG_I(context, "Block Dim: %u", tiling->get_block_dim());
+    OPS_LOG_I(context, "Block Dim: %u", tiling->get_blockDim());
     OPS_LOG_I(context, "numTokens: %u, numHeads: %u, numKvHeads: %u, headDim: %u, "
               "qSize: %u, kvSize: %u, attnOutputGate: %u, epsilon: %f",
-              tiling->get_num_tokens(), tiling->get_num_heads(), tiling->get_num_kv_heads(),
-              tiling->get_head_dim(), tiling->get_q_size(), tiling->get_kv_size(),
-              tiling->get_attn_output_gate(), tiling->get_epsilon());
+              tiling->get_numTokens(), tiling->get_numHeads(), tiling->get_numKvHeads(),
+              tiling->get_headDim(), tiling->get_qSize(), tiling->get_kvSize(),
+              tiling->get_attnOutputGate(), tiling->get_epsilon());
 }
 
 static ge::graphStatus Tiling4Qwen3NextQKVPreprocess(gert::TilingContext* context)
