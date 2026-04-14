@@ -16,6 +16,7 @@
 using namespace AscendC;
 
 // Tiling data structure for Qwen3Next QKV Preprocessing
+// Must match the host-side Qwen3NextQKVPreprocessTilingData exactly (binary-compatible)
 struct Qwen3NextQKVPreprocessTilingData {
     uint32_t numTokens;
     uint32_t numHeads;
@@ -23,6 +24,7 @@ struct Qwen3NextQKVPreprocessTilingData {
     uint32_t headDim;
     uint32_t qSize;
     uint32_t kvSize;
+    uint32_t hiddenSize;   // must match host struct field order (between kvSize and qkvSize)
     uint32_t qkvSize;
     uint32_t blockDim;
     uint32_t attnOutputGate;  // 0 or 1
@@ -30,7 +32,6 @@ struct Qwen3NextQKVPreprocessTilingData {
 };
 
 constexpr uint32_t BUFFER_NUM = 2;
-constexpr uint32_t REDUCE_LEN = 64;
 
 template <typename T>
 class KernelQwen3NextQKVPreprocess {
@@ -69,7 +70,7 @@ public:
         }
         this->tokenWork = endToken - startToken;
 
-        // Global buffers - offset is in elements for 1D tensors
+        // Global buffers
         qkvGm.SetGlobalBuffer((__gm__ T*)qkv + startToken * qkvSize, tokenWork * qkvSize);
         qOutGm.SetGlobalBuffer((__gm__ T*)qOut + startToken * qSize, tokenWork * qSize);
         kOutGm.SetGlobalBuffer((__gm__ T*)kOut + startToken * kvSize, tokenWork * kvSize);
@@ -79,38 +80,48 @@ public:
             gateOutGm.SetGlobalBuffer((__gm__ T*)gateOut + startToken * qSize, tokenWork * qSize);
         }
 
-        // RMSNorm weights
+        // RMSNorm weights - shape [headDim]
         qNormWeightGm.SetGlobalBuffer((__gm__ T*)qNormWeight, headDim);
         kNormWeightGm.SetGlobalBuffer((__gm__ T*)kNormWeight, headDim);
 
-        // Rotary embeddings: (numPositions, headDim)
+        // Rotary embeddings: [numTokens, headDim]
         qCosGm.SetGlobalBuffer((__gm__ T*)qCos, numTokens * headDim);
         qSinGm.SetGlobalBuffer((__gm__ T*)qSin, numTokens * headDim);
         kCosGm.SetGlobalBuffer((__gm__ T*)kCos, numTokens * headDim);
         kSinGm.SetGlobalBuffer((__gm__ T*)kSin, numTokens * headDim);
 
-        // Initialize UB buffers
-        // Need space for: Q(2*qSize), K(kvSize), V(kvSize), gate(qSize), plus intermediates
-        uint32_t ubSizeQ = (qSize > 256) ? 256 : qSize;
-        uint32_t ubSizeK = (kvSize > 256) ? 256 : kvSize;
+        // UB buffer sizing: inQueueQkv holds Q (qSize) and K (kvSize) in separate buffers
+        // Use max(qSize, kvSize) so either Q or K fits in a single buffer slot
+        uint32_t maxQKSize = (qSize > kvSize) ? qSize : kvSize;
+        uint32_t ubSizeQK = (maxQKSize > 256) ? 256 : maxQKSize;
         uint32_t ubSizeGate = (qSize > 256) ? 256 : qSize;
 
-        Ppipe->InitBuffer(inQueueQkv, BUFFER_NUM, ubSizeQ * sizeof(T));
+        Ppipe->InitBuffer(inQueueQkv, BUFFER_NUM, ubSizeQK * sizeof(T));
         Ppipe->InitBuffer(inQueueGate, BUFFER_NUM, ubSizeGate * sizeof(T));
         Ppipe->InitBuffer(inQueueQNormWeight, BUFFER_NUM, headDim * sizeof(T));
         Ppipe->InitBuffer(inQueueKNormWeight, BUFFER_NUM, headDim * sizeof(T));
-        Ppipe->InitBuffer(outQueueQ, BUFFER_NUM, ubSizeQ * sizeof(T));
-        Ppipe->InitBuffer(outQueueK, BUFFER_NUM, ubSizeK * sizeof(T));
-        Ppipe->InitBuffer(outQueueV, BUFFER_NUM, ubSizeK * sizeof(T));
+        Ppipe->InitBuffer(outQueueQ, BUFFER_NUM, ubSizeQK * sizeof(T));
+        Ppipe->InitBuffer(outQueueK, BUFFER_NUM, ubSizeQK * sizeof(T));
+        Ppipe->InitBuffer(outQueueV, BUFFER_NUM, ubSizeQK * sizeof(T));
         Ppipe->InitBuffer(outQueueGate, BUFFER_NUM, ubSizeGate * sizeof(T));
 
-        // RMSNorm intermediate buffers
-        Ppipe->InitBuffer(rmsBuf, 128 * sizeof(float));
+        // Float scratch buffers: headDim floats for RMS computation + 64 floats for reduce work
+        uint32_t rmsBufSize = (headDim > 128) ? headDim : 128;
+        Ppipe->InitBuffer(rmsBuf, rmsBufSize * sizeof(float));
         Ppipe->InitBuffer(reduceBuf, 64 * sizeof(float));
     }
 
     __aicore__ inline void Process()
     {
+        // Load norm weights once; they are reused across all tokens via EnQue/DeQue cycle
+        LocalTensor<T> qWeightInit = inQueueQNormWeight.AllocTensor<T>();
+        DataCopyCustom(qWeightInit, qNormWeightGm, headDim);
+        inQueueQNormWeight.EnQue(qWeightInit);
+
+        LocalTensor<T> kWeightInit = inQueueKNormWeight.AllocTensor<T>();
+        DataCopyCustom(kWeightInit, kNormWeightGm, headDim);
+        inQueueKNormWeight.EnQue(kWeightInit);
+
         for (uint32_t tokenIdx = 0; tokenIdx < tokenWork; tokenIdx++) {
             SplitQKV(tokenIdx);
             ApplyQRMSNorm(tokenIdx);
@@ -122,226 +133,192 @@ public:
     }
 
 private:
+    // Split input QKV and route each tensor to its destination queue.
+    // V goes directly to outQueueV to avoid exceeding inQueueQkv's BUFFER_NUM=2 capacity.
     __aicore__ inline void SplitQKV(uint32_t tokenIdx)
     {
         uint32_t qkvOffset = tokenIdx * qkvSize;
 
         if (attnOutputGate) {
-            // qkv layout: [q_gate(2*qSize), k(kvSize), v(kvSize)]
-            // Split q_gate into q(first qSize) and gate(second qSize)
+            // QKV layout when attnOutputGate=true: [q_gate(2*qSize), k(kvSize), v(kvSize)]
+            // q occupies first qSize elements, gate occupies second qSize elements
 
-            // Copy q (first half of q_gate)
             LocalTensor<T> qLocal = inQueueQkv.AllocTensor<T>();
             DataCopyCustom(qLocal, qkvGm[qkvOffset], qSize);
+            inQueueQkv.EnQue(qLocal);
 
-            // Copy gate (second half of q_gate)
             LocalTensor<T> gateLocal = inQueueGate.AllocTensor<T>();
             DataCopyCustom(gateLocal, qkvGm[qkvOffset + qSize], qSize);
-
-            // Copy k and v
-            LocalTensor<T> kLocal = inQueueQkv.AllocTensor<T>();
-            LocalTensor<T> vLocal = inQueueQkv.AllocTensor<T>();
-            DataCopyCustom(kLocal, qkvGm[qkvOffset + qSize * 2], kvSize);
-            DataCopyCustom(vLocal, qkvGm[qkvOffset + qSize * 2 + kvSize], kvSize);
-
-            // Enqueue: order matters for DeQue
-            // We'll DeQue in order: q, k, v, then gate separately
-            inQueueQkv.EnQue(qLocal);
-            inQueueQkv.EnQue(kLocal);
-            inQueueQkv.EnQue(vLocal);
             inQueueGate.EnQue(gateLocal);
+
+            LocalTensor<T> kLocal = inQueueQkv.AllocTensor<T>();
+            DataCopyCustom(kLocal, qkvGm[qkvOffset + qSize * 2], kvSize);
+            inQueueQkv.EnQue(kLocal);
+
+            // V goes to outQueueV directly - no processing needed
+            LocalTensor<T> vLocal = outQueueV.AllocTensor<T>();
+            DataCopyCustom(vLocal, qkvGm[qkvOffset + qSize * 2 + kvSize], kvSize);
+            outQueueV.EnQue(vLocal);
         } else {
-            // qkv layout: [q(qSize), k(kvSize), v(kvSize)]
+            // QKV layout when attnOutputGate=false: [q(qSize), k(kvSize), v(kvSize)]
 
             LocalTensor<T> qLocal = inQueueQkv.AllocTensor<T>();
-            LocalTensor<T> kLocal = inQueueQkv.AllocTensor<T>();
-            LocalTensor<T> vLocal = inQueueQkv.AllocTensor<T>();
-
             DataCopyCustom(qLocal, qkvGm[qkvOffset], qSize);
-            DataCopyCustom(kLocal, qkvGm[qkvOffset + qSize], kvSize);
-            DataCopyCustom(vLocal, qkvGm[qkvOffset + qSize + kvSize], kvSize);
-
             inQueueQkv.EnQue(qLocal);
+
+            LocalTensor<T> kLocal = inQueueQkv.AllocTensor<T>();
+            DataCopyCustom(kLocal, qkvGm[qkvOffset + qSize], kvSize);
             inQueueQkv.EnQue(kLocal);
-            inQueueQkv.EnQue(vLocal);
+
+            // V goes to outQueueV directly
+            LocalTensor<T> vLocal = outQueueV.AllocTensor<T>();
+            DataCopyCustom(vLocal, qkvGm[qkvOffset + qSize + kvSize], kvSize);
+            outQueueV.EnQue(vLocal);
         }
     }
 
+    // Apply RMSNorm per head to Q tensor.
+    // Reduce dimension is headDim (not qSize) - one rstd per head.
     __aicore__ inline void ApplyQRMSNorm(uint32_t tokenIdx)
     {
-        // Deque Q tensor (first tensor in queue)
         LocalTensor<T> qLocal = inQueueQkv.DeQue<T>();
-
-        // Compute RMSNorm: output = input * weight / sqrt(sum(x^2)/n + eps)
-        LocalTensor<float> sqLocal = rmsBuf.Get<float>();
-        LocalTensor<float> reduceLocal = reduceBuf.Get<float>();
-
-        // Cast input to float for computation
-        if constexpr (is_same<T, half>::value || is_same<T, bfloat16_t>::value) {
-            Cast(sqLocal, qLocal, RoundMode::CAST_NONE, qSize);
-        } else {
-            // Float - direct copy
-            for (uint32_t i = 0; i < qSize; i++) {
-                sqLocal.SetValue(i, qLocal.GetValue(i));
-            }
-        }
-        PipeBarrier<PIPE_V>();
-
-        // Square
-        Mul(sqLocal, sqLocal, sqLocal, qSize);
-        PipeBarrier<PIPE_V>();
-
-        // Average
-        float avgFactor = 1.0f / static_cast<float>(headDim);
-        Muls(sqLocal, sqLocal, avgFactor, qSize);
-        PipeBarrier<PIPE_V>();
-
-        // Reduce sum
-        uint32_t repeat = qSize / REDUCE_LEN;
-        if (repeat > 0) {
-            ReduceSumCustom(sqLocal, sqLocal, reduceLocal, qSize);
-            PipeBarrier<PIPE_V>();
-        }
-
-        // Compute rstd = 1/sqrt(sum + eps)
-        Adds(sqLocal, sqLocal, epsilon, 1);
-        Sqrt(sqLocal, sqLocal, 1);
-        Duplicates(reduceLocal, sqLocal, 1);
-        PipeBarrier<PIPE_V>();
-        Div(sqLocal, reduceLocal, sqLocal, 1);  // rstd = 1/rstd
-        PipeBarrier<PIPE_V>();
-
-        // Apply to input: q_norm = q * rstd
         LocalTensor<T> qNormLocal = outQueueQ.AllocTensor<T>();
         LocalTensor<T> qWeightLocal = inQueueQNormWeight.DeQue<T>();
 
-        // Cast rstd to same type as q for multiplication
-        LocalTensor<float> rstdCast = reduceBuf.Get<float>();
-        rstdCast.SetValue(0, sqLocal.GetValue(0));
-        PipeBarrier<PIPE_V>();
+        LocalTensor<float> headBuf = rmsBuf.Get<float>();
+        LocalTensor<float> workBuf = reduceBuf.Get<float>();
 
-        // Multiply input by rstd
-        Muls(qNormLocal, qLocal, rstdCast, qSize);
-        PipeBarrier<PIPE_V>();
+        for (uint32_t head = 0; head < numHeads; head++) {
+            uint32_t headOffset = head * headDim;
 
-        // Apply weight
-        Mul(qNormLocal, qWeightLocal, qNormLocal, qSize);
-        PipeBarrier<PIPE_V>();
+            // Cast this head's elements to float for numerically stable reduction
+            if constexpr (is_same<T, float>::value) {
+                Muls(headBuf, qLocal[headOffset], 1.0f, headDim);
+            } else {
+                Cast(headBuf, qLocal[headOffset], RoundMode::CAST_NONE, headDim);
+            }
+            PipeBarrier<PIPE_V>();
 
-        // Cleanup
+            // Square each element
+            Mul(headBuf, headBuf, headBuf, headDim);
+            PipeBarrier<PIPE_V>();
+
+            // Scale by 1/headDim to get mean of squares
+            Muls(headBuf, headBuf, 1.0f / static_cast<float>(headDim), headDim);
+            PipeBarrier<PIPE_V>();
+
+            // Reduce sum over headDim → result in headBuf[0]
+            ReduceSumCustom(headBuf, headBuf, workBuf, headDim);
+            PipeBarrier<PIPE_V>();
+
+            // rstd = 1 / sqrt(mean_of_squares + epsilon)
+            float ms = headBuf.GetValue(0);
+            float rstdVal = 1.0f / sqrtf(ms + epsilon);
+
+            // Store rstd in workBuf[0] for Muls broadcast
+            workBuf.SetValue(0, rstdVal);
+            PipeBarrier<PIPE_V>();
+
+            // Apply rstd: qNorm[head] = q[head] * rstd
+            Muls(qNormLocal[headOffset], qLocal[headOffset], workBuf, headDim);
+            PipeBarrier<PIPE_V>();
+
+            // Apply weight: qNorm[head] = qNorm[head] * weight (weight shape [headDim] broadcast per-head)
+            Mul(qNormLocal[headOffset], qNormLocal[headOffset], qWeightLocal, headDim);
+            PipeBarrier<PIPE_V>();
+        }
+
+        // Return weight buffer for reuse on the next token
         inQueueQNormWeight.EnQue(qWeightLocal);
         outQueueQ.EnQue(qNormLocal);
         inQueueQkv.FreeTensor(qLocal);
     }
 
+    // Apply RMSNorm per head to K tensor.
     __aicore__ inline void ApplyKRMSNorm(uint32_t tokenIdx)
     {
-        // Deque K tensor (second tensor in queue)
         LocalTensor<T> kLocal = inQueueQkv.DeQue<T>();
-
-        LocalTensor<float> sqLocal = rmsBuf.Get<float>();
-        LocalTensor<float> reduceLocal = reduceBuf.Get<float>();
-
-        // Cast to float
-        if constexpr (is_same<T, half>::value || is_same<T, bfloat16_t>::value) {
-            Cast(sqLocal, kLocal, RoundMode::CAST_NONE, kvSize);
-        } else {
-            for (uint32_t i = 0; i < kvSize; i++) {
-                sqLocal.SetValue(i, kLocal.GetValue(i));
-            }
-        }
-        PipeBarrier<PIPE_V>();
-
-        // Square
-        Mul(sqLocal, sqLocal, sqLocal, kvSize);
-        PipeBarrier<PIPE_V>();
-
-        // Average
-        float avgFactor = 1.0f / static_cast<float>(headDim);
-        Muls(sqLocal, sqLocal, avgFactor, kvSize);
-        PipeBarrier<PIPE_V>();
-
-        // Reduce
-        uint32_t repeat = kvSize / REDUCE_LEN;
-        if (repeat > 0) {
-            ReduceSumCustom(sqLocal, sqLocal, reduceLocal, kvSize);
-            PipeBarrier<PIPE_V>();
-        }
-
-        // rstd
-        Adds(sqLocal, sqLocal, epsilon, 1);
-        Sqrt(sqLocal, sqLocal, 1);
-        Duplicates(reduceLocal, sqLocal, 1);
-        PipeBarrier<PIPE_V>();
-        Div(sqLocal, reduceLocal, sqLocal, 1);
-        PipeBarrier<PIPE_V>();
-
-        // Apply
         LocalTensor<T> kNormLocal = outQueueK.AllocTensor<T>();
         LocalTensor<T> kWeightLocal = inQueueKNormWeight.DeQue<T>();
 
-        LocalTensor<float> rstdCast = reduceBuf.Get<float>();
-        rstdCast.SetValue(0, sqLocal.GetValue(0));
-        PipeBarrier<PIPE_V>();
+        LocalTensor<float> headBuf = rmsBuf.Get<float>();
+        LocalTensor<float> workBuf = reduceBuf.Get<float>();
 
-        Muls(kNormLocal, kLocal, rstdCast, kvSize);
-        PipeBarrier<PIPE_V>();
-        Mul(kNormLocal, kWeightLocal, kNormLocal, kvSize);
-        PipeBarrier<PIPE_V>();
+        for (uint32_t head = 0; head < numKvHeads; head++) {
+            uint32_t headOffset = head * headDim;
+
+            if constexpr (is_same<T, float>::value) {
+                Muls(headBuf, kLocal[headOffset], 1.0f, headDim);
+            } else {
+                Cast(headBuf, kLocal[headOffset], RoundMode::CAST_NONE, headDim);
+            }
+            PipeBarrier<PIPE_V>();
+
+            Mul(headBuf, headBuf, headBuf, headDim);
+            PipeBarrier<PIPE_V>();
+
+            Muls(headBuf, headBuf, 1.0f / static_cast<float>(headDim), headDim);
+            PipeBarrier<PIPE_V>();
+
+            ReduceSumCustom(headBuf, headBuf, workBuf, headDim);
+            PipeBarrier<PIPE_V>();
+
+            float ms = headBuf.GetValue(0);
+            float rstdVal = 1.0f / sqrtf(ms + epsilon);
+
+            workBuf.SetValue(0, rstdVal);
+            PipeBarrier<PIPE_V>();
+
+            Muls(kNormLocal[headOffset], kLocal[headOffset], workBuf, headDim);
+            PipeBarrier<PIPE_V>();
+
+            Mul(kNormLocal[headOffset], kNormLocal[headOffset], kWeightLocal, headDim);
+            PipeBarrier<PIPE_V>();
+        }
 
         inQueueKNormWeight.EnQue(kWeightLocal);
         outQueueK.EnQue(kNormLocal);
         inQueueQkv.FreeTensor(kLocal);
     }
 
+    // Apply interleaved rotary embedding to Q:
+    //   rotary[2i]   = q[2i]*cos[2i]   - q[2i+1]*sin[2i+1]
+    //   rotary[2i+1] = q[2i]*sin[2i]   + q[2i+1]*cos[2i+1]
+    // cos/sin indexed as: globalTokenId * headDim + dim
     __aicore__ inline void ApplyRotaryQ(uint32_t tokenIdx)
     {
-        // Deque Q normalized tensor
         LocalTensor<T> qNormLocal = outQueueQ.DeQue<T>();
         uint32_t globalTokenId = startToken + tokenIdx;
 
-        // Get cos/sin
-        LocalTensor<T> cosTensor = qCosGm.Get<T>();
-        LocalTensor<T> sinTensor = qSinGm.Get<T>();
-
         LocalTensor<T> qRotLocal = outQueueQ.AllocTensor<T>();
 
-        // Apply rotary per head
         for (uint32_t head = 0; head < numHeads; head++) {
             uint32_t baseOffset = head * headDim;
 
-            // For each head, compute rotary
-            // q_rot[2i] = q[2i] * cos[2i] - q[2i+1] * sin[2i+1]
-            // q_rot[2i+1] = q[2i] * sin[2i] + q[2i+1] * cos[2i+1]
             for (uint32_t dim = 0; dim < headDim; dim += 2) {
-                uint32_t realDim1 = baseOffset + dim;
-                uint32_t realDim2 = baseOffset + dim + 1;
+                uint32_t idx0 = baseOffset + dim;
+                uint32_t idx1 = baseOffset + dim + 1;
                 uint32_t cosSinOffset = globalTokenId * headDim + dim;
 
-                T q1 = qNormLocal.GetValue(realDim1);
-                T q2 = qNormLocal.GetValue(realDim2);
-                T cos1 = cosTensor.GetValue(cosSinOffset);
-                T sin1 = sinTensor.GetValue(cosSinOffset);
+                T q0 = qNormLocal.GetValue(idx0);
+                T q1 = qNormLocal.GetValue(idx1);
+                T cosVal = qCosGm.GetValue(cosSinOffset);
+                T sinVal = qSinGm.GetValue(cosSinOffset);
 
-                // Note: This is simplified. Real rotary uses interleaved indexing.
-                T qRot1 = q1 * cos1 - q2 * sin1;
-                T qRot2 = q1 * sin1 + q2 * cos1;
-
-                qRotLocal.SetValue(realDim1, qRot1);
-                qRotLocal.SetValue(realDim2, qRot2);
+                qRotLocal.SetValue(idx0, q0 * cosVal - q1 * sinVal);
+                qRotLocal.SetValue(idx1, q0 * sinVal + q1 * cosVal);
             }
         }
 
+        outQueueQ.FreeTensor(qNormLocal);
         outQueueQ.EnQue(qRotLocal);
     }
 
+    // Apply interleaved rotary embedding to K over all numKvHeads.
     __aicore__ inline void ApplyRotaryK(uint32_t tokenIdx)
     {
         LocalTensor<T> kNormLocal = outQueueK.DeQue<T>();
         uint32_t globalTokenId = startToken + tokenIdx;
-
-        LocalTensor<T> cosTensor = kCosGm.Get<T>();
-        LocalTensor<T> sinTensor = kSinGm.Get<T>();
 
         LocalTensor<T> kRotLocal = outQueueK.AllocTensor<T>();
 
@@ -349,44 +326,42 @@ private:
             uint32_t baseOffset = head * headDim;
 
             for (uint32_t dim = 0; dim < headDim; dim += 2) {
-                uint32_t realDim1 = baseOffset + dim;
-                uint32_t realDim2 = baseOffset + dim + 1;
+                uint32_t idx0 = baseOffset + dim;
+                uint32_t idx1 = baseOffset + dim + 1;
                 uint32_t cosSinOffset = globalTokenId * headDim + dim;
 
-                T k1 = kNormLocal.GetValue(realDim1);
-                T k2 = kNormLocal.GetValue(realDim2);
-                T cos1 = cosTensor.GetValue(cosSinOffset);
-                T sin1 = sinTensor.GetValue(cosSinOffset);
+                T k0 = kNormLocal.GetValue(idx0);
+                T k1 = kNormLocal.GetValue(idx1);
+                T cosVal = kCosGm.GetValue(cosSinOffset);
+                T sinVal = kSinGm.GetValue(cosSinOffset);
 
-                T kRot1 = k1 * cos1 - k2 * sin1;
-                T kRot2 = k1 * sin1 + k2 * cos1;
-
-                kRotLocal.SetValue(realDim1, kRot1);
-                kRotLocal.SetValue(realDim2, kRot2);
+                kRotLocal.SetValue(idx0, k0 * cosVal - k1 * sinVal);
+                kRotLocal.SetValue(idx1, k0 * sinVal + k1 * cosVal);
             }
         }
 
+        outQueueK.FreeTensor(kNormLocal);
         outQueueK.EnQue(kRotLocal);
     }
 
     __aicore__ inline void CopyOutputs(uint32_t tokenIdx)
     {
-        // Q output
+        // Q output (after RMSNorm + Rotary)
         LocalTensor<T> qLocal = outQueueQ.DeQue<T>();
         DataCopyCustom(qOutGm[tokenIdx * qSize], qLocal, qSize);
         outQueueQ.FreeTensor(qLocal);
 
-        // K output
+        // K output (after RMSNorm + Rotary)
         LocalTensor<T> kLocal = outQueueK.DeQue<T>();
         DataCopyCustom(kOutGm[tokenIdx * kvSize], kLocal, kvSize);
         outQueueK.FreeTensor(kLocal);
 
-        // V output - this was stored in inQueueQkv
-        LocalTensor<T> vLocal = inQueueQkv.DeQue<T>();
+        // V output (pass-through, stored in outQueueV by SplitQKV)
+        LocalTensor<T> vLocal = outQueueV.DeQue<T>();
         DataCopyCustom(vOutGm[tokenIdx * kvSize], vLocal, kvSize);
-        inQueueQkv.FreeTensor(vLocal);
+        outQueueV.FreeTensor(vLocal);
 
-        // Gate output - only when attnOutputGate is enabled
+        // Gate output (only when attnOutputGate is enabled)
         if (attnOutputGate) {
             LocalTensor<T> gateLocal = inQueueGate.DeQue<T>();
             DataCopyCustom(gateOutGm[tokenIdx * qSize], gateLocal, qSize);
@@ -397,21 +372,21 @@ private:
 private:
     TPipe* Ppipe = nullptr;
 
-    // Input queues
-    TQue<QuePosition::VECIN, BUFFER_NUM> inQueueQkv;  // For Q, K, V tensors
-    TQue<QuePosition::VECIN, BUFFER_NUM> inQueueGate;  // For gate tensor when enabled
+    // Input queues (BUFFER_NUM=2 each)
+    TQue<QuePosition::VECIN, BUFFER_NUM> inQueueQkv;        // Q and K tensors
+    TQue<QuePosition::VECIN, BUFFER_NUM> inQueueGate;       // gate tensor (attnOutputGate=true)
     TQue<QuePosition::VECIN, BUFFER_NUM> inQueueQNormWeight;
     TQue<QuePosition::VECIN, BUFFER_NUM> inQueueKNormWeight;
 
     // Output queues
     TQue<QuePosition::VECOUT, BUFFER_NUM> outQueueQ;
     TQue<QuePosition::VECOUT, BUFFER_NUM> outQueueK;
-    TQue<QuePosition::VECOUT, BUFFER_NUM> outQueueV;
+    TQue<QuePosition::VECOUT, BUFFER_NUM> outQueueV;    // V is directly routed here by SplitQKV
     TQue<QuePosition::VECOUT, BUFFER_NUM> outQueueGate;
 
-    // Buffers
-    TBuf<TPosition::VECCALC> rmsBuf;
-    TBuf<TPosition::VECCALC> reduceBuf;
+    // Float scratch buffers for RMSNorm computation
+    TBuf<TPosition::VECCALC> rmsBuf;    // headDim floats for per-head intermediate values
+    TBuf<TPosition::VECCALC> reduceBuf; // work buffer for ReduceSumCustom + rstd scalar
 
     // Global tensors
     GlobalTensor<T> qkvGm;
@@ -426,7 +401,7 @@ private:
     GlobalTensor<T> kCosGm;
     GlobalTensor<T> kSinGm;
 
-    // Parameters
+    // Parameters from tiling
     uint32_t numTokens;
     uint32_t numHeads;
     uint32_t numKvHeads;

@@ -8,58 +8,117 @@
  * See LICENSE in the root of the software repository for the full text of the License.
  */
 
-#include "acl/acl.h"
-#include "aclnn_ops.h"
-#include "error_log.h"
+/*!
+ * \file qwen3_next_qkv_preprocess_infershape.cpp
+ * \brief InferShape and InferDataType for Qwen3NextQKVPreprocess
+ */
+
+#include "register/op_def_registry.h"
 #include "log/ops_log.h"
 
-namespace optiling {
+#define unlikely(x) __builtin_expect((x), 0)
+#define OP_CHECK_NULL_WITH_CONTEXT(context, ptr)                                              \
+    do {                                                                                     \
+        if (unlikely((ptr) == nullptr)) {                                                    \
+            const char* name = (unlikely(((context) == nullptr) ||                           \
+                                         (context)->GetNodeName() == nullptr))               \
+                                   ? "nil"                                                   \
+                                   : (context)->GetNodeName();                              \
+            OPS_LOG_E(name, "%s is nullptr!", #ptr);                                         \
+            return ge::GRAPH_FAILED;                                                         \
+        }                                                                                    \
+    } while (0)
 
-constexpr size_t NUM_INPUTS = 8;
-constexpr size_t NUM_OUTPUTS = 1;
+// Attribute indices (matching op_def.cpp order)
+static constexpr int ATTR_EPSILON = 0;
+static constexpr int ATTR_NUM_TOKENS = 1;
+static constexpr int ATTR_NUM_HEADS = 2;
+static constexpr int ATTR_NUM_KV_HEADS = 3;
+static constexpr int ATTR_HEAD_DIM = 4;
+static constexpr int ATTR_Q_SIZE = 5;
+static constexpr int ATTR_KV_SIZE = 6;
+static constexpr int ATTR_QKV_SIZE = 7;
+static constexpr int ATTR_ATTN_OUTPUT_GATE = 8;
 
-static ge::graphStatus InferShapeAddRmsNormBias(
-    const gert::TilingContext* context,
-    std::vector<int64_t>& outputShape)
+static constexpr int NUM_OUTPUTS = 4;  // qOut, kOut, vOut, gateOut
+
+using namespace ge;
+
+namespace ops {
+
+static ge::graphStatus InferShape4Qwen3NextQKVPreprocess(gert::InferShapeContext* context)
 {
-    const gert::StorageShape* qkv_shape = context->GetInputShape(0);
-    OP_CHECK_NULL_WITH_CONTEXT(context, qkv_shape);
+    OP_LOGD(context, "Begin InferShape4Qwen3NextQKVPreprocess");
 
-    // Output shape is the same as input hidden dimension
-    // The actual output shape depends on the model configuration
-    auto numTokens = qkv_shape->GetDim(0);
-    outputShape = {numTokens};
+    // Get input shape
+    const gert::Shape* qkvShape = context->GetInputShape(0);
+    OP_CHECK_NULL_WITH_CONTEXT(context, qkvShape);
+
+    int64_t numTokens = qkvShape->GetDim(0);
+
+    // Get all shape parameters from op attributes
+    auto attrs = context->GetAttrs();
+    OP_CHECK_NULL_WITH_CONTEXT(context, attrs);
+
+    int64_t qSize = *attrs->GetAttrPointer<int64_t>(ATTR_Q_SIZE);
+    int64_t kvSize = *attrs->GetAttrPointer<int64_t>(ATTR_KV_SIZE);
+    int64_t attnOutputGate = *attrs->GetAttrPointer<int64_t>(ATTR_ATTN_OUTPUT_GATE);
+
+    // Set output shapes:
+    //   Output 0 (qOut): [numTokens, qSize]
+    //   Output 1 (kOut): [numTokens, kvSize]
+    //   Output 2 (vOut): [numTokens, kvSize]
+    //   Output 3 (gateOut): [numTokens, qSize] if attnOutputGate=true, else []
+
+    gert::Shape* qOutShape = context->GetOutputShape(0);
+    gert::Shape* kOutShape = context->GetOutputShape(1);
+    gert::Shape* vOutShape = context->GetOutputShape(2);
+    gert::Shape* gateOutShape = context->GetOutputShape(3);
+    OP_CHECK_NULL_WITH_CONTEXT(context, qOutShape);
+    OP_CHECK_NULL_WITH_CONTEXT(context, kOutShape);
+    OP_CHECK_NULL_WITH_CONTEXT(context, vOutShape);
+    OP_CHECK_NULL_WITH_CONTEXT(context, gateOutShape);
+
+    qOutShape->SetDimNum(2);
+    qOutShape->SetDim(0, numTokens);
+    qOutShape->SetDim(1, qSize);
+
+    kOutShape->SetDimNum(2);
+    kOutShape->SetDim(0, numTokens);
+    kOutShape->SetDim(1, kvSize);
+
+    vOutShape->SetDimNum(2);
+    vOutShape->SetDim(0, numTokens);
+    vOutShape->SetDim(1, kvSize);
+
+    if (attnOutputGate != 0) {
+        gateOutShape->SetDimNum(2);
+        gateOutShape->SetDim(0, numTokens);
+        gateOutShape->SetDim(1, qSize);
+    } else {
+        gateOutShape->SetDimNum(1);
+        gateOutShape->SetDim(0, 0);
+    }
+
+    OP_LOGD(context, "InferShape done: qOut=[%ld, %ld], kOut=[%ld, %ld], "
+            "vOut=[%ld, %ld], gateOut=%s",
+            numTokens, qSize, numTokens, kvSize, numTokens, kvSize,
+            attnOutputGate != 0 ? "[numTokens, qSize]" : "[]");
 
     return ge::GRAPH_SUCCESS;
 }
 
-static ge::graphStatus InferShapeQwen3NextQKVPreprocess(
-    const gert::TilingContext* context)
+static ge::graphStatus InferDataType4Qwen3NextQKVPreprocess(gert::InferDataTypeContext* context)
 {
-    OP_LOGI("InferShapeQwen3NextQKVPreprocess", "Enter InferShapeQwen3NextQKVPreprocess");
-
-    // Check input shape
-    const gert::StorageShape* qkv_shape = context->GetInputShape(0);
-    const gert::StorageShape* output_shape = context->GetOutputShape(0);
-
-    OP_CHECK_NULL_WITH_CONTEXT(context, qkv_shape);
-    OP_CHECK_NULL_WITH_CONTEXT(context, output_shape);
-
-    // Verify dimensions
-    size_t qkvDimNum = qkv_shape->GetDimNum();
-    OP_CHECK_IF(
-        qkvDimNum < 2,
-        OP_LOGE(context, "QKV tensor must have at least 2 dimensions."),
-        return ge::GRAPH_FAILED);
-
-    // Get number of tokens from first dimension
-    int64_t numTokens = qkv_shape->GetDim(0);
-
-    // Output shape should be (numTokens, hiddenSize)
-    // This is inferred from the model configuration passed through attributes
-    OP_LOGI(context, "Qwen3NextQKVPreprocess infer shape: numTokens=%ld", numTokens);
-
+    // All outputs inherit dtype from the QKV input (input 0)
+    for (int i = 0; i < NUM_OUTPUTS; ++i) {
+        context->SetOutputDataType(i, context->GetInputDataType(0));
+    }
     return ge::GRAPH_SUCCESS;
 }
 
-}  // namespace optiling
+IMPL_OP_INFERSHAPE(Qwen3NextQKVPreprocess)
+    .InferShape(InferShape4Qwen3NextQKVPreprocess)
+    .InferDataType(InferDataType4Qwen3NextQKVPreprocess);
+
+}  // namespace ops

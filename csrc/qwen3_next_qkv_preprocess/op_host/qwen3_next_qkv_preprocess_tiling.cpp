@@ -4,8 +4,9 @@
  * Licensed under CANN Open Software License Agreement Version 1.0 (the "License").
  * Please refer to the License for the details. You may not use this file except in compliance with the License.
  * THIS SOFTWARE IS PROVIDED ON AN "AS IS" BASIS, WITHOUT WARRANTIES OF ANY KIND, EITHER
- * INCLUDING BUT NOT LIMITED TO NON-INFRINGEMENT, MERCHANTABILITY, OR FITNESS FOR A PARTICULAR
- * PURPOSE. See LICENSE in the root of the software repository for the full text of the License.
+ * EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED TO NON-INFRINGEMENT, MERCHANTABILITY, OR
+ * FITNESS FOR A PARTICULAR PURPOSE. See LICENSE in the root of the software repository
+ * for the full text of the License.
  */
 
 /*!
@@ -16,7 +17,7 @@
 #include "log/ops_log.h"
 #include "../tiling_base/tiling_templates_registry.h"
 #include "../tiling_base/tiling_util.h"
-#include "qwen3_next_qkv_preprocess_tiling.h"
+#include "tiling/qwen3_next_qkv_preprocess_tiling.h"
 
 namespace optiling {
 
@@ -67,18 +68,10 @@ static bool CheckInputOutputShape(const gert::TilingContext* context)
 static void GetCompileParameters(
     gert::TilingContext* context, uint32_t& numCore, uint64_t& ubSize)
 {
-    auto ptrCompileInfo = context->GetCompileInfo<void>();
-    if (ptrCompileInfo == nullptr) {
-        auto ascendc_platform = platform_ascendc::PlatformAscendC(context->GetPlatformInfo());
-        qwen3NextQKVPreprocessSocVersion = ascendc_platform.GetSocVersion();
-        numCore = ascendc_platform.GetCoreNumAiv();
-        ascendc_platform.GetCoreMemSize(platform_ascendc::CoreMemType::UB, ubSize);
-    } else {
-        auto ascendc_platform = platform_ascendc::PlatformAscendC(context->GetPlatformInfo());
-        qwen3NextQKVPreprocessSocVersion = ascendc_platform.GetSocVersion();
-        numCore = ascendc_platform.GetCoreNumAiv();
-        ascendc_platform.GetCoreMemSize(platform_ascendc::CoreMemType::UB, ubSize);
-    }
+    auto ascendc_platform = platform_ascendc::PlatformAscendC(context->GetPlatformInfo());
+    qwen3NextQKVPreprocessSocVersion = ascendc_platform.GetSocVersion();
+    numCore = ascendc_platform.GetCoreNumAiv();
+    ascendc_platform.GetCoreMemSize(platform_ascendc::CoreMemType::UB, ubSize);
 }
 
 static void CalculateTilingParameters(
@@ -93,22 +86,47 @@ static void CalculateTilingParameters(
     uint32_t qkvSize = qkv_shape.GetDim(qkv_shape.GetDimNum() - 1);
     uint32_t hiddenSize = output_shape.GetDim(output_shape.GetDimNum() - 1);
 
+    // Read all shape and attribute parameters from op attributes
     auto attrs = context->GetAttrs();
+    OP_CHECK_NULL_WITH_CONTEXT(context, attrs);
+
     float epsilon = 1e-6f;
+    uint32_t numHeads = 0;
+    uint32_t numKvHeads = 0;
+    uint32_t headDim = 0;
+    uint32_t qSize = 0;
+    uint32_t kvSize = 0;
+    uint32_t attnOutputGate = 0;
+
     if (attrs != nullptr) {
-        epsilon = *attrs->GetFloat(0);
+        epsilon = *attrs->GetAttrPointer<float>(0);        // epsilon
+        numTokens = *attrs->GetAttrPointer<int64_t>(1);    // numTokens
+        numHeads = *attrs->GetAttrPointer<int64_t>(2);     // numHeads
+        numKvHeads = *attrs->GetAttrPointer<int64_t>(3);   // numKvHeads
+        headDim = *attrs->GetAttrPointer<int64_t>(4);      // headDim
+        qSize = *attrs->GetAttrPointer<int64_t>(5);        // qSize
+        kvSize = *attrs->GetAttrPointer<int64_t>(6);       // kvSize
+        attnOutputGate = *attrs->GetAttrPointer<int64_t>(8); // attnOutputGate
     }
 
-    uint32_t blockFactor = 1;
     uint32_t tokensPerCore = CeilDiv(numTokens, numCore);
-    blockFactor = tokensPerCore;
 
     tiling->set_num_tokens(numTokens);
+    tiling->set_num_heads(numHeads);
+    tiling->set_num_kv_heads(numKvHeads);
+    tiling->set_head_dim(headDim);
+    tiling->set_q_size(qSize);
+    tiling->set_kv_size(kvSize);
+    tiling->set_hidden_size(hiddenSize);
+    tiling->set_qkv_size(qSize * 2 + kvSize * 2);  // attnOutputGate=true layout
     tiling->set_block_dim(numCore);
+    tiling->set_attn_output_gate(attnOutputGate);
     tiling->set_epsilon(epsilon);
 
-    OPS_LOG_I(context, "Tiling: numTokens=%u, qkvSize=%u, hiddenSize=%u, blockDim=%u",
-              numTokens, qkvSize, hiddenSize, numCore);
+    OPS_LOG_I(context, "Tiling: numTokens=%u, numHeads=%u, numKvHeads=%u, headDim=%u, "
+              "qSize=%u, kvSize=%u, qkvSize=%u, attnOutputGate=%u, blockDim=%u",
+              numTokens, numHeads, numKvHeads, headDim, qSize, kvSize,
+              tiling->get_qkv_size(), attnOutputGate, numCore);
 }
 
 static void SaveTilingData(
@@ -123,7 +141,7 @@ static void SaveTilingData(
 
 static void SetWorkspaceSize(gert::TilingContext* context)
 {
-    constexpr size_t sysWorkspaceSize = 16 * 1024 * 1024;
+    constexpr size_t sysWorkspaceSize = 16 * 1024 * 1024;  // 16MB minimum
     constexpr size_t usrSize = 256;
     size_t* currentWorkspace = context->GetWorkspaceSizes(1);
     currentWorkspace[0] = usrSize + sysWorkspaceSize;
@@ -134,8 +152,11 @@ static void LogTilingResults(
 {
     OPS_LOG_I(context, "Tiling Key: %u", dtypeKey * 10);
     OPS_LOG_I(context, "Block Dim: %u", tiling->get_block_dim());
-    OPS_LOG_I(context, "numTokens: %u, epsilon: %f",
-              tiling->get_num_tokens(), tiling->get_epsilon());
+    OPS_LOG_I(context, "numTokens: %u, numHeads: %u, numKvHeads: %u, headDim: %u, "
+              "qSize: %u, kvSize: %u, attnOutputGate: %u, epsilon: %f",
+              tiling->get_num_tokens(), tiling->get_num_heads(), tiling->get_num_kv_heads(),
+              tiling->get_head_dim(), tiling->get_q_size(), tiling->get_kv_size(),
+              tiling->get_attn_output_gate(), tiling->get_epsilon());
 }
 
 static ge::graphStatus Tiling4Qwen3NextQKVPreprocess(gert::TilingContext* context)
@@ -184,6 +205,6 @@ static ge::graphStatus TilingPrepare4Qwen3NextQKVPreprocess(gert::TilingParseCon
 
 IMPL_OP_OPTILING(Qwen3NextQKVPreprocess)
     .Tiling(Tiling4Qwen3NextQKVPreprocess)
-    .TilingParse<void>(TilingPrepare4Qwen3NextQKVPreprocess);
+    .TilingParse<Qwen3NextQKVPreprocessCompileInfo>(TilingPrepare4Qwen3NextQKVPreprocess);
 
 }  // namespace optiling
