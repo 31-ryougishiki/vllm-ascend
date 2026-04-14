@@ -12,8 +12,77 @@
 #define QWEN3_NEXT_QKV_PREPROCESS_KERNEL_H_
 
 #include "kernel_operator.h"
+#include <cmath>
 
 using namespace AscendC;
+
+// Local is_same template (not std::is_same, which may not be available in AICORE)
+template <typename, typename>
+struct is_same : public std::false_type {};
+template <typename Tp>
+struct is_same<Tp, Tp> : public std::true_type {};
+
+// Helper function: CeilDiv for integer division rounding up
+__aicore__ inline constexpr uint32_t CeilDiv(uint32_t a, uint32_t b) {
+    return (a + b - 1) / b;
+}
+
+// ReduceSumCustom wrapper for AscendC
+// Uses WholeReduceSum for small reduce dimensions
+__aicore__ inline void ReduceSumCustom(
+    const LocalTensor<float>& dst_local,
+    const LocalTensor<float>& src_local,
+    const LocalTensor<float>& work_local,
+    int32_t count)
+{
+    constexpr uint32_t NUM_PER_REP_FP32 = 8;
+    constexpr uint32_t DEFAULT_REPEAT_STRIDE = 8;
+    constexpr uint32_t MASK_PLACEHOLDER = 64;
+
+    int32_t repeatTimes = count / NUM_PER_REP_FP32;
+    int32_t tailCount = count % NUM_PER_REP_FP32;
+    int32_t bodyCount = repeatTimes * NUM_PER_REP_FP32;
+
+    Duplicate(work_local, ZERO, NUM_PER_REP_FP32);
+    PipeBarrier<PIPE_V>();
+
+    if (likely(repeatTimes > 0)) {
+        Add(work_local, src_local, work_local, MASK_PLACEHOLDER, repeatTimes);
+        PipeBarrier<PIPE_V>();
+    }
+    if (unlikely(tailCount != 0)) {
+        Add(work_local, src_local[bodyCount], work_local, tailCount, 1);
+        PipeBarrier<PIPE_V>();
+    }
+    WholeReduceSum<float, false>(dst_local, work_local, MASK_PLACEHOLDER, 1, 1, 1, DEFAULT_REPEAT_STRIDE);
+    PipeBarrier<PIPE_V>();
+}
+
+// DataCopyCustom wrapper for AscendC
+template <typename T, typename U, typename R>
+__aicore__ inline void DataCopyCustom(const U& dstTensor, const R& srcTensor, const uint32_t count)
+{
+    constexpr uint32_t ONE_BLK_SIZE = 32;
+    constexpr uint32_t BLOCK_SIZE = 32;
+    constexpr uint32_t ONCE_VECTOR_SIZE = 128;
+
+    int32_t numPerBlock = ONE_BLK_SIZE / sizeof(T);
+    if (count % numPerBlock == 0) {
+        DataCopy(dstTensor, srcTensor, count);
+    } else {
+        if constexpr (is_same<U, AscendC::LocalTensor<T>>::value) {
+            int32_t num = ((count + numPerBlock - 1) / numPerBlock) * numPerBlock;
+            DataCopy(dstTensor, srcTensor, num);
+        } else {
+            if (count < numPerBlock) {
+                DataCopy(dstTensor, srcTensor, numPerBlock);
+            } else {
+                int32_t num = ((count + numPerBlock - 1) / numPerBlock) * numPerBlock;
+                DataCopy(dstTensor, srcTensor, num);
+            }
+        }
+    }
+}
 
 // Tiling data structure for Qwen3Next QKV Preprocessing
 // Must match the host-side Qwen3NextQKVPreprocessTilingData exactly (binary-compatible)
@@ -53,6 +122,7 @@ public:
         this->numHeads = tiling->numHeads;
         this->numKvHeads = tiling->numKvHeads;
         this->headDim = tiling->headDim;
+        this->invHeadDim = 1.0f / this->headDim;
         this->qSize = tiling->qSize;
         this->kvSize = tiling->kvSize;
         this->qkvSize = tiling->qkvSize;
@@ -204,7 +274,7 @@ private:
             PipeBarrier<PIPE_V>();
 
             // Scale by 1/headDim to get mean of squares
-            Muls(headBuf, headBuf, 1.0f / static_cast<float>(headDim), headDim);
+            Muls(headBuf, headBuf, invHeadDim, headDim);
             PipeBarrier<PIPE_V>();
 
             // Reduce sum over headDim → result in headBuf[0]
@@ -213,7 +283,7 @@ private:
 
             // rstd = 1 / sqrt(mean_of_squares + epsilon)
             float ms = headBuf.GetValue(0);
-            float rstdVal = 1.0f / sqrtf(ms + epsilon);
+            float rstdVal = 1.0f / sqrt(ms + epsilon);
 
             // Store rstd in workBuf[0] for Muls broadcast
             workBuf.SetValue(0, rstdVal);
@@ -257,14 +327,14 @@ private:
             Mul(headBuf, headBuf, headBuf, headDim);
             PipeBarrier<PIPE_V>();
 
-            Muls(headBuf, headBuf, 1.0f / static_cast<float>(headDim), headDim);
+            Muls(headBuf, headBuf, invHeadDim, headDim);
             PipeBarrier<PIPE_V>();
 
             ReduceSumCustom(headBuf, headBuf, workBuf, headDim);
             PipeBarrier<PIPE_V>();
 
             float ms = headBuf.GetValue(0);
-            float rstdVal = 1.0f / sqrtf(ms + epsilon);
+            float rstdVal = 1.0f / sqrt(ms + epsilon);
 
             workBuf.SetValue(0, rstdVal);
             PipeBarrier<PIPE_V>();
@@ -406,6 +476,7 @@ private:
     uint32_t numHeads;
     uint32_t numKvHeads;
     uint32_t headDim;
+    float invHeadDim;  // precomputed 1.0f / headDim to avoid static_cast in inner loop
     uint32_t qSize;
     uint32_t kvSize;
     uint32_t qkvSize;
