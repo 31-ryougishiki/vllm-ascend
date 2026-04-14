@@ -230,15 +230,8 @@ template <typename T, typename U, typename R>
 __aicore__ inline void DataCopyCustom(const U& dstTensor, const R& srcTensor, const uint32_t count)
 {
 #if (defined(__CCE_AICORE__) && __CCE_AICORE__ == 220) || (defined(__NPU_ARCH__) && __NPU_ARCH__ == 3003)
-    DataCopyParams copyParams;
-    copyParams.blockLen = count * sizeof(T);
-    copyParams.blockCount = 1;
-    if constexpr (is_same<U, AscendC::LocalTensor<T>>::value) {
-        DataCopyPadParams padParams;
-        DataCopyPad(dstTensor, srcTensor, copyParams, padParams);
-    } else {
-        DataCopyPad(dstTensor, srcTensor, copyParams);
-    }
+    // For ascend910b, use simple DataCopy which handles alignment automatically
+    DataCopy(dstTensor, srcTensor, count);
 #else
     // only support count greater than 32byte
     int32_t numPerBlock = ONE_BLK_SIZE / sizeof(T);
