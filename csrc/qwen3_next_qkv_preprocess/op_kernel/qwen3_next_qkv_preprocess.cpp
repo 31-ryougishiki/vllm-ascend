@@ -27,6 +27,7 @@ extern "C" __global__ __aicore__ void qwen3_next_qkv_preprocess(
     GM_ADDR workspace, GM_ADDR tiling)
 {
     TPipe pipe;
+    REGISTER_TILING_DEFAULT(Qwen3NextQKVPreprocessTilingData);
     GET_TILING_DATA(tilingData, tiling);
 
     if (TILING_KEY_IS(10)) {
