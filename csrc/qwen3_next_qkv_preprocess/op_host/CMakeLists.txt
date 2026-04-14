@@ -7,9 +7,12 @@
 # See LICENSE in the root of the software repository for the full text of the License.
 # ======================================================================================================================
 
-if (BUILD_OPEN_PROJECT)
-    include(${OPS_ADV_CMAKE_DIR}/intf_pub.cmake)
-endif ()
+add_ops_compile_options(
+        OP_NAME Qwen3NextQKVPreprocess
+        OPTIONS --cce-auto-sync=off
+                -Wno-deprecated-declarations
+                -Werror
+)
 
 target_sources(op_host_aclnn PRIVATE
         qwen3_next_qkv_preprocess_def.cpp
@@ -17,4 +20,18 @@ target_sources(op_host_aclnn PRIVATE
 
 target_sources(optiling PRIVATE
         qwen3_next_qkv_preprocess_tiling.cpp
+)
+
+target_include_directories(optiling PRIVATE
+        ${CMAKE_CURRENT_SOURCE_DIR}
+)
+
+target_sources(opsproto PRIVATE
+        qwen3_next_qkv_preprocess_infershape.cpp
+)
+
+file(GLOB _QKV_Aclnn_header "${CMAKE_CURRENT_SOURCE_DIR}/aclnn_qwen3_next_qkv_preprocess.h")
+
+install(FILES ${_QKV_Aclnn_header}
+        DESTINATION ${ACLNN_INC_INSTALL_DIR} OPTIONAL
 )
