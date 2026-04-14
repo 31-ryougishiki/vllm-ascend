@@ -17,6 +17,7 @@
 #include "log/ops_log.h"
 #include "../tiling_base/tiling_templates_registry.h"
 #include "../tiling_base/tiling_util.h"
+#include "../tiling_base/error_log.h"
 #include "tiling/qwen3_next_qkv_preprocess_tiling.h"
 
 namespace optiling {
