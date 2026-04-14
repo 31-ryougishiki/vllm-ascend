@@ -9,7 +9,6 @@
  */
 
 #include "qwen3_next_qkv_preprocess_kernel.h"
-#include "qwen3_next_qkv_preprocess_tiling.h"
 
 using namespace AscendC;
 
