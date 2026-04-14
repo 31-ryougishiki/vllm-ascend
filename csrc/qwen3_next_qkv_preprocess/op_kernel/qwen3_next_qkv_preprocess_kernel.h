@@ -12,7 +12,7 @@
 #define QWEN3_NEXT_QKV_PREPROCESS_KERNEL_H_
 
 #include "kernel_operator.h"
-#include "../add_rms_norm_bias/op_kernel/rms_norm_base.h"
+#include "rms_norm_base.h"
 #include <cmath>
 
 using namespace AscendC;
