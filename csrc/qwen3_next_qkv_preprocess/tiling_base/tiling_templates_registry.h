@@ -10,4 +10,5 @@
  */
 
 // tiling_templates_registry.h - Reuse from causal_conv1d
+#include "error_log.h"
 #include "../../causal_conv1d/tiling_base/tiling_templates_registry.h"
