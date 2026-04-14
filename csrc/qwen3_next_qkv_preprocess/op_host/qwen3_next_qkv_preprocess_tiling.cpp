@@ -69,10 +69,17 @@ static bool CheckInputOutputShape(const gert::TilingContext* context)
 static void GetCompileParameters(
     gert::TilingContext* context, uint32_t& numCore, uint64_t& ubSize)
 {
-    auto ascendc_platform = platform_ascendc::PlatformAscendC(context->GetPlatformInfo());
-    qwen3NextQKVPreprocessSocVersion = ascendc_platform.GetSocVersion();
-    numCore = ascendc_platform.GetCoreNumAiv();
-    ascendc_platform.GetCoreMemSize(platform_ascendc::CoreMemType::UB, ubSize);
+    auto ptrCompileInfo = reinterpret_cast<const Qwen3NextQKVPreprocessCompileInfo*>(context->GetCompileInfo());
+    if (ptrCompileInfo == nullptr) {
+        auto ascendc_platform = platform_ascendc::PlatformAscendC(context->GetPlatformInfo());
+        qwen3NextQKVPreprocessSocVersion = ascendc_platform.GetSocVersion();
+        numCore = ascendc_platform.GetCoreNumAiv();
+        ascendc_platform.GetCoreMemSize(platform_ascendc::CoreMemType::UB, ubSize);
+    } else {
+        numCore = ptrCompileInfo->totalCoreNum;
+        ubSize = ptrCompileInfo->totalUbSize;
+        qwen3NextQKVPreprocessSocVersion = ptrCompileInfo->socVersion;
+    }
 }
 
 static void CalculateTilingParameters(
@@ -193,12 +200,15 @@ static ge::graphStatus TilingPrepare4Qwen3NextQKVPreprocess(gert::TilingParseCon
 {
     OPS_LOG_D(context, "TilingPrepare4Qwen3NextQKVPreprocess running.");
     OP_LOGI(context, "TilingPrepare4Qwen3NextQKVPreprocess running.");
-
+    auto compileInfo = context->GetCompiledInfo<Qwen3NextQKVPreprocessCompileInfo>();
+    OP_CHECK_NULL_WITH_CONTEXT(context, compileInfo);
     auto platformInfo = context->GetPlatformInfo();
     OP_CHECK_NULL_WITH_CONTEXT(context, platformInfo);
-
     auto ascendcPlatform = platform_ascendc::PlatformAscendC(platformInfo);
-    qwen3NextQKVPreprocessSocVersion = ascendcPlatform.GetSocVersion();
+
+    compileInfo->socVersion = ascendcPlatform.GetSocVersion();
+    compileInfo->totalCoreNum = ascendcPlatform.GetCoreNumAiv();
+    ascendcPlatform.GetCoreMemSize(platform_ascendc::CoreMemType::UB, compileInfo->totalUbSize);
 
     return ge::GRAPH_SUCCESS;
 }

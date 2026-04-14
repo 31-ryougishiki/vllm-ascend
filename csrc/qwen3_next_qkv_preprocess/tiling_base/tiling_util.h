@@ -10,5 +10,5 @@
  */
 
 // tiling_util.h - Reuse from causal_conv1d
-#include "../../causal_conv1d/tiling_base/tiling_util.h"
 #include "error_log.h"
+#include "../../causal_conv1d/tiling_base/tiling_util.h"
