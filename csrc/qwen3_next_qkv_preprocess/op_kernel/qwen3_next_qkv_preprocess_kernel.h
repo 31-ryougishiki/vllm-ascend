@@ -116,6 +116,8 @@ public:
         uint32_t rmsBufSize = (headDim > 128) ? headDim : 128;
         Ppipe->InitBuffer(rmsBuf, rmsBufSize * sizeof(float));
         Ppipe->InitBuffer(reduceBuf, 64 * sizeof(float));
+        Ppipe->InitBuffer(weightFloatBuf, headDim * sizeof(float));  // for casting T weight to float
+        Ppipe->InitBuffer(rotaryTmpBuf, 256 * sizeof(float));  // for rotary computation
     }
 
     __aicore__ inline void Process()
@@ -196,6 +198,16 @@ private:
         LocalTensor<float> workBuf = reduceBuf.Get<float>();
         LocalTensor<float> qBuf = reduceBuf.Get<float>();
         LocalTensor<float> qNormBuf = reduceBuf.Get<float>();
+        LocalTensor<float> weightFloatBufLocal = weightFloatBuf.Get<float>();
+
+        // Cast weight from T to float once per token (reused across all heads)
+        if constexpr (is_same<T, float>::value) {
+            // Already float, use directly
+            weightFloatBufLocal = qWeightLocal;
+        } else {
+            Cast(weightFloatBufLocal, qWeightLocal, RoundMode::CAST_NONE, headDim);
+        }
+        PipeBarrier<PIPE_V>();
 
         for (uint32_t head = 0; head < numHeads; head++) {
             uint32_t headOffset = head * headDim;
@@ -234,8 +246,8 @@ private:
             }
             PipeBarrier<PIPE_V>();
 
-            // Apply weight in float
-            Mul(qNormBuf, qNormBuf, qWeightLocal, headDim);
+            // Apply weight in float (both src tensors are now float)
+            Mul(qNormBuf, qNormBuf, weightFloatBufLocal, headDim);
             PipeBarrier<PIPE_V>();
 
             // Cast result back to T
@@ -265,6 +277,15 @@ private:
         LocalTensor<float> workBuf = reduceBuf.Get<float>();
         LocalTensor<float> kBuf = reduceBuf.Get<float>();
         LocalTensor<float> kNormBuf = reduceBuf.Get<float>();
+        LocalTensor<float> weightFloatBufLocal = weightFloatBuf.Get<float>();
+
+        // Cast weight from T to float once per token
+        if constexpr (is_same<T, float>::value) {
+            weightFloatBufLocal = kWeightLocal;
+        } else {
+            Cast(weightFloatBufLocal, kWeightLocal, RoundMode::CAST_NONE, headDim);
+        }
+        PipeBarrier<PIPE_V>();
 
         for (uint32_t head = 0; head < numKvHeads; head++) {
             uint32_t headOffset = head * headDim;
@@ -298,8 +319,8 @@ private:
             }
             PipeBarrier<PIPE_V>();
 
-            // Apply weight in float
-            Mul(kNormBuf, kNormBuf, kWeightLocal, headDim);
+            // Apply weight in float (both src tensors are now float)
+            Mul(kNormBuf, kNormBuf, weightFloatBufLocal, headDim);
             PipeBarrier<PIPE_V>();
 
             // Cast result back to T
@@ -328,28 +349,32 @@ private:
         LocalTensor<T> qRotLocal = outQueueQ.AllocTensor<T>();
         LocalTensor<float> qBuf = reduceBuf.Get<float>();
         LocalTensor<float> cosSinBuf = reduceBuf.Get<float>();
+        // Use inQueueQkv as temp T storage for cos/sin GM loads
+        LocalTensor<T> cosTmpLocal = inQueueQkv.AllocTensor<T>();
 
         for (uint32_t head = 0; head < numHeads; head++) {
             uint32_t baseOffset = head * headDim;
 
             // Cast qNorm to float for this head
             if constexpr (is_same<T, float>::value) {
-                // Already float, copy directly
                 DataCopyCustom<float>(qBuf, qNormLocal[baseOffset], headDim);
             } else {
                 Cast(qBuf, qNormLocal[baseOffset], RoundMode::CAST_NONE, headDim);
             }
             PipeBarrier<PIPE_V>();
 
-            // Cast cos/sin for this head
+            // Load cos from GM to temp T buffer
+            DataCopyCustom<T>(cosTmpLocal, qCosGm[globalTokenId * headDim], headDim);
+
+            // Cast to float
             if constexpr (is_same<T, float>::value) {
-                DataCopyCustom<float>(cosSinBuf, qCosGm[globalTokenId * headDim], headDim);
+                DataCopyCustom<float>(cosSinBuf, cosTmpLocal, headDim);
             } else {
-                Cast(cosSinBuf, qCosGm[globalTokenId * headDim], RoundMode::CAST_NONE, headDim);
+                Cast(cosSinBuf, cosTmpLocal, RoundMode::CAST_NONE, headDim);
             }
             PipeBarrier<PIPE_V>();
 
-            // Compute rotary: q_buf[2i] = q[2i]*cos[2i] - q[2i+1]*sin[2i+1]
+            // Compute rotary in float
             for (uint32_t dim = 0; dim < headDim; dim += 2) {
                 float q0 = qBuf.GetValue(baseOffset + dim);
                 float q1 = qBuf.GetValue(baseOffset + dim + 1);
@@ -364,7 +389,7 @@ private:
             }
             PipeBarrier<PIPE_V>();
 
-            // Cast result back to T
+            // Cast result back to T and copy to output
             if constexpr (is_same<T, float>::value) {
                 DataCopyCustom<T>(qRotLocal[baseOffset], qBuf[baseOffset], headDim);
             } else {
@@ -373,6 +398,7 @@ private:
             PipeBarrier<PIPE_V>();
         }
 
+        inQueueQkv.FreeTensor(cosTmpLocal);
         outQueueQ.FreeTensor(qNormLocal);
         outQueueQ.EnQue(qRotLocal);
     }
@@ -386,6 +412,8 @@ private:
         LocalTensor<T> kRotLocal = outQueueK.AllocTensor<T>();
         LocalTensor<float> kBuf = reduceBuf.Get<float>();
         LocalTensor<float> cosSinBuf = reduceBuf.Get<float>();
+        // Use inQueueQkv as temp T storage for cos/sin GM loads
+        LocalTensor<T> cosTmpLocal = inQueueQkv.AllocTensor<T>();
 
         for (uint32_t head = 0; head < numKvHeads; head++) {
             uint32_t baseOffset = head * headDim;
@@ -398,11 +426,14 @@ private:
             }
             PipeBarrier<PIPE_V>();
 
-            // Cast cos/sin for this head
+            // Load cos from GM to temp T buffer
+            DataCopyCustom<T>(cosTmpLocal, kCosGm[globalTokenId * headDim], headDim);
+
+            // Cast to float
             if constexpr (is_same<T, float>::value) {
-                DataCopyCustom<float>(cosSinBuf, kCosGm[globalTokenId * headDim], headDim);
+                DataCopyCustom<float>(cosSinBuf, cosTmpLocal, headDim);
             } else {
-                Cast(cosSinBuf, kCosGm[globalTokenId * headDim], RoundMode::CAST_NONE, headDim);
+                Cast(cosSinBuf, cosTmpLocal, RoundMode::CAST_NONE, headDim);
             }
             PipeBarrier<PIPE_V>();
 
@@ -430,6 +461,7 @@ private:
             PipeBarrier<PIPE_V>();
         }
 
+        inQueueQkv.FreeTensor(cosTmpLocal);
         outQueueK.FreeTensor(kNormLocal);
         outQueueK.EnQue(kRotLocal);
     }
@@ -477,6 +509,8 @@ private:
     // Float scratch buffers for RMSNorm computation
     TBuf<TPosition::VECCALC> rmsBuf;    // headDim floats for per-head intermediate values
     TBuf<TPosition::VECCALC> reduceBuf; // work buffer for ReduceSumCustom + rstd scalar
+    TBuf<TPosition::VECCALC> weightFloatBuf;  // for casting T weight to float before Mul
+    TBuf<TPosition::VECCALC> rotaryTmpBuf;    // temporary buffer for rotary computation
 
     // Global tensors
     GlobalTensor<T> qkvGm;
