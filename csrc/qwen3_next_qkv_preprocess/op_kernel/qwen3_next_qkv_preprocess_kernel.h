@@ -11,7 +11,7 @@
 #ifndef QWEN3_NEXT_QKV_PREPROCESS_KERNEL_H_
 #define QWEN3_NEXT_QKV_PREPROCESS_KERNEL_H_
 
-#include <AscendC.h>
+#include "kernel_operator.h"
 
 using namespace AscendC;
 
