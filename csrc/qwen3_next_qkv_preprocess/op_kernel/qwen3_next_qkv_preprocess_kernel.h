@@ -12,76 +12,15 @@
 #define QWEN3_NEXT_QKV_PREPROCESS_KERNEL_H_
 
 #include "kernel_operator.h"
+#include "../add_rms_norm_bias/op_kernel/rms_norm_base.h"
 #include <cmath>
 
 using namespace AscendC;
-
-// Local is_same template (not std::is_same, which may not be available in AICORE)
-template <typename, typename>
-struct is_same : public std::false_type {};
-template <typename Tp>
-struct is_same<Tp, Tp> : public std::true_type {};
+using namespace RmsNorm;
 
 // Helper function: CeilDiv for integer division rounding up
 __aicore__ inline constexpr uint32_t CeilDiv(uint32_t a, uint32_t b) {
     return (a + b - 1) / b;
-}
-
-// ReduceSumCustom wrapper for AscendC
-// Uses WholeReduceSum for small reduce dimensions
-__aicore__ inline void ReduceSumCustom(
-    const LocalTensor<float>& dst_local,
-    const LocalTensor<float>& src_local,
-    const LocalTensor<float>& work_local,
-    int32_t count)
-{
-    constexpr uint32_t NUM_PER_REP_FP32 = 8;
-    constexpr uint32_t DEFAULT_REPEAT_STRIDE = 8;
-    constexpr uint32_t MASK_PLACEHOLDER = 64;
-
-    int32_t repeatTimes = count / NUM_PER_REP_FP32;
-    int32_t tailCount = count % NUM_PER_REP_FP32;
-    int32_t bodyCount = repeatTimes * NUM_PER_REP_FP32;
-
-    Duplicate(work_local, ZERO, NUM_PER_REP_FP32);
-    PipeBarrier<PIPE_V>();
-
-    if (likely(repeatTimes > 0)) {
-        Add(work_local, src_local, work_local, MASK_PLACEHOLDER, repeatTimes);
-        PipeBarrier<PIPE_V>();
-    }
-    if (unlikely(tailCount != 0)) {
-        Add(work_local, src_local[bodyCount], work_local, tailCount, 1);
-        PipeBarrier<PIPE_V>();
-    }
-    WholeReduceSum<float, false>(dst_local, work_local, MASK_PLACEHOLDER, 1, 1, 1, DEFAULT_REPEAT_STRIDE);
-    PipeBarrier<PIPE_V>();
-}
-
-// DataCopyCustom wrapper for AscendC
-template <typename T, typename U, typename R>
-__aicore__ inline void DataCopyCustom(const U& dstTensor, const R& srcTensor, const uint32_t count)
-{
-    constexpr uint32_t ONE_BLK_SIZE = 32;
-    constexpr uint32_t BLOCK_SIZE = 32;
-    constexpr uint32_t ONCE_VECTOR_SIZE = 128;
-
-    int32_t numPerBlock = ONE_BLK_SIZE / sizeof(T);
-    if (count % numPerBlock == 0) {
-        DataCopy(dstTensor, srcTensor, count);
-    } else {
-        if constexpr (is_same<U, AscendC::LocalTensor<T>>::value) {
-            int32_t num = ((count + numPerBlock - 1) / numPerBlock) * numPerBlock;
-            DataCopy(dstTensor, srcTensor, num);
-        } else {
-            if (count < numPerBlock) {
-                DataCopy(dstTensor, srcTensor, numPerBlock);
-            } else {
-                int32_t num = ((count + numPerBlock - 1) / numPerBlock) * numPerBlock;
-                DataCopy(dstTensor, srcTensor, num);
-            }
-        }
-    }
 }
 
 // Tiling data structure for Qwen3Next QKV Preprocessing
@@ -185,11 +124,11 @@ public:
     {
         // Load norm weights once; they are reused across all tokens via EnQue/DeQue cycle
         LocalTensor<T> qWeightInit = inQueueQNormWeight.AllocTensor<T>();
-        DataCopyCustom(qWeightInit, qNormWeightGm, headDim);
+        DataCopyCustom<T>(qWeightInit, qNormWeightGm, headDim);
         inQueueQNormWeight.EnQue(qWeightInit);
 
         LocalTensor<T> kWeightInit = inQueueKNormWeight.AllocTensor<T>();
-        DataCopyCustom(kWeightInit, kNormWeightGm, headDim);
+        DataCopyCustom<T>(kWeightInit, kNormWeightGm, headDim);
         inQueueKNormWeight.EnQue(kWeightInit);
 
         for (uint32_t tokenIdx = 0; tokenIdx < tokenWork; tokenIdx++) {
@@ -214,35 +153,35 @@ private:
             // q occupies first qSize elements, gate occupies second qSize elements
 
             LocalTensor<T> qLocal = inQueueQkv.AllocTensor<T>();
-            DataCopyCustom(qLocal, qkvGm[qkvOffset], qSize);
+            DataCopyCustom<T>(qLocal, qkvGm[qkvOffset], qSize);
             inQueueQkv.EnQue(qLocal);
 
             LocalTensor<T> gateLocal = inQueueGate.AllocTensor<T>();
-            DataCopyCustom(gateLocal, qkvGm[qkvOffset + qSize], qSize);
+            DataCopyCustom<T>(gateLocal, qkvGm[qkvOffset + qSize], qSize);
             inQueueGate.EnQue(gateLocal);
 
             LocalTensor<T> kLocal = inQueueQkv.AllocTensor<T>();
-            DataCopyCustom(kLocal, qkvGm[qkvOffset + qSize * 2], kvSize);
+            DataCopyCustom<T>(kLocal, qkvGm[qkvOffset + qSize * 2], kvSize);
             inQueueQkv.EnQue(kLocal);
 
             // V goes to outQueueV directly - no processing needed
             LocalTensor<T> vLocal = outQueueV.AllocTensor<T>();
-            DataCopyCustom(vLocal, qkvGm[qkvOffset + qSize * 2 + kvSize], kvSize);
+            DataCopyCustom<T>(vLocal, qkvGm[qkvOffset + qSize * 2 + kvSize], kvSize);
             outQueueV.EnQue(vLocal);
         } else {
             // QKV layout when attnOutputGate=false: [q(qSize), k(kvSize), v(kvSize)]
 
             LocalTensor<T> qLocal = inQueueQkv.AllocTensor<T>();
-            DataCopyCustom(qLocal, qkvGm[qkvOffset], qSize);
+            DataCopyCustom<T>(qLocal, qkvGm[qkvOffset], qSize);
             inQueueQkv.EnQue(qLocal);
 
             LocalTensor<T> kLocal = inQueueQkv.AllocTensor<T>();
-            DataCopyCustom(kLocal, qkvGm[qkvOffset + qSize], kvSize);
+            DataCopyCustom<T>(kLocal, qkvGm[qkvOffset + qSize], kvSize);
             inQueueQkv.EnQue(kLocal);
 
             // V goes to outQueueV directly
             LocalTensor<T> vLocal = outQueueV.AllocTensor<T>();
-            DataCopyCustom(vLocal, qkvGm[qkvOffset + qSize + kvSize], kvSize);
+            DataCopyCustom<T>(vLocal, qkvGm[qkvOffset + qSize + kvSize], kvSize);
             outQueueV.EnQue(vLocal);
         }
     }
@@ -418,23 +357,23 @@ private:
     {
         // Q output (after RMSNorm + Rotary)
         LocalTensor<T> qLocal = outQueueQ.DeQue<T>();
-        DataCopyCustom(qOutGm[tokenIdx * qSize], qLocal, qSize);
+        DataCopyCustom<T>(qOutGm[tokenIdx * qSize], qLocal, qSize);
         outQueueQ.FreeTensor(qLocal);
 
         // K output (after RMSNorm + Rotary)
         LocalTensor<T> kLocal = outQueueK.DeQue<T>();
-        DataCopyCustom(kOutGm[tokenIdx * kvSize], kLocal, kvSize);
+        DataCopyCustom<T>(kOutGm[tokenIdx * kvSize], kLocal, kvSize);
         outQueueK.FreeTensor(kLocal);
 
         // V output (pass-through, stored in outQueueV by SplitQKV)
         LocalTensor<T> vLocal = outQueueV.DeQue<T>();
-        DataCopyCustom(vOutGm[tokenIdx * kvSize], vLocal, kvSize);
+        DataCopyCustom<T>(vOutGm[tokenIdx * kvSize], vLocal, kvSize);
         outQueueV.FreeTensor(vLocal);
 
         // Gate output (only when attnOutputGate is enabled)
         if (attnOutputGate) {
             LocalTensor<T> gateLocal = inQueueGate.DeQue<T>();
-            DataCopyCustom(gateOutGm[tokenIdx * qSize], gateLocal, qSize);
+            DataCopyCustom<T>(gateOutGm[tokenIdx * qSize], gateLocal, qSize);
             inQueueGate.FreeTensor(gateLocal);
         }
     }
