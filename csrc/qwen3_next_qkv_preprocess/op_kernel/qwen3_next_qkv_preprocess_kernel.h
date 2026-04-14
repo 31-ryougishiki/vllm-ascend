@@ -16,12 +16,10 @@
 #include <cmath>
 
 using namespace AscendC;
-using namespace RmsNorm;
-
-// Helper function: CeilDiv for integer division rounding up
-__aicore__ inline constexpr uint32_t CeilDiv(uint32_t a, uint32_t b) {
-    return (a + b - 1) / b;
-}
+using RmsNorm::ReduceSumCustom;
+using RmsNorm::DataCopyCustom;
+using RmsNorm::is_same;
+using RmsNorm::CeilDiv;
 
 // Tiling data structure for Qwen3Next QKV Preprocessing
 // Must match the host-side Qwen3NextQKVPreprocessTilingData exactly (binary-compatible)
@@ -39,7 +37,7 @@ struct Qwen3NextQKVPreprocessTilingData {
     float epsilon;
 };
 
-constexpr uint32_t BUFFER_NUM = 2;
+constexpr uint32_t QQBUFFER_NUM = 2;
 
 template <typename T>
 class KernelQwen3NextQKVPreprocess {
@@ -105,14 +103,14 @@ public:
         uint32_t ubSizeQK = (maxQKSize > 256) ? 256 : maxQKSize;
         uint32_t ubSizeGate = (qSize > 256) ? 256 : qSize;
 
-        Ppipe->InitBuffer(inQueueQkv, BUFFER_NUM, ubSizeQK * sizeof(T));
-        Ppipe->InitBuffer(inQueueGate, BUFFER_NUM, ubSizeGate * sizeof(T));
-        Ppipe->InitBuffer(inQueueQNormWeight, BUFFER_NUM, headDim * sizeof(T));
-        Ppipe->InitBuffer(inQueueKNormWeight, BUFFER_NUM, headDim * sizeof(T));
-        Ppipe->InitBuffer(outQueueQ, BUFFER_NUM, ubSizeQK * sizeof(T));
-        Ppipe->InitBuffer(outQueueK, BUFFER_NUM, ubSizeQK * sizeof(T));
-        Ppipe->InitBuffer(outQueueV, BUFFER_NUM, ubSizeQK * sizeof(T));
-        Ppipe->InitBuffer(outQueueGate, BUFFER_NUM, ubSizeGate * sizeof(T));
+        Ppipe->InitBuffer(inQueueQkv, QBUFFER_NUM, ubSizeQK * sizeof(T));
+        Ppipe->InitBuffer(inQueueGate, QBUFFER_NUM, ubSizeGate * sizeof(T));
+        Ppipe->InitBuffer(inQueueQNormWeight, QBUFFER_NUM, headDim * sizeof(T));
+        Ppipe->InitBuffer(inQueueKNormWeight, QBUFFER_NUM, headDim * sizeof(T));
+        Ppipe->InitBuffer(outQueueQ, QBUFFER_NUM, ubSizeQK * sizeof(T));
+        Ppipe->InitBuffer(outQueueK, QBUFFER_NUM, ubSizeQK * sizeof(T));
+        Ppipe->InitBuffer(outQueueV, QBUFFER_NUM, ubSizeQK * sizeof(T));
+        Ppipe->InitBuffer(outQueueGate, QBUFFER_NUM, ubSizeGate * sizeof(T));
 
         // Float scratch buffers: headDim floats for RMS computation + 64 floats for reduce work
         uint32_t rmsBufSize = (headDim > 128) ? headDim : 128;
@@ -143,7 +141,7 @@ public:
 
 private:
     // Split input QKV and route each tensor to its destination queue.
-    // V goes directly to outQueueV to avoid exceeding inQueueQkv's BUFFER_NUM=2 capacity.
+    // V goes directly to outQueueV to avoid exceeding inQueueQkv's QBUFFER_NUM=2 capacity.
     __aicore__ inline void SplitQKV(uint32_t tokenIdx)
     {
         uint32_t qkvOffset = tokenIdx * qkvSize;
@@ -381,17 +379,17 @@ private:
 private:
     TPipe* Ppipe = nullptr;
 
-    // Input queues (BUFFER_NUM=2 each)
-    TQue<QuePosition::VECIN, BUFFER_NUM> inQueueQkv;        // Q and K tensors
-    TQue<QuePosition::VECIN, BUFFER_NUM> inQueueGate;       // gate tensor (attnOutputGate=true)
-    TQue<QuePosition::VECIN, BUFFER_NUM> inQueueQNormWeight;
-    TQue<QuePosition::VECIN, BUFFER_NUM> inQueueKNormWeight;
+    // Input queues (QBUFFER_NUM=2 each)
+    TQue<QuePosition::VECIN, QBUFFER_NUM> inQueueQkv;        // Q and K tensors
+    TQue<QuePosition::VECIN, QBUFFER_NUM> inQueueGate;       // gate tensor (attnOutputGate=true)
+    TQue<QuePosition::VECIN, QBUFFER_NUM> inQueueQNormWeight;
+    TQue<QuePosition::VECIN, QBUFFER_NUM> inQueueKNormWeight;
 
     // Output queues
-    TQue<QuePosition::VECOUT, BUFFER_NUM> outQueueQ;
-    TQue<QuePosition::VECOUT, BUFFER_NUM> outQueueK;
-    TQue<QuePosition::VECOUT, BUFFER_NUM> outQueueV;    // V is directly routed here by SplitQKV
-    TQue<QuePosition::VECOUT, BUFFER_NUM> outQueueGate;
+    TQue<QuePosition::VECOUT, QBUFFER_NUM> outQueueQ;
+    TQue<QuePosition::VECOUT, QBUFFER_NUM> outQueueK;
+    TQue<QuePosition::VECOUT, QBUFFER_NUM> outQueueV;    // V is directly routed here by SplitQKV
+    TQue<QuePosition::VECOUT, QBUFFER_NUM> outQueueGate;
 
     // Float scratch buffers for RMSNorm computation
     TBuf<TPosition::VECCALC> rmsBuf;    // headDim floats for per-head intermediate values
