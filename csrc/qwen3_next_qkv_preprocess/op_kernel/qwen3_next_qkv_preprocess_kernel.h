@@ -194,6 +194,8 @@ private:
 
         LocalTensor<float> headBuf = rmsBuf.Get<float>();
         LocalTensor<float> workBuf = reduceBuf.Get<float>();
+        LocalTensor<float> qBuf = reduceBuf.Get<float>();
+        LocalTensor<float> qNormBuf = reduceBuf.Get<float>();
 
         for (uint32_t head = 0; head < numHeads; head++) {
             uint32_t headOffset = head * headDim;
@@ -222,16 +224,27 @@ private:
             float ms = headBuf.GetValue(0);
             float rstdVal = 1.0f / sqrt(ms + epsilon);
 
-            // Store rstd in workBuf[0] for Muls broadcast
-            workBuf.SetValue(0, rstdVal);
+            // Cast input to float, apply rstd in float, then cast back
+            if constexpr (is_same<T, float>::value) {
+                Muls(qNormBuf, qLocal[headOffset], rstdVal, headDim);
+            } else {
+                Cast(qBuf, qLocal[headOffset], RoundMode::CAST_NONE, headDim);
+                PipeBarrier<PIPE_V>();
+                Muls(qNormBuf, qBuf, rstdVal, headDim);
+            }
             PipeBarrier<PIPE_V>();
 
-            // Apply rstd: qNorm[head] = q[head] * rstd
-            Muls(qNormLocal[headOffset], qLocal[headOffset], workBuf, headDim);
+            // Apply weight in float
+            Mul(qNormBuf, qNormBuf, qWeightLocal, headDim);
             PipeBarrier<PIPE_V>();
 
-            // Apply weight: qNorm[head] = qNorm[head] * weight (weight shape [headDim] broadcast per-head)
-            Mul(qNormLocal[headOffset], qNormLocal[headOffset], qWeightLocal, headDim);
+            // Cast result back to T
+            if constexpr (is_same<T, float>::value) {
+                // Already float, copy directly
+                DataCopyCustom<T>(qNormLocal[headOffset], qNormBuf, headDim);
+            } else {
+                Cast(qNormLocal[headOffset], qNormBuf, RoundMode::CAST_NONE, headDim);
+            }
             PipeBarrier<PIPE_V>();
         }
 
@@ -250,6 +263,8 @@ private:
 
         LocalTensor<float> headBuf = rmsBuf.Get<float>();
         LocalTensor<float> workBuf = reduceBuf.Get<float>();
+        LocalTensor<float> kBuf = reduceBuf.Get<float>();
+        LocalTensor<float> kNormBuf = reduceBuf.Get<float>();
 
         for (uint32_t head = 0; head < numKvHeads; head++) {
             uint32_t headOffset = head * headDim;
@@ -273,13 +288,26 @@ private:
             float ms = headBuf.GetValue(0);
             float rstdVal = 1.0f / sqrt(ms + epsilon);
 
-            workBuf.SetValue(0, rstdVal);
+            // Cast input to float, apply rstd in float, then cast back
+            if constexpr (is_same<T, float>::value) {
+                Muls(kNormBuf, kLocal[headOffset], rstdVal, headDim);
+            } else {
+                Cast(kBuf, kLocal[headOffset], RoundMode::CAST_NONE, headDim);
+                PipeBarrier<PIPE_V>();
+                Muls(kNormBuf, kBuf, rstdVal, headDim);
+            }
             PipeBarrier<PIPE_V>();
 
-            Muls(kNormLocal[headOffset], kLocal[headOffset], workBuf, headDim);
+            // Apply weight in float
+            Mul(kNormBuf, kNormBuf, kWeightLocal, headDim);
             PipeBarrier<PIPE_V>();
 
-            Mul(kNormLocal[headOffset], kNormLocal[headOffset], kWeightLocal, headDim);
+            // Cast result back to T
+            if constexpr (is_same<T, float>::value) {
+                DataCopyCustom<T>(kNormLocal[headOffset], kNormBuf, headDim);
+            } else {
+                Cast(kNormLocal[headOffset], kNormBuf, RoundMode::CAST_NONE, headDim);
+            }
             PipeBarrier<PIPE_V>();
         }
 
@@ -298,23 +326,51 @@ private:
         uint32_t globalTokenId = startToken + tokenIdx;
 
         LocalTensor<T> qRotLocal = outQueueQ.AllocTensor<T>();
+        LocalTensor<float> qBuf = reduceBuf.Get<float>();
+        LocalTensor<float> cosSinBuf = reduceBuf.Get<float>();
 
         for (uint32_t head = 0; head < numHeads; head++) {
             uint32_t baseOffset = head * headDim;
 
-            for (uint32_t dim = 0; dim < headDim; dim += 2) {
-                uint32_t idx0 = baseOffset + dim;
-                uint32_t idx1 = baseOffset + dim + 1;
-                uint32_t cosSinOffset = globalTokenId * headDim + dim;
-
-                T q0 = qNormLocal.GetValue(idx0);
-                T q1 = qNormLocal.GetValue(idx1);
-                T cosVal = qCosGm.GetValue(cosSinOffset);
-                T sinVal = qSinGm.GetValue(cosSinOffset);
-
-                qRotLocal.SetValue(idx0, q0 * cosVal - q1 * sinVal);
-                qRotLocal.SetValue(idx1, q0 * sinVal + q1 * cosVal);
+            // Cast qNorm to float for this head
+            if constexpr (is_same<T, float>::value) {
+                // Already float, copy directly
+                DataCopyCustom<float>(qBuf, qNormLocal[baseOffset], headDim);
+            } else {
+                Cast(qBuf, qNormLocal[baseOffset], RoundMode::CAST_NONE, headDim);
             }
+            PipeBarrier<PIPE_V>();
+
+            // Cast cos/sin for this head
+            if constexpr (is_same<T, float>::value) {
+                DataCopyCustom<float>(cosSinBuf, qCosGm[globalTokenId * headDim], headDim);
+            } else {
+                Cast(cosSinBuf, qCosGm[globalTokenId * headDim], RoundMode::CAST_NONE, headDim);
+            }
+            PipeBarrier<PIPE_V>();
+
+            // Compute rotary: q_buf[2i] = q[2i]*cos[2i] - q[2i+1]*sin[2i+1]
+            for (uint32_t dim = 0; dim < headDim; dim += 2) {
+                float q0 = qBuf.GetValue(baseOffset + dim);
+                float q1 = qBuf.GetValue(baseOffset + dim + 1);
+                float cosVal = cosSinBuf.GetValue(dim);
+                float sinVal = cosSinBuf.GetValue(dim + 1);
+
+                float rot0 = q0 * cosVal - q1 * sinVal;
+                float rot1 = q0 * sinVal + q1 * cosVal;
+
+                qBuf.SetValue(baseOffset + dim, rot0);
+                qBuf.SetValue(baseOffset + dim + 1, rot1);
+            }
+            PipeBarrier<PIPE_V>();
+
+            // Cast result back to T
+            if constexpr (is_same<T, float>::value) {
+                DataCopyCustom<T>(qRotLocal[baseOffset], qBuf[baseOffset], headDim);
+            } else {
+                Cast(qRotLocal[baseOffset], qBuf[baseOffset], RoundMode::CAST_NONE, headDim);
+            }
+            PipeBarrier<PIPE_V>();
         }
 
         outQueueQ.FreeTensor(qNormLocal);
@@ -328,23 +384,50 @@ private:
         uint32_t globalTokenId = startToken + tokenIdx;
 
         LocalTensor<T> kRotLocal = outQueueK.AllocTensor<T>();
+        LocalTensor<float> kBuf = reduceBuf.Get<float>();
+        LocalTensor<float> cosSinBuf = reduceBuf.Get<float>();
 
         for (uint32_t head = 0; head < numKvHeads; head++) {
             uint32_t baseOffset = head * headDim;
 
-            for (uint32_t dim = 0; dim < headDim; dim += 2) {
-                uint32_t idx0 = baseOffset + dim;
-                uint32_t idx1 = baseOffset + dim + 1;
-                uint32_t cosSinOffset = globalTokenId * headDim + dim;
-
-                T k0 = kNormLocal.GetValue(idx0);
-                T k1 = kNormLocal.GetValue(idx1);
-                T cosVal = kCosGm.GetValue(cosSinOffset);
-                T sinVal = kSinGm.GetValue(cosSinOffset);
-
-                kRotLocal.SetValue(idx0, k0 * cosVal - k1 * sinVal);
-                kRotLocal.SetValue(idx1, k0 * sinVal + k1 * cosVal);
+            // Cast kNorm to float for this head
+            if constexpr (is_same<T, float>::value) {
+                DataCopyCustom<float>(kBuf, kNormLocal[baseOffset], headDim);
+            } else {
+                Cast(kBuf, kNormLocal[baseOffset], RoundMode::CAST_NONE, headDim);
             }
+            PipeBarrier<PIPE_V>();
+
+            // Cast cos/sin for this head
+            if constexpr (is_same<T, float>::value) {
+                DataCopyCustom<float>(cosSinBuf, kCosGm[globalTokenId * headDim], headDim);
+            } else {
+                Cast(cosSinBuf, kCosGm[globalTokenId * headDim], RoundMode::CAST_NONE, headDim);
+            }
+            PipeBarrier<PIPE_V>();
+
+            // Compute rotary: k_buf[2i] = k[2i]*cos[2i] - k[2i+1]*sin[2i+1]
+            for (uint32_t dim = 0; dim < headDim; dim += 2) {
+                float k0 = kBuf.GetValue(baseOffset + dim);
+                float k1 = kBuf.GetValue(baseOffset + dim + 1);
+                float cosVal = cosSinBuf.GetValue(dim);
+                float sinVal = cosSinBuf.GetValue(dim + 1);
+
+                float rot0 = k0 * cosVal - k1 * sinVal;
+                float rot1 = k0 * sinVal + k1 * cosVal;
+
+                kBuf.SetValue(baseOffset + dim, rot0);
+                kBuf.SetValue(baseOffset + dim + 1, rot1);
+            }
+            PipeBarrier<PIPE_V>();
+
+            // Cast result back to T
+            if constexpr (is_same<T, float>::value) {
+                DataCopyCustom<T>(kRotLocal[baseOffset], kBuf[baseOffset], headDim);
+            } else {
+                Cast(kRotLocal[baseOffset], kBuf[baseOffset], RoundMode::CAST_NONE, headDim);
+            }
+            PipeBarrier<PIPE_V>();
         }
 
         outQueueK.FreeTensor(kNormLocal);
