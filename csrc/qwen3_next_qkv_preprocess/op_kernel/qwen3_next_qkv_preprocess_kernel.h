@@ -21,6 +21,9 @@ using RmsNorm::DataCopyCustom;
 using RmsNorm::is_same;
 using RmsNorm::CeilDiv;
 
+#ifndef QWEN3_NEXT_QKV_PREPROCESS_TILING_DATA_H_
+#define QWEN3_NEXT_QKV_PREPROCESS_TILING_DATA_H_
+
 // Tiling data structure for Qwen3Next QKV Preprocessing
 // Must match the host-side Qwen3NextQKVPreprocessTilingData exactly (binary-compatible)
 struct Qwen3NextQKVPreprocessTilingData {
@@ -36,6 +39,7 @@ struct Qwen3NextQKVPreprocessTilingData {
     uint32_t attnOutputGate;  // 0 or 1
     float epsilon;
 };
+#endif  // QWEN3_NEXT_QKV_PREPROCESS_TILING_DATA_H_
 
 constexpr uint32_t QBUFFER_NUM = 2;
 
