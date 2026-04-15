@@ -53,8 +53,8 @@ public:
 
     __aicore__ inline void Init(
         GM_ADDR qkv, GM_ADDR qNormWeight, GM_ADDR kNormWeight,
-        GM_ADDR qCos, GM_ADDR qSin, GM_ADDR kCos, GM_ADDR kSin,
-        GM_ADDR positions, GM_ADDR qOut, GM_ADDR kOut, GM_ADDR vOut, GM_ADDR gateOut,
+        GM_ADDR cosSinCache, GM_ADDR positions,
+        GM_ADDR qOut, GM_ADDR kOut, GM_ADDR vOut, GM_ADDR gateOut,
         const Qwen3NextQKVPreprocessTilingData* tiling)
     {
         ASSERT(GetBlockNum() != 0 && "Block dim can not be zero!");
@@ -97,11 +97,9 @@ public:
         qNormWeightGm.SetGlobalBuffer((__gm__ T*)qNormWeight, headDim);
         kNormWeightGm.SetGlobalBuffer((__gm__ T*)kNormWeight, headDim);
 
-        // Rotary embeddings: [numTokens, headDim]
-        qCosGm.SetGlobalBuffer((__gm__ T*)qCos, numTokens * headDim);
-        qSinGm.SetGlobalBuffer((__gm__ T*)qSin, numTokens * headDim);
-        kCosGm.SetGlobalBuffer((__gm__ T*)kCos, numTokens * headDim);
-        kSinGm.SetGlobalBuffer((__gm__ T*)kSin, numTokens * headDim);
+        // Rotary embeddings: [maxPosition, headDim * 2] - first half is cos, second half is sin
+        // cosSinCache is indexed as: positionId * headDim * 2 + dim (for cos) or + headDim + dim (for sin)
+        cosSinCacheGm.SetGlobalBuffer((__gm__ T*)cosSinCache, numTokens * headDim * 2);
 
         // Positions: [numTokens] - position IDs for each token in rotary embedding
         positionsGm.SetGlobalBuffer((__gm__ int64_t*)positions, numTokens);
@@ -365,11 +363,14 @@ private:
     // Apply interleaved rotary embedding to Q:
     //   rotary[2i]   = q[2i]*cos[2i]   - q[2i+1]*sin[2i+1]
     //   rotary[2i+1] = q[2i]*sin[2i]   + q[2i+1]*cos[2i+1]
-    // cos/sin indexed as: positions[tokenIdx] * headDim + dim
+    // cosSinCache: [maxPosition, headDim * 2], first half is cos, second half is sin
+    // cos for position: cosSinCache[positionId * headDim * 2 + dim]
+    // sin for position: cosSinCache[positionId * headDim * 2 + headDim + dim]
     __aicore__ inline void ApplyRotaryQ(uint32_t tokenIdx)
     {
         LocalTensor<T> qNormLocal = outQueueQ.DeQue<T>();
         uint32_t positionId = positionsGm.GetValue(tokenIdx);
+        uint32_t cosSinBase = positionId * headDim * 2;  // base offset for cos/sin in cosSinCache
 
         LocalTensor<T> qRotLocal = outQueueQ.AllocTensor<T>();
         // Use separate buffers to avoid data overlap
@@ -390,7 +391,7 @@ private:
             PipeBarrier<PIPE_V>();
 
             // Load cos from GM to temp T buffer
-            DataCopyCustom<T>(cosTmpLocal, qCosGm[positionId * headDim], headDim);
+            DataCopyCustom<T>(cosTmpLocal, cosSinCacheGm[cosSinBase], headDim);
 
             // Cast to float (data in cosSinBuf[0..headDim-1])
             if constexpr (is_same<T, float>::value) {
@@ -401,7 +402,7 @@ private:
             PipeBarrier<PIPE_V>();
 
             // Also load sin to cosSinBuf[headDim..2*headDim-1]
-            DataCopyCustom<T>(cosTmpLocal, qSinGm[positionId * headDim], headDim);
+            DataCopyCustom<T>(cosTmpLocal, cosSinCacheGm[cosSinBase + headDim], headDim);
             if constexpr (is_same<T, float>::value) {
                 DataCopyCustom<float>(cosSinBuf[headDim], cosTmpLocal, headDim);
             } else {
@@ -435,10 +436,14 @@ private:
     }
 
     // Apply interleaved rotary embedding to K over all numKvHeads.
+    // cosSinCache: [maxPosition, headDim * 2], first half is cos, second half is sin
+    // cos for position: cosSinCache[positionId * headDim * 2 + dim]
+    // sin for position: cosSinCache[positionId * headDim * 2 + headDim + dim]
     __aicore__ inline void ApplyRotaryK(uint32_t tokenIdx)
     {
         LocalTensor<T> kNormLocal = outQueueK.DeQue<T>();
         uint32_t positionId = positionsGm.GetValue(tokenIdx);
+        uint32_t cosSinBase = positionId * headDim * 2;  // base offset for cos/sin in cosSinCache
 
         LocalTensor<T> kRotLocal = outQueueK.AllocTensor<T>();
         // Use separate buffers to avoid data overlap
@@ -459,7 +464,7 @@ private:
             PipeBarrier<PIPE_V>();
 
             // Load cos from GM to temp T buffer
-            DataCopyCustom<T>(cosTmpLocal, kCosGm[positionId * headDim], headDim);
+            DataCopyCustom<T>(cosTmpLocal, cosSinCacheGm[cosSinBase], headDim);
 
             // Cast to float (cos data in cosSinBuf[0..headDim-1])
             if constexpr (is_same<T, float>::value) {
@@ -470,7 +475,7 @@ private:
             PipeBarrier<PIPE_V>();
 
             // Also load sin to cosSinBuf[headDim..2*headDim-1]
-            DataCopyCustom<T>(cosTmpLocal, kSinGm[positionId * headDim], headDim);
+            DataCopyCustom<T>(cosTmpLocal, cosSinCacheGm[cosSinBase + headDim], headDim);
             if constexpr (is_same<T, float>::value) {
                 DataCopyCustom<float>(cosSinBuf[headDim], cosTmpLocal, headDim);
             } else {
@@ -557,10 +562,7 @@ private:
     GlobalTensor<T> gateOutGm;
     GlobalTensor<T> qNormWeightGm;
     GlobalTensor<T> kNormWeightGm;
-    GlobalTensor<T> qCosGm;
-    GlobalTensor<T> qSinGm;
-    GlobalTensor<T> kCosGm;
-    GlobalTensor<T> kSinGm;
+    GlobalTensor<T> cosSinCacheGm;  // [maxPosition, headDim * 2] - cos and sin concatenated
     GlobalTensor<int64_t> positionsGm;  // position IDs for rotary embedding
 
     // Parameters from tiling

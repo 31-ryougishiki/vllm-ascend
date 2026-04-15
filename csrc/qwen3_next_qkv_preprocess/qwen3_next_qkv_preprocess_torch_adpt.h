@@ -9,7 +9,7 @@
  *
  * Unless required by applicable law or agreed to in writing, software
  * distributed under the License is distributed on an "AS IS" BASIS,
- * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * WITHOUT WARRANTIES OF CONDITIONS OF ANY KIND, either express or implied.
  * See the License for the specific language governing permissions and
  * limitations under the License.
  */
@@ -23,8 +23,8 @@ namespace vllm_ascend {
  *
  * Implements qwen3_next.py lines 918-937:
  * 1. QKV split based on attn_output_gate
- * 2. Q RMSNorm
- * 3. K RMSNorm
+ * 2. Q RMSNorm (GemmaRMSNorm: x * (1 + w) / sqrt(mean(x^2) + eps))
+ * 3. K RMSNorm (same formula)
  * 4. Rotary Embedding
  *
  * Input layout (matches vLLM's qkv_proj output):
@@ -60,14 +60,6 @@ std::tuple<at::Tensor, at::Tensor, at::Tensor, at::Tensor> npu_qwen3_next_qkv_pr
     int64_t qkvSize = qkv.size(1);
     bool attnOutputGate = (qkvSize == expectedSizeWithGate);
 
-    // Split cosSinCache into qCos, qSin, kCos, kSin
-    // cosSinCache shape: [maxPosition, headDim * 2] where first half is cos, second half is sin
-    int64_t maxPosition = cosSinCache.size(0);
-    at::Tensor qCos = cosSinCache.slice(1, 0, headDim);
-    at::Tensor qSin = cosSinCache.slice(1, headDim, headDim * 2);
-    at::Tensor kCos = qCos;  // Same cos for k
-    at::Tensor kSin = qSin;  // Same sin for k
-
     // Output tensors
     at::Tensor qOut = at::empty({numTokens, qSize}, qkv.options());
     at::Tensor kOut = at::empty({numTokens, kvSize}, qkv.options());
@@ -79,15 +71,13 @@ std::tuple<at::Tensor, at::Tensor, at::Tensor, at::Tensor> npu_qwen3_next_qkv_pr
     }
 
     // Call the NPU operator
+    // cosSinCache is passed directly - kernel computes offsets internally
     // qkv layout is passed directly from vLLM's qkv_proj output
     EXEC_NPU_CMD(aclnnQwen3NextQKVPreprocess,
                   qkv,
                   qNormWeight,
                   kNormWeight,
-                  qCos,
-                  qSin,
-                  kCos,
-                  kSin,
+                  cosSinCache,
                   positions,
                   1e-6f,  // epsilon
                   numTokens,
