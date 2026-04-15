@@ -29,7 +29,11 @@ namespace vllm_ascend {
  *
  * Input layout (matches vLLM's qkv_proj output):
  *   attnOutputGate=true:  qkv=[q_gate(2*qSize), k(kvSize), v(kvSize)]
+ *                         where q_gate is [q, gate] (each qSize)
  *   attnOutputGate=false: qkv=[q(qSize), k(kvSize), v(kvSize)]
+ *
+ * cosSinCache: [maxPosition, headDim * 2] - concatenated cos and sin
+ * positions: [numTokens] - position IDs for each token
  *
  * Returns Q, K, V tensors (and gate if attn_output_gate is enabled)
  */
@@ -37,20 +41,33 @@ std::tuple<at::Tensor, at::Tensor, at::Tensor, at::Tensor> npu_qwen3_next_qkv_pr
     const at::Tensor& qkv,
     const at::Tensor& qNormWeight,
     const at::Tensor& kNormWeight,
-    const at::Tensor& qCos,
-    const at::Tensor& qSin,
-    const at::Tensor& kCos,
-    const at::Tensor& kSin,
-    double epsilon,
-    int64_t numTokens,
+    const at::Tensor& cosSinCache,
+    const at::Tensor& positions,
     int64_t numHeads,
     int64_t numKvHeads,
-    int64_t headDim,
-    int64_t qSize,
-    int64_t kvSize,
-    int64_t qkvSize,
-    bool attnOutputGate)
+    int64_t headDim)
 {
+    // Derive sizes from parameters
+    int64_t qSize = numHeads * headDim;
+    int64_t kvSize = numKvHeads * headDim;
+    int64_t numTokens = qkv.size(0);
+
+    // Determine qkvSize and attnOutputGate from input shape
+    // qkv layout when attnOutputGate=true: [q_gate(2*qSize), k(kvSize), v(kvSize)]
+    // qkv layout when attnOutputGate=false: [q(qSize), k(kvSize), v(kvSize)]
+    int64_t expectedSizeWithGate = 2 * qSize + 2 * kvSize;
+    int64_t expectedSizeWithoutGate = qSize + 2 * kvSize;
+    int64_t qkvSize = qkv.size(1);
+    bool attnOutputGate = (qkvSize == expectedSizeWithGate);
+
+    // Split cosSinCache into qCos, qSin, kCos, kSin
+    // cosSinCache shape: [maxPosition, headDim * 2] where first half is cos, second half is sin
+    int64_t maxPosition = cosSinCache.size(0);
+    at::Tensor qCos = cosSinCache.slice(1, 0, headDim);
+    at::Tensor qSin = cosSinCache.slice(1, headDim, headDim * 2);
+    at::Tensor kCos = qCos;  // Same cos for k
+    at::Tensor kSin = qSin;  // Same sin for k
+
     // Output tensors
     at::Tensor qOut = at::empty({numTokens, qSize}, qkv.options());
     at::Tensor kOut = at::empty({numTokens, kvSize}, qkv.options());
@@ -71,7 +88,8 @@ std::tuple<at::Tensor, at::Tensor, at::Tensor, at::Tensor> npu_qwen3_next_qkv_pr
                   qSin,
                   kCos,
                   kSin,
-                  epsilon,
+                  positions,
+                  1e-6f,  // epsilon
                   numTokens,
                   numHeads,
                   numKvHeads,

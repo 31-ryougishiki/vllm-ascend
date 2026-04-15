@@ -54,7 +54,7 @@ public:
     __aicore__ inline void Init(
         GM_ADDR qkv, GM_ADDR qNormWeight, GM_ADDR kNormWeight,
         GM_ADDR qCos, GM_ADDR qSin, GM_ADDR kCos, GM_ADDR kSin,
-        GM_ADDR qOut, GM_ADDR kOut, GM_ADDR vOut, GM_ADDR gateOut,
+        GM_ADDR positions, GM_ADDR qOut, GM_ADDR kOut, GM_ADDR vOut, GM_ADDR gateOut,
         const Qwen3NextQKVPreprocessTilingData* tiling)
     {
         ASSERT(GetBlockNum() != 0 && "Block dim can not be zero!");
@@ -102,6 +102,9 @@ public:
         qSinGm.SetGlobalBuffer((__gm__ T*)qSin, numTokens * headDim);
         kCosGm.SetGlobalBuffer((__gm__ T*)kCos, numTokens * headDim);
         kSinGm.SetGlobalBuffer((__gm__ T*)kSin, numTokens * headDim);
+
+        // Positions: [numTokens] - position IDs for each token in rotary embedding
+        positionsGm.SetGlobalBuffer((__gm__ int64_t*)positions, numTokens);
 
         // UB buffer sizing: inQueueQkv holds Q (qSize) and K (kvSize) in separate buffers
         // Use max(qSize, kvSize) so either Q or K fits in a single buffer slot
@@ -362,11 +365,11 @@ private:
     // Apply interleaved rotary embedding to Q:
     //   rotary[2i]   = q[2i]*cos[2i]   - q[2i+1]*sin[2i+1]
     //   rotary[2i+1] = q[2i]*sin[2i]   + q[2i+1]*cos[2i+1]
-    // cos/sin indexed as: globalTokenId * headDim + dim
+    // cos/sin indexed as: positions[tokenIdx] * headDim + dim
     __aicore__ inline void ApplyRotaryQ(uint32_t tokenIdx)
     {
         LocalTensor<T> qNormLocal = outQueueQ.DeQue<T>();
-        uint32_t globalTokenId = startToken + tokenIdx;
+        uint32_t positionId = positionsGm.GetValue(tokenIdx);
 
         LocalTensor<T> qRotLocal = outQueueQ.AllocTensor<T>();
         // Use separate buffers to avoid data overlap
@@ -387,7 +390,7 @@ private:
             PipeBarrier<PIPE_V>();
 
             // Load cos from GM to temp T buffer
-            DataCopyCustom<T>(cosTmpLocal, qCosGm[globalTokenId * headDim], headDim);
+            DataCopyCustom<T>(cosTmpLocal, qCosGm[positionId * headDim], headDim);
 
             // Cast to float (data in cosSinBuf[0..headDim-1])
             if constexpr (is_same<T, float>::value) {
@@ -398,7 +401,7 @@ private:
             PipeBarrier<PIPE_V>();
 
             // Also load sin to cosSinBuf[headDim..2*headDim-1]
-            DataCopyCustom<T>(cosTmpLocal, qSinGm[globalTokenId * headDim], headDim);
+            DataCopyCustom<T>(cosTmpLocal, qSinGm[positionId * headDim], headDim);
             if constexpr (is_same<T, float>::value) {
                 DataCopyCustom<float>(cosSinBuf[headDim], cosTmpLocal, headDim);
             } else {
@@ -435,7 +438,7 @@ private:
     __aicore__ inline void ApplyRotaryK(uint32_t tokenIdx)
     {
         LocalTensor<T> kNormLocal = outQueueK.DeQue<T>();
-        uint32_t globalTokenId = startToken + tokenIdx;
+        uint32_t positionId = positionsGm.GetValue(tokenIdx);
 
         LocalTensor<T> kRotLocal = outQueueK.AllocTensor<T>();
         // Use separate buffers to avoid data overlap
@@ -456,7 +459,7 @@ private:
             PipeBarrier<PIPE_V>();
 
             // Load cos from GM to temp T buffer
-            DataCopyCustom<T>(cosTmpLocal, kCosGm[globalTokenId * headDim], headDim);
+            DataCopyCustom<T>(cosTmpLocal, kCosGm[positionId * headDim], headDim);
 
             // Cast to float (cos data in cosSinBuf[0..headDim-1])
             if constexpr (is_same<T, float>::value) {
@@ -467,7 +470,7 @@ private:
             PipeBarrier<PIPE_V>();
 
             // Also load sin to cosSinBuf[headDim..2*headDim-1]
-            DataCopyCustom<T>(cosTmpLocal, kSinGm[globalTokenId * headDim], headDim);
+            DataCopyCustom<T>(cosTmpLocal, kSinGm[positionId * headDim], headDim);
             if constexpr (is_same<T, float>::value) {
                 DataCopyCustom<float>(cosSinBuf[headDim], cosTmpLocal, headDim);
             } else {
@@ -558,6 +561,7 @@ private:
     GlobalTensor<T> qSinGm;
     GlobalTensor<T> kCosGm;
     GlobalTensor<T> kSinGm;
+    GlobalTensor<int64_t> positionsGm;  // position IDs for rotary embedding
 
     // Parameters from tiling
     uint32_t numTokens;
