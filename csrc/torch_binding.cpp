@@ -971,13 +971,14 @@ TORCH_LIBRARY_EXPAND(CONCAT(_C, _ascend), ops)
     ops.impl("moe_grouped_matmul", torch::kPrivateUse1,&vllm_ascend::moe_grouped_matmul);
 
     ops.def(
-        "npu_qwen3_next_qkv_preprocess(Tensor hiddenStates, "
+        "npu_qwen3_next_qkv_preprocess(Tensor qkv, "
         "Tensor qNormWeight, "
         "Tensor kNormWeight, "
         "Tensor qCos, "
         "Tensor qSin, "
         "Tensor kCos, "
         "Tensor kSin, "
+        "Tensor gate, "
         "float epsilon=1e-6, "
         "int numTokens=0, "
         "int numHeads=0, "

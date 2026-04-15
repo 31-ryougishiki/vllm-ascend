@@ -27,16 +27,22 @@ namespace vllm_ascend {
  * 3. K RMSNorm
  * 4. Rotary Embedding
  *
+ * Input layout:
+ *   attnOutputGate=true:  qkv=[q,q,gate,k,v] (actually [q|k|v] since gate is separate input)
+ *                          gate=separate gate tensor [qSize]
+ *   attnOutputGate=false: qkv=[q,k,v], gate=empty
+ *
  * Returns Q, K, V tensors (and gate if attn_output_gate is enabled)
  */
 std::tuple<at::Tensor, at::Tensor, at::Tensor, at::Tensor> npu_qwen3_next_qkv_preprocess(
-    const at::Tensor& hiddenStates,
+    const at::Tensor& qkv,
     const at::Tensor& qNormWeight,
     const at::Tensor& kNormWeight,
     const at::Tensor& qCos,
     const at::Tensor& qSin,
     const at::Tensor& kCos,
     const at::Tensor& kSin,
+    const at::Tensor& gate,
     double epsilon,
     int64_t numTokens,
     int64_t numHeads,
@@ -48,25 +54,26 @@ std::tuple<at::Tensor, at::Tensor, at::Tensor, at::Tensor> npu_qwen3_next_qkv_pr
     bool attnOutputGate)
 {
     // Output tensors
-    at::Tensor qOut = at::empty({numTokens, qSize}, hiddenStates.options());
-    at::Tensor kOut = at::empty({numTokens, kvSize}, hiddenStates.options());
-    at::Tensor vOut = at::empty({numTokens, kvSize}, hiddenStates.options());
+    at::Tensor qOut = at::empty({numTokens, qSize}, qkv.options());
+    at::Tensor kOut = at::empty({numTokens, kvSize}, qkv.options());
+    at::Tensor vOut = at::empty({numTokens, kvSize}, qkv.options());
     at::Tensor gateOut;
 
     if (attnOutputGate) {
-        gateOut = at::empty({numTokens, qSize}, hiddenStates.options());
+        gateOut = at::empty({numTokens, qSize}, qkv.options());
     }
 
     // Call the NPU operator
     if (attnOutputGate) {
         EXEC_NPU_CMD(aclnnQwen3NextQKVPreprocess,
-                      hiddenStates,
+                      qkv,
                       qNormWeight,
                       kNormWeight,
                       qCos,
                       qSin,
                       kCos,
                       kSin,
+                      gate,
                       epsilon,
                       numTokens,
                       numHeads,
@@ -83,13 +90,14 @@ std::tuple<at::Tensor, at::Tensor, at::Tensor, at::Tensor> npu_qwen3_next_qkv_pr
         return std::make_tuple(qOut, kOut, vOut, gateOut);
     } else {
         EXEC_NPU_CMD(aclnnQwen3NextQKVPreprocess,
-                      hiddenStates,
+                      qkv,
                       qNormWeight,
                       kNormWeight,
                       qCos,
                       qSin,
                       kCos,
                       kSin,
+                      gate,
                       epsilon,
                       numTokens,
                       numHeads,
@@ -101,9 +109,10 @@ std::tuple<at::Tensor, at::Tensor, at::Tensor, at::Tensor> npu_qwen3_next_qkv_pr
                       0,  // attnOutputGate disabled
                       qOut,
                       kOut,
-                      vOut);
+                      vOut,
+                      gateOut);
         // Return empty tensor for gate to maintain interface consistency
-        gateOut = at::empty({0}, hiddenStates.options());
+        gateOut = at::empty({0}, qkv.options());
         return std::make_tuple(qOut, kOut, vOut, gateOut);
     }
 }

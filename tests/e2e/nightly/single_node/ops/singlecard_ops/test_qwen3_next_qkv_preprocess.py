@@ -114,6 +114,7 @@ def qwen3_next_qkv_preprocess_reference(
     q_sin: torch.Tensor,
     k_cos: torch.Tensor,
     k_sin: torch.Tensor,
+    gate: torch.Tensor,
     num_tokens: int,
     num_heads: int,
     num_kv_heads: int,
@@ -127,25 +128,21 @@ def qwen3_next_qkv_preprocess_reference(
 
     Args:
         qkv: Input tensor of shape [numTokens, qkvTotalSize]
+             Layout: [q(qSize), k(kvSize), v(kvSize)]
         q_weight: Q RMSNorm weight of shape [headDim]
         k_weight: K RMSNorm weight of shape [headDim]
         q_cos: Q cos of shape [numTokens, headDim]
         q_sin: Q sin of shape [numTokens, headDim]
         k_cos: K cos of shape [numTokens, headDim]
         k_sin: K sin of shape [numTokens, headDim]
-        attn_output_gate: If True, layout is [q_gate(2*qSize), k(kvSize), v(kvSize)]
-                         If False, layout is [q(qSize), k(kvSize), v(kvSize)]
+        gate: Gate tensor of shape [numTokens, qSize] when attn_output_gate=True, else empty
+        attn_output_gate: If True, gate is passed separately
+                         If False, gate is empty tensor
     Returns:
         (q_out, k_out, v_out, gate_out) tensors
     """
-    if attn_output_gate:
-        # Layout: [q_gate(2*qSize), k(kvSize), v(kvSize)]
-        q_gate, k, v = torch.split(qkv, [q_size * 2, kv_size, kv_size], dim=-1)
-        q, gate = torch.split(q_gate, [q_size, q_size], dim=-1)
-    else:
-        # Layout: [q(qSize), k(kvSize), v(kvSize)]
-        q, k, v = torch.split(qkv, [q_size, kv_size, kv_size], dim=-1)
-        gate = torch.empty(0, dtype=q.dtype, device=q.device)
+    # Split qkv into [q, k, v]
+    q, k, v = torch.split(qkv, [q_size, kv_size, kv_size], dim=-1)
 
     # Reshape for per-head RMSNorm: [numTokens, numHeads, headDim]
     q_reshaped = q.reshape(num_tokens, num_heads, head_dim)
@@ -175,6 +172,7 @@ def qwen3_next_qkv_preprocess_npu(
     q_sin: torch.Tensor,
     k_cos: torch.Tensor,
     k_sin: torch.Tensor,
+    gate: torch.Tensor,
     num_tokens: int,
     num_heads: int,
     num_kv_heads: int,
@@ -188,6 +186,10 @@ def qwen3_next_qkv_preprocess_npu(
     """Call NPU qwen3_next_qkv_preprocess operator.
 
     Registered in torch_binding.cpp as torch.ops._C_ascend.npu_qwen3_next_qkv_preprocess.
+
+    Input layout:
+        qkv: [q(qSize), k(kvSize), v(kvSize)]
+        gate: [qSize] when attn_output_gate=True, empty tensor otherwise
     """
     return torch.ops._C_ascend.npu_qwen3_next_qkv_preprocess(
         qkv,
@@ -197,6 +199,7 @@ def qwen3_next_qkv_preprocess_npu(
         q_sin,
         k_cos,
         k_sin,
+        gate,
         epsilon,
         num_tokens,
         num_heads,
@@ -234,14 +237,13 @@ def test_qwen3_next_qkv_preprocess(
 
     q_size = num_q_heads * head_dim
     kv_size = num_kv_heads * head_dim
-    if attn_output_gate:
-        qkv_size = q_size * 2 + kv_size * 2
-    else:
-        qkv_size = q_size + kv_size * 2
+    # qkv layout: [q(qSize), k(kvSize), v(kvSize)]
+    qkv_size = q_size + kv_size * 2
 
     atol, rtol = ATOL_RTOL[dtype]
 
     # Create input tensors on NPU
+    # qkv: [q, k, v] layout
     qkv = torch.randn(num_tokens, qkv_size, dtype=dtype, device=device)
     q_weight = torch.randn(head_dim, dtype=dtype, device=device)
     k_weight = torch.randn(head_dim, dtype=dtype, device=device)
@@ -252,6 +254,12 @@ def test_qwen3_next_qkv_preprocess(
     k_cos = torch.randn(num_tokens, head_dim, dtype=dtype, device=device)
     k_sin = torch.randn(num_tokens, head_dim, dtype=dtype, device=device)
 
+    # gate: separate tensor when attn_output_gate=True
+    if attn_output_gate:
+        gate = torch.randn(num_tokens, q_size, dtype=dtype, device=device)
+    else:
+        gate = torch.empty(0, dtype=dtype, device=device)
+
     # Reference result (computed on CPU/NPU)
     q_ref, k_ref, v_ref, gate_ref = qwen3_next_qkv_preprocess_reference(
         qkv,
@@ -261,6 +269,7 @@ def test_qwen3_next_qkv_preprocess(
         q_sin,
         k_cos,
         k_sin,
+        gate,
         num_tokens,
         num_q_heads,
         num_kv_heads,
@@ -280,6 +289,7 @@ def test_qwen3_next_qkv_preprocess(
         q_sin,
         k_cos,
         k_sin,
+        gate,
         num_tokens,
         num_q_heads,
         num_kv_heads,
@@ -310,7 +320,8 @@ def test_qwen3_next_qkv_preprocess(
     )
 
     # Verify V output (pass-through)
-    v_expected = qkv[..., q_size * 2:q_size * 2 + kv_size] if attn_output_gate else qkv[..., q_size:q_size + kv_size]
+    # V is at offset q_size + kv_size in the [q, k, v] layout
+    v_expected = qkv[..., q_size + kv_size:q_size + kv_size * 2]
     torch.testing.assert_close(
         v_npu.to(torch.float32).cpu(),
         v_expected.to(torch.float32),
@@ -321,10 +332,9 @@ def test_qwen3_next_qkv_preprocess(
 
     # Verify gate output (only when attnOutputGate=True)
     if attn_output_gate:
-        gate_expected = qkv[..., q_size:q_size * 2]
         torch.testing.assert_close(
             gate_npu.to(torch.float32).cpu(),
-            gate_expected.to(torch.float32),
+            gate.to(torch.float32),
             atol=atol,
             rtol=rtol,
             msg=f"Gate output mismatch (dtype={dtype})",
