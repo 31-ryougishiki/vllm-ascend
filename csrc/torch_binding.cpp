@@ -978,7 +978,6 @@ TORCH_LIBRARY_EXPAND(CONCAT(_C, _ascend), ops)
         "Tensor qSin, "
         "Tensor kCos, "
         "Tensor kSin, "
-        "Tensor gate, "
         "float epsilon=1e-6, "
         "int numTokens=0, "
         "int numHeads=0, "

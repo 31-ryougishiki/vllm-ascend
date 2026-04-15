@@ -125,7 +125,10 @@ static void CalculateTilingParameters(
     tiling->set_qSize(qSize);
     tiling->set_kvSize(kvSize);
     tiling->set_hiddenSize(hiddenSize);
-    tiling->set_qkvSize(qSize + 2 * kvSize);  // [q, k, v] layout
+    // qkvSize layout:
+    //   attnOutputGate=true:  [q_gate(2*qSize), k(kvSize), v(kvSize)] = 2*qSize + 2*kvSize
+    //   attnOutputGate=false: [q(qSize), k(kvSize), v(kvSize)] = qSize + 2*kvSize
+    tiling->set_qkvSize(attnOutputGate ? (2 * qSize + 2 * kvSize) : (qSize + 2 * kvSize));
     tiling->set_blockDim(numCore);
     tiling->set_attnOutputGate(attnOutputGate);
     tiling->set_epsilon(epsilon);

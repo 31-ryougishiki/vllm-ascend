@@ -27,10 +27,9 @@ namespace vllm_ascend {
  * 3. K RMSNorm
  * 4. Rotary Embedding
  *
- * Input layout:
- *   attnOutputGate=true:  qkv=[q,q,gate,k,v] (actually [q|k|v] since gate is separate input)
- *                          gate=separate gate tensor [qSize]
- *   attnOutputGate=false: qkv=[q,k,v], gate=empty
+ * Input layout (matches vLLM's qkv_proj output):
+ *   attnOutputGate=true:  qkv=[q_gate(2*qSize), k(kvSize), v(kvSize)]
+ *   attnOutputGate=false: qkv=[q(qSize), k(kvSize), v(kvSize)]
  *
  * Returns Q, K, V tensors (and gate if attn_output_gate is enabled)
  */
@@ -42,7 +41,6 @@ std::tuple<at::Tensor, at::Tensor, at::Tensor, at::Tensor> npu_qwen3_next_qkv_pr
     const at::Tensor& qSin,
     const at::Tensor& kCos,
     const at::Tensor& kSin,
-    const at::Tensor& gate,
     double epsilon,
     int64_t numTokens,
     int64_t numHeads,
@@ -64,57 +62,30 @@ std::tuple<at::Tensor, at::Tensor, at::Tensor, at::Tensor> npu_qwen3_next_qkv_pr
     }
 
     // Call the NPU operator
-    if (attnOutputGate) {
-        EXEC_NPU_CMD(aclnnQwen3NextQKVPreprocess,
-                      qkv,
-                      qNormWeight,
-                      kNormWeight,
-                      qCos,
-                      qSin,
-                      kCos,
-                      kSin,
-                      gate,
-                      epsilon,
-                      numTokens,
-                      numHeads,
-                      numKvHeads,
-                      headDim,
-                      qSize,
-                      kvSize,
-                      qkvSize,
-                      1,  // attnOutputGate enabled
-                      qOut,
-                      kOut,
-                      vOut,
-                      gateOut);
-        return std::make_tuple(qOut, kOut, vOut, gateOut);
-    } else {
-        EXEC_NPU_CMD(aclnnQwen3NextQKVPreprocess,
-                      qkv,
-                      qNormWeight,
-                      kNormWeight,
-                      qCos,
-                      qSin,
-                      kCos,
-                      kSin,
-                      gate,
-                      epsilon,
-                      numTokens,
-                      numHeads,
-                      numKvHeads,
-                      headDim,
-                      qSize,
-                      kvSize,
-                      qkvSize,
-                      0,  // attnOutputGate disabled
-                      qOut,
-                      kOut,
-                      vOut,
-                      gateOut);
-        // Return empty tensor for gate to maintain interface consistency
-        gateOut = at::empty({0}, qkv.options());
-        return std::make_tuple(qOut, kOut, vOut, gateOut);
-    }
+    // qkv layout is passed directly from vLLM's qkv_proj output
+    EXEC_NPU_CMD(aclnnQwen3NextQKVPreprocess,
+                  qkv,
+                  qNormWeight,
+                  kNormWeight,
+                  qCos,
+                  qSin,
+                  kCos,
+                  kSin,
+                  epsilon,
+                  numTokens,
+                  numHeads,
+                  numKvHeads,
+                  headDim,
+                  qSize,
+                  kvSize,
+                  qkvSize,
+                  attnOutputGate ? 1 : 0,
+                  qOut,
+                  kOut,
+                  vOut,
+                  gateOut);
+
+    return std::make_tuple(qOut, kOut, vOut, gateOut);
 }
 
 }  // namespace vllm_ascend
