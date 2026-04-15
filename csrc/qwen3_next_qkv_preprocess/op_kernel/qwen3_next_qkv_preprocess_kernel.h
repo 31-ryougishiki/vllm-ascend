@@ -123,6 +123,7 @@ public:
         Ppipe->InitBuffer(reduceBuf, 256 * sizeof(float));  // Need 256 floats for rotary computation
         Ppipe->InitBuffer(weightFloatBuf, headDim * sizeof(float));  // for casting T weight to float
         Ppipe->InitBuffer(rotaryTmpBuf, 256 * sizeof(float));  // for rotary computation
+        Ppipe->InitBuffer(rmsTmpBuf, headDim * sizeof(float));  // temp for x * (1 + w) in RMSNorm
     }
 
     __aicore__ inline void Process()
@@ -202,6 +203,8 @@ private:
     }
 
     // Apply RMSNorm per head to Q tensor.
+    // GemmaRMSNorm formula: x = x * rsqrt(mean(x^2) + eps) * (1 + weight)
+    //                       = x * rstd * (1 + w) = x_norm + x_norm * w
     // Reduce dimension is headDim (not qSize) - one rstd per head.
     __aicore__ inline void ApplyQRMSNorm(uint32_t tokenIdx)
     {
@@ -214,6 +217,7 @@ private:
         LocalTensor<float> qBuf = reduceBuf.Get<float>();
         LocalTensor<float> qNormBuf = reduceBuf.Get<float>();
         LocalTensor<float> weightFloatBufLocal = weightFloatBuf.Get<float>();
+        LocalTensor<float> tmpBuf = rmsTmpBuf.Get<float>();
 
         // Cast weight from T to float once per token (reused across all heads)
         if constexpr (is_same<T, float>::value) {
@@ -251,7 +255,7 @@ private:
             float ms = headBuf.GetValue(0);
             float rstdVal = 1.0f / sqrt(ms + epsilon);
 
-            // Cast input to float, apply rstd in float, then cast back
+            // Cast input to float, apply rstd in float
             if constexpr (is_same<T, float>::value) {
                 Muls(qNormBuf, qLocal[headOffset], rstdVal, headDim);
             } else {
@@ -261,8 +265,12 @@ private:
             }
             PipeBarrier<PIPE_V>();
 
-            // Apply weight in float (both src tensors are now float)
-            Mul(qNormBuf, qNormBuf, weightFloatBufLocal, headDim);
+            // Apply GemmaRMSNorm: x * (1 + w) = x + x * w
+            // Compute x * w in tmpBuf
+            Mul(tmpBuf, qNormBuf, weightFloatBufLocal, headDim);
+            PipeBarrier<PIPE_V>();
+            // Add: x + x * w
+            Add(qNormBuf, qNormBuf, tmpBuf, headDim);
             PipeBarrier<PIPE_V>();
 
             // Cast result back to T
@@ -277,6 +285,9 @@ private:
     }
 
     // Apply RMSNorm per head to K tensor.
+    // Apply RMSNorm per head to K tensor.
+    // GemmaRMSNorm formula: x = x * rsqrt(mean(x^2) + eps) * (1 + weight)
+    //                       = x * rstd * (1 + w) = x_norm + x_norm * w
     __aicore__ inline void ApplyKRMSNorm(uint32_t tokenIdx)
     {
         LocalTensor<T> kLocal = inQueueQkv.DeQue<T>();
@@ -288,6 +299,7 @@ private:
         LocalTensor<float> kBuf = reduceBuf.Get<float>();
         LocalTensor<float> kNormBuf = reduceBuf.Get<float>();
         LocalTensor<float> weightFloatBufLocal = weightFloatBuf.Get<float>();
+        LocalTensor<float> tmpBuf = rmsTmpBuf.Get<float>();
 
         // Cast weight from T to float once per token
         if constexpr (is_same<T, float>::value) {
@@ -319,7 +331,7 @@ private:
             float ms = headBuf.GetValue(0);
             float rstdVal = 1.0f / sqrt(ms + epsilon);
 
-            // Cast input to float, apply rstd in float, then cast back
+            // Cast input to float, apply rstd in float
             if constexpr (is_same<T, float>::value) {
                 Muls(kNormBuf, kLocal[headOffset], rstdVal, headDim);
             } else {
@@ -329,8 +341,12 @@ private:
             }
             PipeBarrier<PIPE_V>();
 
-            // Apply weight in float (both src tensors are now float)
-            Mul(kNormBuf, kNormBuf, weightFloatBufLocal, headDim);
+            // Apply GemmaRMSNorm: x * (1 + w) = x + x * w
+            // Compute x * w in tmpBuf
+            Mul(tmpBuf, kNormBuf, weightFloatBufLocal, headDim);
+            PipeBarrier<PIPE_V>();
+            // Add: x + x * w
+            Add(kNormBuf, kNormBuf, tmpBuf, headDim);
             PipeBarrier<PIPE_V>();
 
             // Cast result back to T
@@ -528,6 +544,7 @@ private:
     TBuf<TPosition::VECCALC> reduceBuf; // work buffer for ReduceSumCustom + rstd scalar
     TBuf<TPosition::VECCALC> weightFloatBuf;  // for casting T weight to float before Mul
     TBuf<TPosition::VECCALC> rotaryTmpBuf;    // temporary buffer for rotary computation
+    TBuf<TPosition::VECCALC> rmsTmpBuf;      // temporary buffer for x * (1 + w) computation
 
     // Global tensors
     GlobalTensor<T> qkvGm;
