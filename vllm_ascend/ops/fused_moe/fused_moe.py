@@ -188,10 +188,6 @@ class AscendFusedMoE(FusedMoE):
 
         assert self.quant_method is not None
 
-        # [split] split-mode 下使用 split_moe_group
-        # if is_split_attn_enabled():
-        #     self.moe_config.tp_group = get_split_moe_group() # NOTE: split: should be None?
-        # else:
         self.moe_config.tp_group = get_tp_group()
         self.moe_config.ep_group = get_ep_group()
         self.moe_config.dp_group = get_dp_group()
