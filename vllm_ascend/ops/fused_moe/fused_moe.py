@@ -21,8 +21,8 @@ from typing import Callable, Optional
 import torch
 import torch.nn.functional as F
 from vllm.config import get_current_vllm_config
-from vllm.distributed import (get_dp_group, get_ep_group, get_split_moe_group,
-                              get_tp_group, is_split_attn_enabled,
+from vllm.distributed import (get_dp_group, get_ep_group,
+                              get_tp_group,
                               tensor_model_parallel_all_reduce)
 from vllm.forward_context import get_forward_context
 from vllm.logger import logger

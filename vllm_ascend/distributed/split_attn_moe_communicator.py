@@ -21,11 +21,8 @@ This module provides point-to-point communication between attn group and moe gro
 in the layer-split distributed inference scenario.
 """
 
-import logging
 import torch
 import torch.distributed as dist
-
-logger = logging.getLogger(__name__)
 
 # Global state for cross-group communication
 _CROSS_GROUP_INITIALIZED = False
@@ -98,11 +95,6 @@ def init_p2p_groups(split_tp_size: int, split_ep_size: int) -> None:
         # new_group requires ALL processes to participate
         group = dist.new_group(p2p_ranks, backend=backend)
         _CROSS_P2P_GROUPS[local_rank] = group
-
-
-def is_cross_group_initialized() -> bool:
-    """Check if cross-group is initialized."""
-    return _CROSS_GROUP_INITIALIZED
 
 
 def _get_peer_rank(local_rank: int, is_attn: bool) -> int:
