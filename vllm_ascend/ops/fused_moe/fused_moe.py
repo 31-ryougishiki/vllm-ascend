@@ -205,6 +205,10 @@ class AscendFusedMoE(FusedMoE):
 
         # init moe
         # 获取split_ep_size（需要从parallel_config传递过来）
+        from vllm.logger import init_logger
+        _dbg_logger = init_logger(__name__)
+        _dbg_rank = torch.distributed.get_rank()
+        _dbg_logger.info("[DEBUG][Rank %d] AscendFusedMoE: before init_eplb_config", _dbg_rank)
         split_ep_size = getattr(self.moe_parallel_config, 'split_ep_size', 0)
         self.mix_placement = getattr(ascend_config, "mix_placement", False)
         self.n_shared_experts = num_shared_experts
@@ -212,6 +216,7 @@ class AscendFusedMoE(FusedMoE):
         self.moe_config.num_experts = num_experts
         self.global_expert_map, self._expert_map, self.log2phy, self.global_redundant_expert_num = init_eplb_config(
             ascend_config, self.moe_instance_id, self.moe_config)
+        _dbg_logger.info("[DEBUG][Rank %d] AscendFusedMoE: after init_eplb_config, before create_weights", _dbg_rank)
         self.global_num_experts = num_experts + self.global_redundant_expert_num
         self.dynamic_eplb = (ascend_config.dynamic_eplb
                              or ascend_config.expert_map_record_path) and (
@@ -247,11 +252,13 @@ class AscendFusedMoE(FusedMoE):
                 in ("GPTQMarlinMoEMethod", "CompressedTensorsWNA16MoEMethod")):
             moe_quant_params["intermediate_size_full"] = intermediate_size
         self.quant_method.create_weights(layer=self, **moe_quant_params)
+        _dbg_logger.info("[DEBUG][Rank %d] AscendFusedMoE: after create_weights", _dbg_rank)
 
         self.enable_shared_expert_dp = ascend_config.enable_shared_expert_dp
 
         setup_moe_comm_method(self.moe_config)
         self.quant_type = self._get_quant_type()
+        _dbg_logger.info("[DEBUG][Rank %d] AscendFusedMoE: done", _dbg_rank)
 
     def _get_quant_type(self) -> QuantType:
         quant_method = self.quant_method
