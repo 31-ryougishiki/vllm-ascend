@@ -50,6 +50,13 @@ def _maybe_all_gather_and_maybe_unpad_impl(
     if forward_context.is_multimodal_model and is_first_allgather:
         return x
     sp_enabled = forward_context.sp_enabled
+
+    # NOTE: [lqf] In split mode, MoE ranks don't have TP group,
+    # so skip the all_gather to avoid errors
+    from vllm.distributed import is_split_attn_enabled
+    if is_split_attn_enabled():
+        sp_enabled = False
+
     if sp_enabled and label:
         dp_metadata = forward_context.dp_metadata
         if dp_metadata is None or not is_ep_comm:
@@ -83,6 +90,12 @@ def _maybe_pad_and_reduce_impl(x: torch.Tensor,
         forward_context = get_forward_context()
     except AssertionError:
         return tensor_model_parallel_all_reduce(x)
+
+    # NOTE: In split mode, MoE ranks don't have TP group,
+    # so skip the reduce_scatter to avoid errors
+    from vllm.distributed import is_split_attn_enabled
+    if is_split_attn_enabled():
+        return x
 
     if not getattr(forward_context, "sp_enabled", False):
         return tensor_model_parallel_all_reduce(x)

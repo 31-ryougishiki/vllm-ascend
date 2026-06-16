@@ -43,7 +43,8 @@ from vllm.distributed.kv_transfer import (get_kv_transfer_group,
                                           has_kv_transfer_group)
 from vllm.distributed.parallel_state import (get_dcp_group, get_dp_group,
                                              get_pcp_group, get_pp_group,
-                                             get_tp_group)
+                                             get_tp_group, is_split_moe_rank,
+                                             is_split_attn_enabled)
 from vllm.forward_context import get_forward_context
 from vllm.logger import logger
 from vllm.model_executor.layers.attention_layer_base import AttentionLayerBase
@@ -1186,8 +1187,12 @@ class NPUModelRunner(GPUModelRunner):
                                        maybe_padded_num_tokens,
                                        self.vllm_config)
 
-        if get_forward_context().sp_enabled and not isinstance(
-                hidden_states, IntermediateTensors):
+        # [FIX] In split mode, MoE rank should skip all_gather because:
+        # 1. MoE rank is not part of TP group (get_tp_group() returns None)
+        # 2. MoE rank's output doesn't affect final inference result (only attn rank matters)
+        if (get_forward_context().sp_enabled
+            and not isinstance(hidden_states, IntermediateTensors)
+            and not (is_split_attn_enabled() and is_split_moe_rank())):
             hidden_states = self._all_gather_hidden_states_and_aux(
                 hidden_states)
         return hidden_states if self.pcp_size == 1 else self.pcp_manager.get_restore_hidden_states(
@@ -1492,7 +1497,9 @@ class NPUModelRunner(GPUModelRunner):
                                "after execute_model() returns None.")
 
         with ProfileExecuteDuration().capture_async("prepare input"):
+
             self._update_states(scheduler_output)
+
             if has_ec_transfer() and get_ec_transfer().is_producer:
                 with self.maybe_get_ec_connector_output(
                         scheduler_output,
@@ -1605,6 +1612,15 @@ class NPUModelRunner(GPUModelRunner):
                     hidden_states.tensors, all_gather_group=get_tp_group())
                 logits = None
             else:
+                # [FIX] In split mode, MoE rank's hidden_states is None after send_to_attn.
+                # Skip computing logits and return None directly.
+                if is_split_attn_enabled() and is_split_moe_rank():
+                    logger.debug(
+                        f"[Split Mode] MoE rank {torch.distributed.get_rank()} "
+                        f"returning None (hidden_states sent to attn rank)"
+                    )
+                    return None
+
                 if self.input_batch.pooling_params:
                     if vllm_version_is('0.13.0'):
                         pool_output = self._pool(
@@ -1650,6 +1666,7 @@ class NPUModelRunner(GPUModelRunner):
                 positions,
             )
             self.kv_connector_output = kv_connector_output
+
         return None
 
     @torch.inference_mode
@@ -1676,7 +1693,6 @@ class NPUModelRunner(GPUModelRunner):
             output = copy(EMPTY_MODEL_RUNNER_OUTPUT)
             output.kv_connector_output = kv_connector_output
             return output
-
         # Unpack ephemeral state.
         (
             scheduler_output,
@@ -1703,7 +1719,6 @@ class NPUModelRunner(GPUModelRunner):
 
         with ProfileExecuteDuration().capture_async("Sample"):
             sampler_output = self._sample(logits, spec_decode_metadata)
-
         def propose_draft_token_ids(sampled_token_ids):
             assert self.spec_decode_common_attn_metadata is not None
             self._draft_token_ids = self.propose_draft_token_ids(

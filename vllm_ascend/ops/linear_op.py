@@ -82,6 +82,8 @@ class CustomLinearOp:
     # Custom communication group, while determining weight sharding
     @property
     def comm_group(self):
+        if split_attn_group := get_effective_tp_group():
+            return split_attn_group
         return get_tp_group()
 
     @property
@@ -222,6 +224,8 @@ class OProjRowParallelOp(CustomRowParallelOp):
 
     @property
     def comm_group(self):
+        if split_attn_group := get_effective_tp_group():
+            return split_attn_group
         return get_otp_group()
 
     def apply_impl(
@@ -292,6 +296,9 @@ class Flashcomm2OProjRowParallelOp(CustomRowParallelOp):
 
     @property
     def comm_group(self):
+        # TODO: [lqf] flashcomm2跑起来不知道对不对
+        if split_attn_group := get_effective_tp_group():
+            return split_attn_group
         return get_flashcomm2_otp_group()
 
     @property
@@ -569,6 +576,14 @@ class SequenceRowParallelOp(CustomRowParallelOp):
             sp_enabled = False
             mmrs_fusion = False
 
+        # NOTE: In split mode, skip reduce_scatter and use all_reduce instead
+        # to avoid issues with input size not divisible by tp_size
+        from vllm.distributed import is_split_attn_enabled
+        if is_split_attn_enabled():
+            output_parallel = self.layer.quant_method.apply(
+                self.layer, input_parallel, bias=bias_)
+            return tensor_model_parallel_all_reduce(output_parallel)
+
         x = input_parallel
 
         if not sp_enabled:
@@ -714,7 +729,7 @@ def _get_column_parallel_op(
         if "shared_expert" in prefix:
             return None
         sp_column_prefix = [
-            "gate_up_proj",  # first MLP of most LLMs 
+            "gate_up_proj",  # first MLP of most LLMs
             "in_proj",  # gated deltanet of Qwen3 Next
             "qkv_proj",  # qkv linear of most LLMs
             "conv1d",  # gated deltanet of Qwen3 Next
@@ -757,6 +772,14 @@ def _get_row_parallel_op(
                 return SequenceRowParallelOp(layer)
 
     return None
+
+
+def get_effective_tp_group():
+  """获取有效的TP group，优先使用split_attn_group"""
+  from vllm.distributed import is_split_attn_enabled, get_split_attn_group
+  if is_split_attn_enabled():
+      return get_split_attn_group()
+  return None
 
 
 def get_parallel_op(disable_tp, prefix, layer, direct):

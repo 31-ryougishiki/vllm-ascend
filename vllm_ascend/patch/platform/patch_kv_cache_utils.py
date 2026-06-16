@@ -164,11 +164,25 @@ def get_kv_cache_config_from_groups(
         # (sw.1, padding) will be: (group_size = 2)
         # full.0, sw.0, sw.1: share a Tensor with size=available_memory//2
         # full.1, sw.2: share another Tensor with size=available_memory//2
+
+        # [FIX] Handle layer split mode: MoE workers have no attention layers,
+        # so all groups have empty layer_names. Return default config.
         group_size = max(len(group.layer_names) for group in kv_cache_groups)
+        if group_size == 0:
+            # MoE worker in layer split mode or attention-free model
+            # Return MAX_VALUE so it won't affect min(num_blocks) calculation
+            # in vllm/v1/core/kv_cache_utils.py get_kv_cache_configs()
+            # The actual KV cache allocation will be determined by Attn ranks.
+            # IMPORTANT: Return empty kv_cache_groups so that vllm's
+            # _report_kv_cache_config will skip this worker.
+            return KVCacheConfig(
+                num_blocks=2**63 - 1,  # MAX_VALUE, won't be chosen as min
+                kv_cache_tensors=[],
+                kv_cache_groups=[],  # Empty list to skip _report_kv_cache_config
+            )
 
         page_size = get_uniform_page_size(
             [group.kv_cache_spec for group in kv_cache_groups])
-        assert group_size > 0, "group_size must be greater than 0"
         num_blocks = get_num_blocks(vllm_config, group_size, available_memory,
                                     page_size)
         kv_cache_tensors = []

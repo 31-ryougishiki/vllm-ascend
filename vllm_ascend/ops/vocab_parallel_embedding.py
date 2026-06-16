@@ -21,7 +21,10 @@ import torch
 from torch import nn
 from torch.nn.parameter import Parameter
 from vllm.distributed import divide
-from vllm.distributed.parallel_state import get_tp_group
+from vllm.distributed.parallel_state import (
+    get_tp_group,
+    get_split_attn_group
+)
 from vllm.model_executor.layers.logits_processor import LogitsProcessor
 from vllm.model_executor.layers.quantization.base_config import (
     QuantizationConfig, QuantizeMethodBase, method_has_implemented_embedding)
@@ -58,7 +61,14 @@ class AscendVocabParallelEmbedding(VocabParallelEmbedding):
             self.comm_group = get_embed_tp_group()
             self.forward_type = "embed_tp"
         else:
-            self.comm_group = get_tp_group()
+            # NOTE: [split] split-mode模式下，对于加载attn的rank改成split_attn_group
+            from vllm.config import get_current_vllm_config
+            config = get_current_vllm_config()
+            split_tp_size = config.parallel_config.split_tp_size
+            if split_tp_size > 1:
+                self.comm_group = get_split_attn_group()
+            else:
+                self.comm_group = get_tp_group()
 
         self.tp_size = self.comm_group.world_size
         self.tp_rank = self.comm_group.rank_in_group

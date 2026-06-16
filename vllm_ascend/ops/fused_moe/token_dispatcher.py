@@ -35,6 +35,9 @@ from vllm_ascend.ops.fused_moe.comm_utils import (
 from vllm_ascend.utils import (AscendDeviceType, get_ascend_device_type,
                                is_hierarchical_communication_enabled)
 
+from vllm.logger import init_logger
+logger = init_logger(__name__)
+
 
 @dataclass
 class TokenDispatchResult:
@@ -63,15 +66,33 @@ class MoETokenDispatcher(ABC):
     @property
     def ep_group(self):
         """Get expert model parallel group."""
-        return get_ep_group().device_group
+        # NOTE: [split] split模式下使用split_moe_group
+        from vllm.distributed import is_split_attn_enabled, get_split_moe_group
+        if is_split_attn_enabled():
+            group = get_split_moe_group()
+            return group.device_group if group else None
+        group = get_ep_group()
+        return group.device_group if group else None
 
     @property
     def ep_rank(self):
-        return get_ep_group().rank_in_group
+        # NOTE: [split] split模式下使用split_moe_group的rank
+        from vllm.distributed import is_split_attn_enabled, get_split_moe_group
+        if is_split_attn_enabled():
+            rank = get_split_moe_group().rank_in_group
+            return rank
+        rank = get_ep_group().rank_in_group
+        return rank
 
     @property
     def ep_size(self):
-        return get_ep_group().world_size
+        # NOTE: [split] split模式下使用split_moe_group的world_size
+        from vllm.distributed import is_split_attn_enabled, get_split_moe_group
+        if is_split_attn_enabled():
+            size = get_split_moe_group().world_size
+            return size
+        size = get_ep_group().world_size
+        return size
 
     @abstractmethod
     def token_dispatch(
@@ -411,10 +432,10 @@ class TokenDispatcherWithAll2AllV(MoETokenDispatcher):
                     self.local_expert_indices[i + 1] -
                     1), "local_expert_indices must be continuous"
 
-        # TODO: Try local_rank = ep_group.rank_in_group
-        local_rank = torch.distributed.get_rank(group=self.ep_group)
+        # NOTE: [lqf] get_hccl_comm_name需要全局rank
+        global_rank = torch.distributed.get_global_rank(self.ep_group, self.ep_rank)
         backend = self.ep_group._get_backend(torch.device("npu"))
-        self.moe_all_to_all_group_name = backend.get_hccl_comm_name(local_rank)
+        self.moe_all_to_all_group_name = backend.get_hccl_comm_name(self.ep_rank)
 
     def token_dispatch(self,
                        hidden_states: torch.Tensor,

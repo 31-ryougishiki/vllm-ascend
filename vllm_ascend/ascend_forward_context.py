@@ -239,8 +239,15 @@ def select_moe_comm_method(num_tokens: int,
         vllm_config.model_config.hf_text_config, 'moe_quantize',
         getattr(vllm_config.model_config.hf_text_config, 'quantize', None))
 
-    if not vllm_config.parallel_config.enable_expert_parallel or get_ep_group(
-    ).world_size == 1:
+    # NOTE: split模式下使用split_moe_group
+    from vllm.distributed import is_split_attn_enabled, get_split_moe_group, is_split_attn_rank
+    ep_group = get_split_moe_group() if is_split_attn_enabled() else get_ep_group()
+
+    # NOTE: split模式下，ATTN ranks没有MoE weights，跳过MoE相关逻辑
+    if is_split_attn_enabled() and is_split_attn_rank():
+        return None
+
+    if not vllm_config.parallel_config.enable_expert_parallel or ep_group is None or ep_group.world_size == 1:
         moe_comm_type = MoECommType.ALLGATHER
     elif soc_version in {AscendDeviceType.A2}:
         if (num_tokens <= mc2_tokens_capacity
@@ -256,7 +263,9 @@ def select_moe_comm_method(num_tokens: int,
         # TODO: drop the EP-size guard when dispatch_ffn_combine supports larger EP sizes
         # TODO: drop speculative method guard when dispatch_gmm_combine_decode supports w16a16
         fused_mc2_enable = envs_ascend.VLLM_ASCEND_ENABLE_FUSED_MC2 and quant_type == "w8a8_dynamic"
-        dispatch_ffn_combine_enable = get_ep_group().world_size <= 32 and (
+        # NOTE: [split] split模式下使用split_moe_group
+        ep_size = ep_group.world_size if ep_group else 1
+        dispatch_ffn_combine_enable = ep_size <= 32 and (
             not is_draft_model) and (not dynamic_eplb)
         if num_tokens <= mc2_tokens_capacity:
             fused_decode_enable = fused_mc2_enable

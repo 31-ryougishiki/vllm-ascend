@@ -21,7 +21,8 @@ from typing import Callable, Optional
 import torch
 import torch.nn.functional as F
 from vllm.config import get_current_vllm_config
-from vllm.distributed import (get_dp_group, get_ep_group, get_tp_group,
+from vllm.distributed import (get_dp_group, get_ep_group, get_split_moe_group,
+                              get_tp_group, is_split_attn_enabled,
                               tensor_model_parallel_all_reduce)
 from vllm.forward_context import get_forward_context
 from vllm.logger import logger
@@ -187,9 +188,13 @@ class AscendFusedMoE(FusedMoE):
 
         assert self.quant_method is not None
 
+        # [split] split-mode 下使用 split_moe_group
+        # if is_split_attn_enabled():
+        #     self.moe_config.tp_group = get_split_moe_group() # NOTE: split: should be None?
+        # else:
         self.moe_config.tp_group = get_tp_group()
-        self.moe_config.dp_group = get_dp_group()
         self.moe_config.ep_group = get_ep_group()
+        self.moe_config.dp_group = get_dp_group()
         self.moe_config.mc2_group = get_mc2_group()
         self.moe_config.supports_eplb = self.quant_method.supports_eplb
         ascend_config = get_ascend_config()
@@ -203,6 +208,8 @@ class AscendFusedMoE(FusedMoE):
                 dtype=vllm_config.model_config.dtype)
 
         # init moe
+        # 获取split_ep_size（需要从parallel_config传递过来）
+        split_ep_size = getattr(self.moe_parallel_config, 'split_ep_size', 0)
         self.mix_placement = getattr(ascend_config, "mix_placement", False)
         self.n_shared_experts = num_shared_experts
         num_experts += num_shared_experts if self.mix_placement else 0
