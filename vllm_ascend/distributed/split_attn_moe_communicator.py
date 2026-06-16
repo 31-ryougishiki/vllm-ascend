@@ -21,7 +21,6 @@ This module provides point-to-point communication between attn group and moe gro
 in the layer-split distributed inference scenario.
 """
 
-from typing import Optional
 import logging
 import torch
 import torch.distributed as dist
@@ -33,10 +32,6 @@ _CROSS_GROUP_INITIALIZED = False
 _CROSS_ATTN_RANKS = None
 _CROSS_MOE_RANKS = None
 _CROSS_P2P_GROUPS = {}  # {local_rank: torch.distributed.ProcessGroup}
-
-# Buffer reuse: pre-allocated buffers for recv operations when no tensor provided
-# Key: local_rank, Value: {"from_moe": tensor, "from_attn": tensor}
-_CROSS_BUFFERS = {}
 
 
 def init_cross_group(split_tp_size: int, split_ep_size: int) -> None:
@@ -104,70 +99,6 @@ def init_p2p_groups(split_tp_size: int, split_ep_size: int) -> None:
         group = dist.new_group(p2p_ranks, backend=backend)
         _CROSS_P2P_GROUPS[local_rank] = group
 
-    # Initialize buffer reuse - pre-allocate buffers for each local_rank
-    _init_buffers(split_tp_size)
-
-
-def _init_buffers(split_tp_size: int) -> None:
-    """Initialize communication buffers for recv operations.
-
-    Pre-allocates tensors for recv when no existing tensor is provided.
-    Send operations use the model's tensor directly.
-
-    Args:
-        split_tp_size: Number of GPUs in attn group (also number of P2P pairs)
-    """
-    global _CROSS_BUFFERS
-
-    # Pre-allocate recv buffers for each P2P pair
-    # Default shape: (1024, 2048) - can accommodate typical batch_size=32, seq_len=1024
-    default_shape = (1024, 2048)
-    default_dtype = torch.bfloat16
-
-    for local_rank in range(split_tp_size):
-        _CROSS_BUFFERS[local_rank] = {
-            "from_moe": torch.empty(default_shape, dtype=default_dtype),
-            "from_attn": torch.empty(default_shape, dtype=default_dtype),
-        }
-
-
-def _ensure_buffer_size(buffer: torch.Tensor, shape: torch.Size, dtype: torch.dtype, device: torch.device) -> torch.Tensor:
-    """Ensure buffer is large enough, reallocate if needed.
-
-    Args:
-        buffer: Existing buffer tensor
-        shape: Required shape
-        dtype: Required dtype
-        device: Required device
-
-    Returns:
-        Buffer tensor (reused or newly allocated)
-    """
-    if buffer.shape == shape and buffer.dtype == dtype and buffer.device == device:
-        return buffer
-    # Reallocate if shape/dtype/device changed
-    return torch.empty(shape, dtype=dtype, device=device)
-
-
-def _get_buffer(local_rank: int, direction: str) -> torch.Tensor:
-    """Get or create buffer for recv direction.
-
-    Args:
-        local_rank: Local rank within the group
-        direction: One of "from_moe", "from_attn"
-
-    Returns:
-        Buffer tensor
-    """
-    global _CROSS_BUFFERS
-
-    if local_rank not in _CROSS_BUFFERS:
-        # Lazy initialization if not done yet
-        _init_buffers(local_rank + 1)
-
-    buffer = _CROSS_BUFFERS[local_rank][direction]
-    return buffer
-
 
 def is_cross_group_initialized() -> bool:
     """Check if cross-group is initialized."""
@@ -219,16 +150,16 @@ def send_to_moe(hidden_states: torch.Tensor) -> None:
     dist.send(hidden_states.contiguous(), dst=dst_rank, group=group)
 
 
-def recv_from_attn(tensor: Optional[torch.Tensor] = None) -> torch.Tensor:
+def recv_from_attn(tensor: torch.Tensor) -> torch.Tensor:
     """Receive hidden states from attn group in moe group.
 
-    If tensor is provided, receives directly into it. Otherwise uses pre-allocated buffer.
+    Receives directly into the provided tensor.
 
     Args:
-        tensor: Optional tensor to receive into. If None, uses pre-allocated buffer.
+        tensor: Tensor to receive into.
 
     Returns:
-        Received tensor (the same tensor passed in or the buffer)
+        Received tensor (the same tensor passed in)
     """
     global _CROSS_MOE_RANKS, _CROSS_P2P_GROUPS
 
@@ -240,21 +171,8 @@ def recv_from_attn(tensor: Optional[torch.Tensor] = None) -> torch.Tensor:
     src_rank = _get_peer_rank(local_rank, is_attn=False)
     group = _CROSS_P2P_GROUPS.get(local_rank)
 
-    # Use provided tensor or get from buffer
-    if tensor is not None:
-        recv_tensor = tensor
-    else:
-        # Fallback to buffer if no tensor provided (backward compatibility)
-        buffer = _get_buffer(local_rank, "from_attn")
-        # Buffer should be large enough, but check and reallocate if needed
-        # This shouldn't happen in normal use since caller provides tensor
-        recv_tensor = buffer
-
-    shape = recv_tensor.shape
-
-    # Receive directly into the tensor
-    dist.recv(recv_tensor, src=src_rank, group=group)
-    return recv_tensor
+    dist.recv(tensor, src=src_rank, group=group)
+    return tensor
 
 
 def send_to_attn(hidden_states: torch.Tensor) -> None:
@@ -279,16 +197,16 @@ def send_to_attn(hidden_states: torch.Tensor) -> None:
     dist.send(hidden_states.contiguous(), dst=dst_rank, group=group)
 
 
-def recv_from_moe(tensor: Optional[torch.Tensor] = None) -> torch.Tensor:
+def recv_from_moe(tensor: torch.Tensor) -> torch.Tensor:
     """Receive hidden states from moe group in attn group.
 
-    If tensor is provided, receives directly into it. Otherwise uses pre-allocated buffer.
+    Receives directly into the provided tensor.
 
     Args:
-        tensor: Optional tensor to receive into. If None, uses pre-allocated buffer.
+        tensor: Tensor to receive into.
 
     Returns:
-        Received tensor (the same tensor passed in or the buffer)
+        Received tensor (the same tensor passed in)
     """
     global _CROSS_ATTN_RANKS, _CROSS_P2P_GROUPS
 
@@ -300,16 +218,5 @@ def recv_from_moe(tensor: Optional[torch.Tensor] = None) -> torch.Tensor:
     src_rank = _get_peer_rank(local_rank, is_attn=True)
     group = _CROSS_P2P_GROUPS.get(local_rank)
 
-    # Use provided tensor or get from buffer
-    if tensor is not None:
-        recv_tensor = tensor
-    else:
-        # Fallback to buffer if no tensor provided (backward compatibility)
-        buffer = _get_buffer(local_rank, "from_moe")
-        recv_tensor = buffer
-
-    shape = recv_tensor.shape
-
-    # Receive directly into the tensor
-    dist.recv(recv_tensor, src=src_rank, group=group)
-    return recv_tensor
+    dist.recv(tensor, src=src_rank, group=group)
+    return tensor
