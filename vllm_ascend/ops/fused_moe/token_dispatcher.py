@@ -122,13 +122,18 @@ class TokenDispatcherWithMC2(MoETokenDispatcher):
 
     def __init__(self, **kwargs):
         super().__init__(**kwargs)
-        device_group = get_mc2_group().device_group
-        # TODO: Try local_rank = ep_group.rank_in_group
-        local_rank = torch.distributed.get_rank(group=device_group)
-        backend = device_group._get_backend(torch.device("npu"))
-        self.moe_all_to_all_group_name = backend.get_hccl_comm_name(local_rank)
+        self._mc2_group_name = None  # lazily initialized
         self.ep_rank_id = get_mc2_group().rank_in_group
         self.ep_world_size = get_mc2_group().world_size
+
+    @property
+    def moe_all_to_all_group_name(self):
+        if self._mc2_group_name is None:
+            device_group = get_mc2_group().device_group
+            local_rank = torch.distributed.get_rank(group=device_group)
+            backend = device_group._get_backend(torch.device("npu"))
+            self._mc2_group_name = backend.get_hccl_comm_name(local_rank)
+        return self._mc2_group_name
         self.enable_dispatch_v2 = hasattr(torch_npu,
                                           "npu_moe_distribute_dispatch_v2")
         self.need_extra_args = (

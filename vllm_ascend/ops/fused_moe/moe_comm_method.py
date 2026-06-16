@@ -42,17 +42,10 @@ def get_moe_comm_method(
 
 
 def setup_moe_comm_method(moe_config):
-    import torch.distributed as dist
-    _r = dist.get_rank()
     _MoECommMethods[MoECommType.ALLTOALL] = AlltoAllCommImpl(moe_config)
-    from vllm.logger import init_logger
-    init_logger(__name__).info("[DEBUG][Rank %d] setup_moe: ALLTOALL done", _r)
     _MoECommMethods[MoECommType.ALLGATHER] = AllGatherCommImpl(moe_config)
-    init_logger(__name__).info("[DEBUG][Rank %d] setup_moe: ALLGATHER done", _r)
     _MoECommMethods[MoECommType.MC2] = MC2CommImpl(moe_config)
-    init_logger(__name__).info("[DEBUG][Rank %d] setup_moe: MC2 done", _r)
     _MoECommMethods[MoECommType.FUSED_MC2] = FusedMC2CommImpl(moe_config)
-    init_logger(__name__).info("[DEBUG][Rank %d] setup_moe: FUSED_MC2 done", _r)
 
 
 @dataclass
