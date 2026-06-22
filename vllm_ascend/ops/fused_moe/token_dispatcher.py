@@ -369,6 +369,9 @@ class TokenDispatcherWithAllGather(MoETokenDispatcher):
             last_expert_idx = self.num_experts_local
             global_num_experts = self.num_experts_local
 
+        logger.info("[MOE-COMM] rank=%d AllGather-dispatch enter: hs=%s top_k=%d local_experts=%d",
+                    torch.distributed.get_rank(), tuple(hidden_states.shape),
+                    self.top_k, self.num_experts_local)
         sorted_hidden_states, expanded_row_idx, expert_tokens, pertoken_scale = (
             torch.ops._C_ascend.npu_moe_init_routing_custom(
                 hidden_states,
@@ -383,6 +386,9 @@ class TokenDispatcherWithAllGather(MoETokenDispatcher):
                 if self.with_quant and pertoken_scale is None else -1,
             ))
         expert_tokens = expert_tokens.to(torch.int64)
+        logger.info("[MOE-COMM] rank=%d AllGather-dispatch done: sorted_hs=%s expert_tokens=%s",
+                    torch.distributed.get_rank(), tuple(sorted_hidden_states.shape),
+                    tuple(expert_tokens.shape))
         group_list_type = 1  # `count` mode
         context_metadata = {
             "topk_weights": topk_weights,
@@ -399,10 +405,14 @@ class TokenDispatcherWithAllGather(MoETokenDispatcher):
 
     def token_combine(self, hidden_states, context_metadata, bias=None):
         assert self.original_shape is not None
+        logger.info("[MOE-COMM] rank=%d AllGather-combine enter: hs=%s",
+                    torch.distributed.get_rank(), tuple(hidden_states.shape))
         final_hidden_states = torch_npu.npu_moe_token_unpermute(
             permuted_tokens=hidden_states,
             sorted_indices=torch.abs(context_metadata["expanded_row_idx"]),
             probs=context_metadata["topk_weights"])
+        logger.info("[MOE-COMM] rank=%d AllGather-combine done: out=%s",
+                    torch.distributed.get_rank(), tuple(final_hidden_states.shape))
         if len(self.original_shape) == 3:
             final_hidden_states = final_hidden_states.view(self.original_shape)
 
