@@ -224,18 +224,10 @@ class TokenDispatcherWithMC2(MoETokenDispatcher):
                                                   topk_ids, expert_map,
                                                   mc2_mask,
                                                   global_redundant_expert_num)
-        if torch.distributed.get_rank() == 3:
-            logger.info("[MOE-COMM] rank=%d MC2-dispatch enter: hs=%s ep_size=%d global_bs=%d",
-                    torch.distributed.get_rank(), tuple(hidden_states.shape),
-                    self.ep_world_size, self.global_bs)
         output = torch_npu.npu_moe_distribute_dispatch_v2(
             **kwargs_mc2
         ) if self.enable_dispatch_v2 else torch_npu.npu_moe_distribute_dispatch(
             **kwargs_mc2)
-        if torch.distributed.get_rank() == 3:
-            logger.info("[MOE-COMM] rank=%d MC2-dispatch done: expand_x=%s",
-                    torch.distributed.get_rank(), tuple(output[0].shape))
-        # comm_stream.wait_stream(torch.npu.current_stream())
         expand_x, dynamic_scale, assist_info_for_combine, expert_token_nums, \
             ep_recv_counts, tp_recv_counts, expand_scales = output[0:7]
 
@@ -312,15 +304,8 @@ class TokenDispatcherWithMC2(MoETokenDispatcher):
 
         kwargs_mc2 = self.get_combine_mc_kwargs(hidden_states,
                                                 context_metadata)
-        if torch.distributed.get_rank() == 3:
-            logger.info("[MOE-COMM] rank=%d MC2-combine enter: hs=%s",
-                    torch.distributed.get_rank(), tuple(hidden_states.shape))
         combined_output = torch_npu.npu_moe_distribute_combine_v2(**kwargs_mc2) \
             if self.enable_dispatch_v2 else torch_npu.npu_moe_distribute_combine(**kwargs_mc2)
-        if torch.distributed.get_rank() == 3:
-            logger.info("[MOE-COMM] rank=%d MC2-combine done: out=%s",
-                    torch.distributed.get_rank(), tuple(combined_output.shape))
-
         return TokenCombineResult(routed_out=combined_output, )
 
 
@@ -373,10 +358,6 @@ class TokenDispatcherWithAllGather(MoETokenDispatcher):
             last_expert_idx = self.num_experts_local
             global_num_experts = self.num_experts_local
 
-        if torch.distributed.get_rank() == 3:
-            logger.info("[MOE-COMM] rank=%d AllGather-dispatch enter: hs=%s top_k=%d local_experts=%d",
-                    torch.distributed.get_rank(), tuple(hidden_states.shape),
-                    self.top_k, self.num_experts_local)
         sorted_hidden_states, expanded_row_idx, expert_tokens, pertoken_scale = (
             torch.ops._C_ascend.npu_moe_init_routing_custom(
                 hidden_states,
@@ -391,10 +372,6 @@ class TokenDispatcherWithAllGather(MoETokenDispatcher):
                 if self.with_quant and pertoken_scale is None else -1,
             ))
         expert_tokens = expert_tokens.to(torch.int64)
-        if torch.distributed.get_rank() == 3:
-            logger.info("[MOE-COMM] rank=%d AllGather-dispatch done: sorted_hs=%s expert_tokens=%s",
-                    torch.distributed.get_rank(), tuple(sorted_hidden_states.shape),
-                    tuple(expert_tokens.shape))
         group_list_type = 1  # `count` mode
         context_metadata = {
             "topk_weights": topk_weights,
@@ -411,16 +388,10 @@ class TokenDispatcherWithAllGather(MoETokenDispatcher):
 
     def token_combine(self, hidden_states, context_metadata, bias=None):
         assert self.original_shape is not None
-        if torch.distributed.get_rank() == 3:
-            logger.info("[MOE-COMM] rank=%d AllGather-combine enter: hs=%s",
-                    torch.distributed.get_rank(), tuple(hidden_states.shape))
         final_hidden_states = torch_npu.npu_moe_token_unpermute(
             permuted_tokens=hidden_states,
             sorted_indices=torch.abs(context_metadata["expanded_row_idx"]),
             probs=context_metadata["topk_weights"])
-        if torch.distributed.get_rank() == 3:
-            logger.info("[MOE-COMM] rank=%d AllGather-combine done: out=%s",
-                    torch.distributed.get_rank(), tuple(final_hidden_states.shape))
         if len(self.original_shape) == 3:
             final_hidden_states = final_hidden_states.view(self.original_shape)
 
@@ -502,17 +473,10 @@ class TokenDispatcherWithAll2AllV(MoETokenDispatcher):
             permute2_ep_all_to_all_handle.wait()
             dynamic_scale.untyped_storage().resize_(0)
 
-        if torch.distributed.get_rank() == 3:
-            logger.info("[MOE-COMM] rank=%d All2All-dispatch enter: hs=%s ep_size=%d",
-                    torch.distributed.get_rank(), tuple(permutated_local_input_tokens.shape),
-                    self.ep_group.size())
         _, global_input_tokens, permute1_ep_all_to_all_handle = async_all_to_all(
             permutated_local_input_tokens, output_splits, input_splits,
             self.ep_group)
         permute1_ep_all_to_all_handle.wait()
-        if torch.distributed.get_rank() == 3:
-            logger.info("[MOE-COMM] rank=%d All2All-dispatch done: hs=%s",
-                    torch.distributed.get_rank(), tuple(global_input_tokens.shape))
         permutated_local_input_tokens.untyped_storage().resize_(0)
 
         # Postprocess
@@ -549,10 +513,6 @@ class TokenDispatcherWithAll2AllV(MoETokenDispatcher):
                                                  context_metadata)
 
         # 2. AllToAll
-        if torch.distributed.get_rank() == 3:
-            logger.info("[MOE-COMM] rank=%d All2All-combine enter: hs=%s ep_size=%d",
-                    torch.distributed.get_rank(), tuple(hidden_states.shape),
-                    self.ep_group.size())
         _, permutated_local_input_tokens, handle = async_all_to_all(
             hidden_states,
             context_metadata["input_splits"],
@@ -560,9 +520,6 @@ class TokenDispatcherWithAll2AllV(MoETokenDispatcher):
             self.ep_group,
         )
         handle.wait()
-        if torch.distributed.get_rank() == 3:
-            logger.info("[MOE-COMM] rank=%d All2All-combine done: hs=%s",
-                    torch.distributed.get_rank(), tuple(permutated_local_input_tokens.shape))
         hidden_states.untyped_storage().resize_(0)
 
         # 3. Postprocess using metadata

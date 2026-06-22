@@ -32,6 +32,7 @@ from vllm.model_executor.layers.fused_moe.layer import (
 from vllm.model_executor.layers.fused_moe.shared_fused_moe import \
     SharedFusedMoE
 
+from vllm_ascend import moe_timer
 from vllm_ascend.ascend_config import get_ascend_config
 from vllm_ascend.ascend_forward_context import MoECommType
 from vllm_ascend.distributed.parallel_state import get_mc2_group
@@ -125,10 +126,6 @@ class AscendUnquantizedFusedMoEMethod(UnquantizedFusedMoEMethod):
             routed_scaling_factor=routed_scaling_factor,
             e_score_correction_bias=e_score_correction_bias,
             global_num_experts=global_num_experts)
-
-        if torch.distributed.get_rank() == 3:
-            logger.info("[MOE-STEP3a] rank=%d select_experts done: topk_ids=%s top_k=%d",
-                    torch.distributed.get_rank(), tuple(topk_ids.shape), top_k)
 
         if zero_expert_num > 0 and zero_expert_type is not None:
             topk_ids, topk_weights, zero_expert_result = zero_experts_compute(
@@ -350,24 +347,15 @@ class AscendFusedMoE(FusedMoE):
                 set_flash_common3_context(topk_weights=topk_weights,
                                           topk_ids=topk_ids)
 
-        _dbg_rank = torch.distributed.get_rank()
-        _dbg_moe_comm_type = forward_context.moe_comm_type
-        if torch.distributed.get_rank() == 3:
-            logger.info("[MOE-STEP1] rank=%d entering prepare: hs=%s moe_comm_type=%s",
-                    _dbg_rank, tuple(hidden_states.shape), _dbg_moe_comm_type)
-
+        moe_timer.tick()
         hidden_states, router_logits, mc2_mask, context_metadata = forward_context.moe_comm_method.prepare(
             hidden_states=hidden_states,
             router_logits=router_logits,
             replace_allreduce=forward_context.sp_enabled,
             enable_shared_expert_dp=self.enable_shared_expert_dp,
             quant_type=self.quant_type)
+        moe_timer.tock("moe_prepare")
 
-        if torch.distributed.get_rank() == 3:
-            logger.info("[MOE-STEP2] rank=%d prepare done: hs=%s replace_allreduce=%s",
-                    _dbg_rank, tuple(hidden_states.shape), forward_context.sp_enabled)
-
-        # Make sure the default stream waits for the gate stream to finish.
         if self.multistream_overlap_gate:
             torch.npu.current_stream().wait_stream(AscendFusedMoE.gate_stream)
 
@@ -377,9 +365,7 @@ class AscendFusedMoE(FusedMoE):
             pertoken_scale = None
 
         # Matrix multiply.
-        if torch.distributed.get_rank() == 3:
-            logger.info("[MOE-STEP3] rank=%d entering quant_method.apply: hs=%s top_k=%d",
-                    _dbg_rank, tuple(hidden_states.shape), self.top_k)
+        moe_timer.tick()
         fused_experts_results: FusedExpertsResult = self.quant_method.apply(
             layer=self,
             x=hidden_states,
@@ -402,6 +388,7 @@ class AscendFusedMoE(FusedMoE):
             log2phy=self.log2phy,
             global_redundant_expert_num=self.global_redundant_expert_num,
             mc2_mask=mc2_mask)
+        moe_timer.tock("moe_fused_experts")
 
         if self.dynamic_eplb:
             expert_tokens = fused_experts_results.expert_tokens
@@ -412,14 +399,12 @@ class AscendFusedMoE(FusedMoE):
                 torch.cat([expert_tokens[:1], expert_tokens[1:] - expert_tokens[:-1]])
             self.moe_load.add_(local_load)
 
+        moe_timer.tick()
         routed_out = forward_context.moe_comm_method.finalize(
             hidden_states=fused_experts_results.routed_out,
             reduce_results=self.reduce_results,
             context_metadata=context_metadata)
-
-        if torch.distributed.get_rank() == 3:
-            logger.info("[MOE-STEP6] rank=%d finalize done: output=%s",
-                    _dbg_rank, tuple(routed_out.shape))
+        moe_timer.tock("moe_finalize")
 
         if return_with_event:
             return FusedMoEResult(

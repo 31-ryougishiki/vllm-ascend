@@ -63,6 +63,7 @@ from vllm_ascend.distributed.parallel_state import (get_flashcomm2_odp_group,
                                                     get_mlp_tp_group,
                                                     get_otp_group)
 from vllm_ascend.ops.flashcomm2_oshard_manager import flashcomm2_oshard_manager
+from vllm_ascend import moe_timer
 from vllm_ascend.utils import (enable_dsa_cp, enable_dsa_cp_with_layer_shard,
                                enable_sp, flashcomm2_enable,
                                get_flashcomm2_reorgnized_batch_ids,
@@ -486,14 +487,11 @@ class SequenceColumnParallelOp(CustomColumnParallelOp):
         # Matrix multiply.
         assert self.quant_method is not None
 
-        if torch.distributed.get_rank() == 0:
-            logger.info("[ATTN-COMM] rank=0 AG-qkv enter: hs=%s",
-                        tuple(input_.shape))
+        moe_timer.tick()
         input_ = torch.ops.vllm.maybe_all_gather_and_maybe_unpad(
             input_, True, is_first_allgather=self.is_first_allgather)
-        if torch.distributed.get_rank() == 0:
-            logger.info("[ATTN-COMM] rank=0 AG-qkv done: hs=%s",
-                        tuple(input_.shape))
+        moe_timer.tock("attn_ag")
+        moe_timer.tick()
         output_parallel = self.quant_method.apply(self.layer, input_, bias)
 
         if self.gather_output:
@@ -591,13 +589,10 @@ class SequenceRowParallelOp(CustomRowParallelOp):
         if is_split_attn_enabled():
             output_parallel = self.layer.quant_method.apply(
                 self.layer, input_parallel, bias=bias_)
-            if torch.distributed.get_rank() == 0:
-                logger.info("[SPLIT-COMM] rank=0 AR-o_proj enter: hs=%s",
-                            tuple(output_parallel.shape))
+            moe_timer.tock("attn_compute")
+            moe_timer.tick()
             result = tensor_model_parallel_all_reduce(output_parallel)
-            if torch.distributed.get_rank() == 0:
-                logger.info("[SPLIT-COMM] rank=0 AR-o_proj done: hs=%s",
-                            tuple(result.shape))
+            moe_timer.tock("attn_ar")
             return result
 
         x = input_parallel
@@ -670,14 +665,10 @@ class SequenceRowParallelOp(CustomRowParallelOp):
             output_parallel = self.layer.quant_method.apply(self.layer,
                                                             x,
                                                             bias=bias_)
-            if torch.distributed.get_rank() == 0:
-                logger.info("[ATTN-COMM] rank=0 RS-o_proj enter: hs=%s",
-                            tuple(output_parallel.shape))
+            moe_timer.tock("attn_compute")
+            moe_timer.tick()
             output = tensor_model_parallel_reduce_scatter(output_parallel, 0)
-            if torch.distributed.get_rank() == 0:
-                logger.info("[ATTN-COMM] rank=0 RS-o_proj done: hs=%s",
-                            tuple(output.shape))
-
+            moe_timer.tock("attn_rs")
         return output
 
     def update_attrs(self):
