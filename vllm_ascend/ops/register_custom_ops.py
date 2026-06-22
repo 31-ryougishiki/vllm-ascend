@@ -8,12 +8,15 @@ from vllm.distributed import (get_dp_group, get_ep_group,
                               tensor_model_parallel_all_reduce,
                               tensor_model_parallel_reduce_scatter)
 from vllm.forward_context import get_forward_context
+from vllm.logger import init_logger
 from vllm.utils.torch_utils import direct_register_custom_op
 
 import vllm_ascend.envs as envs_ascend
 from vllm_ascend.ascend_forward_context import MoECommType
 from vllm_ascend.ops.weight_prefetch import maybe_npu_prefetch
 from vllm_ascend.utils import npu_stream_switch, prefetch_stream
+
+logger = init_logger(__name__)
 
 
 def _maybe_chunk_residual_impl(x: torch.Tensor,
@@ -60,12 +63,23 @@ def _maybe_all_gather_and_maybe_unpad_impl(
     if sp_enabled and label:
         dp_metadata = forward_context.dp_metadata
         if dp_metadata is None or not is_ep_comm:
+            _dbg_rank = torch.distributed.get_rank()
+            logger.info("[MOE-COMM] rank=%d TP-AllGather enter: hs=%s -> tp_size=%d",
+                        _dbg_rank, tuple(x.shape),
+                        get_tensor_model_parallel_world_size())
             x = tensor_model_parallel_all_gather(x, 0)
             pad_size = forward_context.pad_size
             if pad_size > 0:
                 x = x[:-pad_size]
+            logger.info("[MOE-COMM] rank=%d TP-AllGather done: hs=%s",
+                        _dbg_rank, tuple(x.shape))
         else:
+            _dbg_rank = torch.distributed.get_rank()
+            logger.info("[MOE-COMM] rank=%d EP-AllGather enter: hs=%s -> ep_size=%d",
+                        _dbg_rank, tuple(x.shape), get_ep_group().world_size)
             x = get_ep_group().all_gather(x, 0)
+            logger.info("[MOE-COMM] rank=%d EP-AllGather done: hs=%s",
+                        _dbg_rank, tuple(x.shape))
             # unpad
             num_tokens_across_dp_cpu = dp_metadata.num_tokens_across_dp_cpu
             result = torch.empty(
@@ -97,15 +111,26 @@ def _maybe_pad_and_reduce_impl(x: torch.Tensor,
     if is_split_attn_enabled():
         return x
 
+    _dbg_rank = torch.distributed.get_rank()
     if not getattr(forward_context, "sp_enabled", False):
-        return tensor_model_parallel_all_reduce(x)
+        logger.info("[MOE-COMM] rank=%d TP-AllReduce enter: hs=%s tp_size=%d",
+                    _dbg_rank, tuple(x.shape), get_tensor_model_parallel_world_size())
+        result = tensor_model_parallel_all_reduce(x)
+        logger.info("[MOE-COMM] rank=%d TP-AllReduce done: hs=%s",
+                    _dbg_rank, tuple(result.shape))
+        return result
 
     dp_metadata = forward_context.dp_metadata
     if dp_metadata is None or not is_ep_comm:
         pad_size = forward_context.pad_size
         if pad_size > 0:
             x = F.pad(x, (0, 0, 0, pad_size))
-        return tensor_model_parallel_reduce_scatter(x, 0)
+        logger.info("[MOE-COMM] rank=%d TP-ReduceScatter enter: hs=%s tp_size=%d",
+                    _dbg_rank, tuple(x.shape), get_tensor_model_parallel_world_size())
+        result = tensor_model_parallel_reduce_scatter(x, 0)
+        logger.info("[MOE-COMM] rank=%d TP-ReduceScatter done: hs=%s",
+                    _dbg_rank, tuple(result.shape))
+        return result
     else:
         # padding
         dp_size = get_dp_group().world_size
@@ -121,8 +146,13 @@ def _maybe_pad_and_reduce_impl(x: torch.Tensor,
             padded_x[idx, :num_tokens_dp] = x[offset:offset + num_tokens_dp]
             offset += num_tokens_dp
 
-        return get_ep_group().reduce_scatter(padded_x.view(-1, *x.shape[1:]),
+        logger.info("[MOE-COMM] rank=%d EP-ReduceScatter enter: hs=%s ep_size=%d",
+                    _dbg_rank, tuple(padded_x.shape), get_ep_group().world_size)
+        result = get_ep_group().reduce_scatter(padded_x.view(-1, *x.shape[1:]),
                                              0)
+        logger.info("[MOE-COMM] rank=%d EP-ReduceScatter done: hs=%s",
+                    _dbg_rank, tuple(result.shape))
+        return result
 
 
 def _maybe_prefetch_mlp_gate_up_proj_impl(x_dependency: torch.Tensor,
