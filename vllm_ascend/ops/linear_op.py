@@ -54,6 +54,7 @@ from vllm.distributed import (split_tensor_along_last_dim,
                               tensor_model_parallel_reduce_scatter)
 from vllm.distributed.parallel_state import get_tp_group
 from vllm.forward_context import get_forward_context
+from vllm.logger import init_logger
 
 from vllm_ascend import envs as envs_ascend
 from vllm_ascend.ascend_config import get_ascend_config
@@ -68,6 +69,8 @@ from vllm_ascend.utils import (enable_dsa_cp, enable_dsa_cp_with_layer_shard,
                                matmul_allreduce_enable, mlp_tp_enable,
                                oproj_tp_enable, parse_layer_idx,
                                shared_expert_dp_enabled)
+
+logger = init_logger(__name__)
 
 
 class CustomLinearOp:
@@ -483,8 +486,14 @@ class SequenceColumnParallelOp(CustomColumnParallelOp):
         # Matrix multiply.
         assert self.quant_method is not None
 
+        if torch.distributed.get_rank() == 0:
+            logger.info("[ATTN-COMM] rank=0 AG-qkv enter: hs=%s",
+                        tuple(input_.shape))
         input_ = torch.ops.vllm.maybe_all_gather_and_maybe_unpad(
             input_, True, is_first_allgather=self.is_first_allgather)
+        if torch.distributed.get_rank() == 0:
+            logger.info("[ATTN-COMM] rank=0 AG-qkv done: hs=%s",
+                        tuple(input_.shape))
         output_parallel = self.quant_method.apply(self.layer, input_, bias)
 
         if self.gather_output:
@@ -654,7 +663,13 @@ class SequenceRowParallelOp(CustomRowParallelOp):
             output_parallel = self.layer.quant_method.apply(self.layer,
                                                             x,
                                                             bias=bias_)
+            if torch.distributed.get_rank() == 0:
+                logger.info("[ATTN-COMM] rank=0 RS-o_proj enter: hs=%s",
+                            tuple(output_parallel.shape))
             output = tensor_model_parallel_reduce_scatter(output_parallel, 0)
+            if torch.distributed.get_rank() == 0:
+                logger.info("[ATTN-COMM] rank=0 RS-o_proj done: hs=%s",
+                            tuple(output.shape))
 
         return output
 
