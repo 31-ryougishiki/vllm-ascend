@@ -591,7 +591,14 @@ class SequenceRowParallelOp(CustomRowParallelOp):
         if is_split_attn_enabled():
             output_parallel = self.layer.quant_method.apply(
                 self.layer, input_parallel, bias=bias_)
-            return tensor_model_parallel_all_reduce(output_parallel)
+            if torch.distributed.get_rank() == 0:
+                logger.info("[SPLIT-COMM] rank=0 AR-o_proj enter: hs=%s",
+                            tuple(output_parallel.shape))
+            result = tensor_model_parallel_all_reduce(output_parallel)
+            if torch.distributed.get_rank() == 0:
+                logger.info("[SPLIT-COMM] rank=0 AR-o_proj done: hs=%s",
+                            tuple(result.shape))
+            return result
 
         x = input_parallel
 
