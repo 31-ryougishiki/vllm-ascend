@@ -34,12 +34,16 @@ class AscendMultiprocExecutor(MultiprocExecutor):
             f"divisible by nnodes_within_dp "
             f"({self.parallel_config.nnodes_within_dp}). ")
         self.local_world_size = self.parallel_config.local_world_size
-        tensor_parallel_size = self.parallel_config.tensor_parallel_size
+        # Use effective TP size: if split_tp_size > 0, use split_tp_size + split_ep_size
+        if self.parallel_config.split_tp_size > 0:
+            effective_tp_size = self.parallel_config.split_tp_size + self.parallel_config.split_ep_size
+        else:
+            effective_tp_size = self.parallel_config.tensor_parallel_size
         pp_parallel_size = self.parallel_config.pipeline_parallel_size
         pcp_parallel_size = self.parallel_config.prefill_context_parallel_size
-        assert self.world_size == tensor_parallel_size * pp_parallel_size * pcp_parallel_size, (
+        assert self.world_size == effective_tp_size * pp_parallel_size * pcp_parallel_size, (
             f"world_size ({self.world_size}) must be equal to the "
-            f"tensor_parallel_size ({tensor_parallel_size}) x pipeline"
+            f"effective_tp_size ({effective_tp_size}) x pipeline"
             f"_parallel_size ({pp_parallel_size}) x prefill_context"
             f"_parallel_size ({pcp_parallel_size}). ")
 
@@ -179,4 +183,5 @@ class AscendWorkerProc(WorkerProc):
         return UnreadyWorkerProcHandle(proc, rank, reader, death_writer)
 
 
+# NOTE: [lqf] 不知道为啥没生效好像
 vllm.v1.executor.multiproc_executor.MultiprocExecutor = AscendMultiprocExecutor

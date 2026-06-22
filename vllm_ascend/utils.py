@@ -765,7 +765,11 @@ def enable_sp(vllm_config=None, enable_shared_expert_dp: bool = False) -> bool:
             "Currently, Omni models do not support FLASHCOMM in vllm-ascend." \
             "We will fix this in the future. Please set VLLM_ASCEND_ENABLE_FLASHCOMM1=0."
 
-        assert vllm_config.parallel_config.tensor_parallel_size > 1, \
+        # NOTE: [lqf] split 模式下使用 split_tp_size
+        tp_size = max(vllm_config.parallel_config.tensor_parallel_size,
+                      vllm_config.parallel_config.split_tp_size)
+        logger.info(f"tp_size={tp_size}, vllm_config.parallel_config.split_tp_size={vllm_config.parallel_config.split_tp_size}")
+        assert tp_size > 1, \
             "Flash Comm v1 (Sequence Parallelism) is only supported when tp_size > 1."
 
         assert (

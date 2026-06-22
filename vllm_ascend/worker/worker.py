@@ -267,6 +267,18 @@ class NPUWorker(WorkerBase):
 
     @torch.inference_mode()
     def determine_available_memory(self) -> int:
+        # [FIX] In split mode, MoE ranks don't need KV cache.
+        # Return MAX_VALUE so that all_reduce(MIN) will only consider
+        # attn ranks' available memory.
+        from vllm.distributed import is_split_moe_rank, is_split_attn_enabled
+        if is_split_attn_enabled() and is_split_moe_rank():
+            logger.info(
+                f"[Split Mode] MoE rank returning MAX_VALUE for available memory calculation"
+            )
+            self.model_runner.profile_run() # moe rank还是正常跑warmup
+            # Return MAX_INT64 so it won't affect all_reduce(MIN)
+            return 2**63 - 1
+
         # Profile the memory usage of the model and get the maximum number of
         # cache blocks that can be allocated with the remaining free memory.
         gc.collect()

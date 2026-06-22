@@ -59,7 +59,9 @@ def generate_global_placement(n_expert, ep_size, n_redundant):
 def init_eplb_config(ascend_config, layer_id, moe_config):
     expert_map_path = ascend_config.expert_map_path
     n_experts = moe_config.num_experts
-    ep_size = moe_config.ep_size
+    # NOTE: lqf
+    # ep_size = moe_config.ep_size
+    ep_size = moe_config.split_ep_size if moe_config.split_ep_size > 0 else moe_config.ep_size
     global_placement = None
     eplb_enable = ascend_config.dynamic_eplb or ascend_config.expert_map_record_path
     n_redundant = ascend_config.init_redundancy_expert if eplb_enable else 0

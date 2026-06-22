@@ -111,5 +111,9 @@ class GroupCoordinatorPatch(GroupCoordinator):
                                                    gather_dim, scatter_sizes,
                                                    gather_sizes)
 
+    def _get_backend(self, device: torch.device):
+        """Get the backend for this group."""
+        return self.device_group._get_backend(device)
+
 
 vllm.distributed.parallel_state.GroupCoordinator = GroupCoordinatorPatch
