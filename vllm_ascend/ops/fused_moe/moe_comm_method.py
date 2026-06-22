@@ -21,6 +21,7 @@ from typing import Dict, Optional
 
 import torch
 from vllm.forward_context import get_forward_context
+from vllm.logger import init_logger
 from vllm.model_executor.layers.fused_moe import FusedMoEConfig
 
 import vllm_ascend.envs as envs_ascend
@@ -34,6 +35,8 @@ from vllm_ascend.ops.fused_moe.token_dispatcher import (
     TokenDispatcherWithAllGather, TokenDispatcherWithMC2)
 
 _MoECommMethods: Dict[Optional[MoECommType], MoECommMethod] = {}
+
+logger = init_logger(__name__)
 
 
 def get_moe_comm_method(
@@ -144,6 +147,11 @@ class MoECommMethod(ABC):
             dynamic_eplb=dynamic_eplb,
             pertoken_scale=pertoken_scale)
 
+        _dbg_rank = torch.distributed.get_rank()
+        logger.info("[MOE-STEP3b] rank=%d dispatch done: hs=%s group_list=%s",
+                    _dbg_rank, tuple(dispatch_results.hidden_states.shape),
+                    tuple(dispatch_results.group_list.shape))
+
         mlp_output = unified_apply_mlp(
             hidden_states=dispatch_results.hidden_states,
             w1=w1,
@@ -163,10 +171,16 @@ class MoECommMethod(ABC):
             need_trans=need_trans,
             dynamic_eplb=dynamic_eplb)
 
+        logger.info("[MOE-STEP3c] rank=%d expert mlp done: output=%s",
+                    _dbg_rank, tuple(mlp_output.shape))
+
         before_combine_evt = torch.npu.current_stream().record_event()
         combine_results = self.token_dispatcher.token_combine(
             hidden_states=mlp_output,
             context_metadata=dispatch_results.context_metadata)
+
+        logger.info("[MOE-STEP3d] rank=%d combine done: routed_out=%s",
+                    _dbg_rank, tuple(combine_results.routed_out.shape))
 
         return FusedExpertsResult(
             routed_out=combine_results.routed_out,
