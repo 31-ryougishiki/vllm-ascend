@@ -126,7 +126,8 @@ class AscendUnquantizedFusedMoEMethod(UnquantizedFusedMoEMethod):
             e_score_correction_bias=e_score_correction_bias,
             global_num_experts=global_num_experts)
 
-        logger.info("[MOE-STEP3a] rank=%d select_experts done: topk_ids=%s top_k=%d",
+        if torch.distributed.get_rank() == 0:
+            logger.info("[MOE-STEP3a] rank=%d select_experts done: topk_ids=%s top_k=%d",
                     torch.distributed.get_rank(), tuple(topk_ids.shape), top_k)
 
         if zero_expert_num > 0 and zero_expert_type is not None:
@@ -351,7 +352,8 @@ class AscendFusedMoE(FusedMoE):
 
         _dbg_rank = torch.distributed.get_rank()
         _dbg_moe_comm_type = forward_context.moe_comm_type
-        logger.info("[MOE-STEP1] rank=%d entering prepare: hs=%s moe_comm_type=%s",
+        if torch.distributed.get_rank() == 0:
+            logger.info("[MOE-STEP1] rank=%d entering prepare: hs=%s moe_comm_type=%s",
                     _dbg_rank, tuple(hidden_states.shape), _dbg_moe_comm_type)
 
         hidden_states, router_logits, mc2_mask, context_metadata = forward_context.moe_comm_method.prepare(
@@ -361,7 +363,8 @@ class AscendFusedMoE(FusedMoE):
             enable_shared_expert_dp=self.enable_shared_expert_dp,
             quant_type=self.quant_type)
 
-        logger.info("[MOE-STEP2] rank=%d prepare done: hs=%s replace_allreduce=%s",
+        if torch.distributed.get_rank() == 0:
+            logger.info("[MOE-STEP2] rank=%d prepare done: hs=%s replace_allreduce=%s",
                     _dbg_rank, tuple(hidden_states.shape), forward_context.sp_enabled)
 
         # Make sure the default stream waits for the gate stream to finish.
@@ -374,7 +377,8 @@ class AscendFusedMoE(FusedMoE):
             pertoken_scale = None
 
         # Matrix multiply.
-        logger.info("[MOE-STEP3] rank=%d entering quant_method.apply: hs=%s top_k=%d",
+        if torch.distributed.get_rank() == 0:
+            logger.info("[MOE-STEP3] rank=%d entering quant_method.apply: hs=%s top_k=%d",
                     _dbg_rank, tuple(hidden_states.shape), self.top_k)
         fused_experts_results: FusedExpertsResult = self.quant_method.apply(
             layer=self,
@@ -413,7 +417,8 @@ class AscendFusedMoE(FusedMoE):
             reduce_results=self.reduce_results,
             context_metadata=context_metadata)
 
-        logger.info("[MOE-STEP6] rank=%d finalize done: output=%s",
+        if torch.distributed.get_rank() == 0:
+            logger.info("[MOE-STEP6] rank=%d finalize done: output=%s",
                     _dbg_rank, tuple(routed_out.shape))
 
         if return_with_event:
