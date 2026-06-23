@@ -55,6 +55,17 @@ def tock(segment: str):
     })
 
 
+def save() -> float:
+    """Save current _t0 for nested timing. Returns the saved value."""
+    return _t0
+
+
+def restore(t0: float):
+    """Restore _t0 after nested timing to allow outer tick/tock to continue."""
+    global _t0
+    _t0 = t0
+
+
 def get_records() -> List[Dict]:
     return _records
 
