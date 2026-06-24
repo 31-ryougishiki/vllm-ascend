@@ -139,6 +139,10 @@ env_variables: Dict[str, Callable[[], Any]] = {
     # Whether to anbale balance scheduling
     "VLLM_ASCEND_BALANCE_SCHEDULING":
     lambda: bool(int(os.getenv("VLLM_ASCEND_BALANCE_SCHEDULING", '0'))),
+    # Whether to disable the MoE/Attention per-step timing (moe_timer).
+    # Set to 1 to disable timing to eliminate performance overhead.
+    "VLLM_ASCEND_DISABLE_MOE_TIMER":
+    lambda: bool(int(os.getenv("VLLM_ASCEND_DISABLE_MOE_TIMER", '0'))),
 }
 
 # end-env-vars-definition
