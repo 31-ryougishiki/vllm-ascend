@@ -1737,6 +1737,8 @@ class NPUModelRunner(GPUModelRunner):
                 aux_hidden_states,
             )
 
+        logger.info("[Sample] rank=%d >>> calling _bookkeeping_sync",
+                    torch.distributed.get_rank())
         _t_bk = time.perf_counter()
         (
             logprobs_lists,
@@ -1861,6 +1863,8 @@ class NPUModelRunner(GPUModelRunner):
             list[int],
     ]:
         _t0 = time.perf_counter()
+        logger.info("[BK] rank=%d >>> ENTERED _bookkeeping_sync (%.3f ms since _t0)",
+                    torch.distributed.get_rank(), (time.perf_counter() - _t0) * 1000)
         # TODO: implement PR 28597 from vllm
         discard_sampled_tokens_req_indices = \
             self.discard_request_indices.np[:self.num_discarded_requests]
