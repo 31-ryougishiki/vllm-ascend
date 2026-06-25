@@ -54,6 +54,9 @@ def layer_begin(layer_idx: int):
         return
     global _current_layer
     _current_layer = layer_idx
+    if should_time():
+        import torch
+        torch.npu.synchronize()
 
 
 def should_time() -> bool:
