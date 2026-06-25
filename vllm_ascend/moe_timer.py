@@ -42,13 +42,11 @@ def step_begin(num_tokens: int = 0):
     """Call once per scheduling step / model forward."""
     if _is_disabled():
         return
-    global _step_counter, _num_tokens, _step_t0
+    global _step_counter, _records, _num_tokens, _step_t0
     _step_counter += 1
     _num_tokens = num_tokens
     _step_t0 = time.perf_counter()
-    # NOTE: records are cleared by dump(), not here, so that engine-level
-    # timers (schedule, sample) added before step_begin / after compute_logits
-    # are preserved across the full step cycle.
+    _records.clear()
 
 
 def layer_begin(layer_idx: int):
@@ -124,20 +122,20 @@ def get_records() -> List[Dict]:
 
 
 def dump():
-    """Print current step timing summary, then clear records for next step."""
+    """Print current step timing summary."""
     if _is_disabled():
         return
-    global _prev_dump_time, _records
+    if not _records:
+        return
+    global _prev_dump_time
     now = time.perf_counter()
     step_total = (now - _step_t0) * 1000
     gap = (now - _prev_dump_time) * 1000 if _prev_dump_time > 0 else 0
     _prev_dump_time = now
-    if _records:
-        logger.info("=== Step %d  num_tokens=%d  total=%.3f ms  "
-                    "gap_from_prev_dump=%.3f ms  Timing (ms) ===",
-                    _step_counter, _num_tokens, step_total, gap)
-        for r in _records:
-            _ly = r["layer"] if r["layer"] is not None else -1
-            logger.info("  layer=%3d  %-30s  %8.3f ms",
-                        _ly, r["seg"], r["dt_ms"])
-    _records.clear()
+    logger.info("=== Step %d  num_tokens=%d  total=%.3f ms  "
+                "gap_from_prev_dump=%.3f ms  Timing (ms) ===",
+                _step_counter, _num_tokens, step_total, gap)
+    for r in _records:
+        _ly = r["layer"] if r["layer"] is not None else -1
+        logger.info("  layer=%3d  %-30s  %8.3f ms",
+                    _ly, r["seg"], r["dt_ms"])
