@@ -1893,15 +1893,21 @@ class NPUModelRunner(GPUModelRunner):
             max_gen_len = sampled_token_ids.shape[-1]
             if max_gen_len == 1:
                 # No spec decode tokens.
+                _tsync0 = time.perf_counter()
+                torch.npu.synchronize()
+                _tsync1 = time.perf_counter()
                 valid_sampled_token_ids = self._to_list(sampled_token_ids)
                 _tb = time.perf_counter()
                 # Mask out the sampled tokens that should not be sampled.
                 for i in discard_sampled_tokens_req_indices:
                     valid_sampled_token_ids[int(i)].clear()
                 _tc = time.perf_counter()
-                logger.info("[BK] rank=%d non_async: to_list=%.3f  clear=%.3f ms",
+                logger.info("[BK] rank=%d non_async: sync=%.3f  to_list=%.3f  "
+                            "clear=%.3f ms",
                             torch.distributed.get_rank(),
-                            (_tb - _ta) * 1000, (_tc - _tb) * 1000)
+                            (_tsync1 - _tsync0) * 1000,
+                            (_tb - _tsync1) * 1000,
+                            (_tc - _tb) * 1000)
             else:
                 # Includes spec decode tokens.
                 valid_sampled_token_ids, cu_num_tokens = RejectionSampler.parse_output(
