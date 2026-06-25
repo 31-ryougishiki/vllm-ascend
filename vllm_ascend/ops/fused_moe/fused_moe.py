@@ -347,14 +347,12 @@ class AscendFusedMoE(FusedMoE):
                 set_flash_common3_context(topk_weights=topk_weights,
                                           topk_ids=topk_ids)
 
-        moe_timer.tick()
         hidden_states, router_logits, mc2_mask, context_metadata = forward_context.moe_comm_method.prepare(
             hidden_states=hidden_states,
             router_logits=router_logits,
             replace_allreduce=forward_context.sp_enabled,
             enable_shared_expert_dp=self.enable_shared_expert_dp,
             quant_type=self.quant_type)
-        moe_timer.tock("moe_prepare")
 
         if self.multistream_overlap_gate:
             torch.npu.current_stream().wait_stream(AscendFusedMoE.gate_stream)
@@ -399,12 +397,10 @@ class AscendFusedMoE(FusedMoE):
                 torch.cat([expert_tokens[:1], expert_tokens[1:] - expert_tokens[:-1]])
             self.moe_load.add_(local_load)
 
-        moe_timer.tick()
         routed_out = forward_context.moe_comm_method.finalize(
             hidden_states=fused_experts_results.routed_out,
             reduce_results=self.reduce_results,
             context_metadata=context_metadata)
-        moe_timer.tock("moe_finalize")
 
         if return_with_event:
             return FusedMoEResult(

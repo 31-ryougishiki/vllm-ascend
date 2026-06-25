@@ -28,7 +28,6 @@ from vllm.distributed.parallel_state import (
 from vllm.forward_context import get_forward_context
 from vllm.model_executor.layers.fused_moe import FusedMoEConfig
 
-from vllm_ascend import moe_timer
 from vllm_ascend.ascend_config import get_ascend_config
 from vllm_ascend.distributed.utils import fc3_all_gather_and_maybe_unpad_impl
 from vllm_ascend.utils import (enable_sp, npu_stream_switch,
@@ -420,14 +419,10 @@ class PrepareAndFinalizeWithAllGather(PrepareAndFinalize):
                                                   (0, 0, 0, pad_size))
 
             # All-gather across DP group
-            _saved_t0 = moe_timer.save()
-            moe_timer.tick()
             hidden_states = self.moe_config.dp_group.all_gather(
                 hidden_states, 0)
             router_logits = self.moe_config.dp_group.all_gather(
                 router_logits, 0)
-            moe_timer.tock("moe_allgather")
-            moe_timer.restore(_saved_t0)
 
         if prefill_context_parallel_enable() and self.moe_config.pcp_size > 1:
             hidden_states = get_pcp_group().all_gather(
@@ -485,11 +480,7 @@ class PrepareAndFinalizeWithAllGather(PrepareAndFinalize):
             Tensor with shape [original_local_num_tokens, hidden_size]
         """
         if self.moe_config.dp_size > 1 and not self.enable_shared_expert_dp:
-            _saved_t0 = moe_timer.save()
-            moe_timer.tick()
             hidden_states = get_dp_group().reduce_scatter(hidden_states, 0)
-            moe_timer.tock("moe_reducescatter")
-            moe_timer.restore(_saved_t0)
             hidden_states = hidden_states[:self.num_tokens]
 
         if prefill_context_parallel_enable() and self.moe_config.pcp_size > 1:
