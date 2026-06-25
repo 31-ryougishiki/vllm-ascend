@@ -1860,6 +1860,7 @@ class NPUModelRunner(GPUModelRunner):
             dict[str, int],
             list[int],
     ]:
+        _t0 = time.perf_counter()
         # TODO: implement PR 28597 from vllm
         discard_sampled_tokens_req_indices = \
             self.discard_request_indices.np[:self.num_discarded_requests]
@@ -1912,6 +1913,10 @@ class NPUModelRunner(GPUModelRunner):
                 for i, req_id in enumerate(self.input_batch.req_ids)
                 if i not in invalid_req_indices_set
             }
+            _t_async = time.perf_counter()
+            logger.info("[BK] rank=%d async_caching=%.3f ms",
+                        torch.distributed.get_rank(),
+                        (_t_async - _t0) * 1000)
 
         # Cache the sampled tokens in the model runner, so that the scheduler
         # doesn't need to send them back.
@@ -1949,6 +1954,10 @@ class NPUModelRunner(GPUModelRunner):
             req_state = self.requests[req_id]
             req_state.output_token_ids.extend(sampled_ids)
 
+        _t1 = time.perf_counter()
+        logger.info("[BK] rank=%d to_lists=%.3f ms",
+                    torch.distributed.get_rank(),
+                    (_t1 - _t0) * 1000)
         logprobs_lists = (logprobs_tensors.tolists(cu_num_tokens)
                           if not self.use_async_scheduling
                           and logprobs_tensors is not None else None)
