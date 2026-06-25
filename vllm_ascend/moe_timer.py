@@ -84,6 +84,23 @@ def tock(segment: str):
     })
 
 
+def tock_always(segment: str):
+    """End timing segment and record, bypassing should_time() check.
+
+    Use for infrastructure-level timing (embed, lm_head) that does not
+    belong to a specific transformer layer.
+    """
+    if _is_disabled():
+        return
+    dt = (time.perf_counter() - _t0) * 1000  # ms
+    _records.append({
+        "step": _step_counter,
+        "layer": _current_layer,
+        "seg": segment,
+        "dt_ms": round(dt, 3),
+    })
+
+
 def save() -> float:
     """Save current _t0 for nested timing. Returns the saved value."""
     if _is_disabled():
@@ -113,5 +130,6 @@ def dump():
     logger.info("=== Step %d  num_tokens=%d  total=%.3f ms  Timing (ms) ===",
                 _step_counter, _num_tokens, step_total)
     for r in _records:
+        _ly = r["layer"] if r["layer"] is not None else -1
         logger.info("  layer=%3d  %-30s  %8.3f ms",
-                    r["layer"], r["seg"], r["dt_ms"])
+                    _ly, r["seg"], r["dt_ms"])
