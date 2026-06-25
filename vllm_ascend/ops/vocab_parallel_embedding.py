@@ -69,8 +69,8 @@ class AscendVocabParallelEmbedding(VocabParallelEmbedding):
             split_tp_size = config.parallel_config.split_tp_size
             if split_tp_size > 0 and "head" in prefix:
                 from vllm_ascend.distributed.parallel_state import \
-                    get_split_lmhead_group
-                self.comm_group = get_split_lmhead_group()
+                    get_mc2_group
+                self.comm_group = get_mc2_group()
             elif split_tp_size > 0:
                 self.comm_group = get_split_attn_group()
             else:

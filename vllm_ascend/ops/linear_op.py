@@ -490,7 +490,7 @@ class SequenceColumnParallelOp(CustomColumnParallelOp):
         moe_timer.tick()
         input_ = torch.ops.vllm.maybe_all_gather_and_maybe_unpad(
             input_, True, is_first_allgather=self.is_first_allgather)
-        moe_timer.tock("attn_ag")
+        moe_timer.tock_sync("attn_ag")
         moe_timer.tick()
         output_parallel = self.quant_method.apply(self.layer, input_, bias)
 
@@ -589,10 +589,10 @@ class SequenceRowParallelOp(CustomRowParallelOp):
         if is_split_attn_enabled():
             output_parallel = self.layer.quant_method.apply(
                 self.layer, input_parallel, bias=bias_)
-            moe_timer.tock("attn_compute")
+            moe_timer.tock_sync("attn_compute")
             moe_timer.tick()
             result = tensor_model_parallel_all_reduce(output_parallel)
-            moe_timer.tock("attn_ar")
+            moe_timer.tock_sync("attn_ar")
             return result
 
         x = input_parallel
@@ -665,10 +665,10 @@ class SequenceRowParallelOp(CustomRowParallelOp):
             output_parallel = self.layer.quant_method.apply(self.layer,
                                                             x,
                                                             bias=bias_)
-            moe_timer.tock("attn_compute")
+            moe_timer.tock_sync("attn_compute")
             moe_timer.tick()
             output = tensor_model_parallel_reduce_scatter(output_parallel, 0)
-            moe_timer.tock("attn_rs")
+            moe_timer.tock_sync("attn_rs")
         return output
 
     def update_attrs(self):

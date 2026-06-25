@@ -386,7 +386,7 @@ class AscendFusedMoE(FusedMoE):
             log2phy=self.log2phy,
             global_redundant_expert_num=self.global_redundant_expert_num,
             mc2_mask=mc2_mask)
-        moe_timer.tock("moe_fused_experts")
+        moe_timer.tock_sync("moe_fused_experts")
 
         if self.dynamic_eplb:
             expert_tokens = fused_experts_results.expert_tokens

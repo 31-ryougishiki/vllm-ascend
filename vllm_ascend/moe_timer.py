@@ -71,7 +71,7 @@ def tick():
 
 
 def tock(segment: str):
-    """End timing segment and record."""
+    """End timing segment and record (CPU wall-clock time)."""
     if _is_disabled():
         return
     if not should_time():
@@ -81,6 +81,24 @@ def tock(segment: str):
         "step": _step_counter,
         "layer": _current_layer,
         "seg": segment,
+        "dt_ms": round(dt, 3),
+    })
+
+
+def tock_sync(segment: str):
+    """End timing segment with NPU synchronize before recording.
+    Measures actual NPU execution time, not just CPU launch time."""
+    if _is_disabled():
+        return
+    if not should_time():
+        return
+    import torch
+    torch.npu.synchronize()
+    dt = (time.perf_counter() - _t0) * 1000  # ms
+    _records.append({
+        "step": _step_counter,
+        "layer": _current_layer,
+        "seg": segment + "_sync",
         "dt_ms": round(dt, 3),
     })
 
@@ -98,6 +116,21 @@ def tock_always(segment: str):
         "step": _step_counter,
         "layer": _current_layer,
         "seg": segment,
+        "dt_ms": round(dt, 3),
+    })
+
+
+def tock_always_sync(segment: str):
+    """End timing with NPU sync, bypassing should_time() check."""
+    if _is_disabled():
+        return
+    import torch
+    torch.npu.synchronize()
+    dt = (time.perf_counter() - _t0) * 1000  # ms
+    _records.append({
+        "step": _step_counter,
+        "layer": _current_layer,
+        "seg": segment + "_sync",
         "dt_ms": round(dt, 3),
     })
 
