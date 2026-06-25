@@ -1954,10 +1954,15 @@ class NPUModelRunner(GPUModelRunner):
                           and logprobs_tensors is not None else None)
 
         # Compute prompt logprobs if needed.
+        _t_p = time.perf_counter()
         prompt_logprobs_dict = self._get_prompt_logprobs_dict(
             hidden_states[:num_scheduled_tokens],
             scheduler_output.num_scheduled_tokens,
         )
+        logger.info("[Sample] rank=%d prompt_logprobs=%.3f ms num_tokens=%d",
+                    torch.distributed.get_rank(),
+                    (time.perf_counter() - _t_p) * 1000,
+                    num_scheduled_tokens)
 
         return (
             logprobs_lists,
