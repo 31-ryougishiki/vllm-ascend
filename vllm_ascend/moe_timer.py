@@ -85,13 +85,17 @@ def _init_mspti():
 
 def _on_range_data(data):
     """MstxMonitor range callback: record range marker durations.
-    Captures NPU execution time for both compute and communication ops
-    that fall within the marked range."""
+    Only records markers created by our tick()/tock() calls (those with
+    clean names).  Auto-generated HCCL markers (JSON blobs) and unnamed
+    markers are filtered out."""
+    name = data.name
+    if not name or name.startswith("{"):
+        return
     duration_ms = (data.end - data.start) / 1_000_000.0
     _records.append({
         "step": _step_counter,
         "layer": _current_layer,
-        "seg": data.name,
+        "seg": name,
         "dt_ms": round(duration_ms, 3),
     })
 
@@ -122,21 +126,37 @@ def should_time() -> bool:
 
 
 def tick(name: str = ""):
-    """Start timing segment.  When mspti is enabled and *name* is given,
-    opens an mstx range marker that records NPU execution time."""
+    """Start timing segment.  Only records when should_time() is True."""
     if _is_disabled():
         return None
     _init_mspti()
     global _t0, _range_ids
     _t0 = time.perf_counter()
+    if not should_time():
+        return None
+    _start_mspti_range(name)
+    return None
+
+
+def tick_always(name: str):
+    """Start timing segment, bypassing should_time(). For embed, lm_head etc."""
+    if _is_disabled():
+        return None
+    _init_mspti()
+    global _t0
+    _t0 = time.perf_counter()
+    _start_mspti_range(name)
+    return None
+
+
+def _start_mspti_range(name: str):
+    global _range_ids
     if _mspti_enabled and name and _mstx_range_start is not None:
         try:
             rid = _mstx_range_start(name)
             _range_ids[name] = rid
-            return rid
         except Exception:
             pass
-    return None
 
 
 def tock(segment: str):
