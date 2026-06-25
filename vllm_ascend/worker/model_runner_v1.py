@@ -1612,13 +1612,10 @@ class NPUModelRunner(GPUModelRunner):
                     hidden_states.tensors, all_gather_group=get_tp_group())
                 logits = None
             else:
-                # [FIX] In split mode, MoE rank's hidden_states is None after send_to_attn.
-                # Skip computing logits and return None directly.
-                if is_split_attn_enabled() and is_split_moe_rank():
-                    logger.debug(
-                        f"[Split Mode] MoE rank {torch.distributed.get_rank()} "
-                        f"returning None (hidden_states sent to attn rank)"
-                    )
+                # NOTE: MoE rank now receives norm'd hidden_states from attn rank
+                # and participates in lm_head. Only skip if hidden_states is None.
+                if is_split_attn_enabled() and is_split_moe_rank() \
+                        and hidden_states is None:
                     return None
 
                 if self.input_batch.pooling_params:
