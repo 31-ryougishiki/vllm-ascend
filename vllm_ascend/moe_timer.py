@@ -21,6 +21,7 @@ _records: List[Dict] = []
 _step_counter: int = 0
 _num_tokens: int = 0
 _step_t0: float = 0.0
+_prev_dump_time: float = 0.0
 _current_layer: Optional[int] = None
 _t0: float = 0.0
 
@@ -41,7 +42,7 @@ def step_begin(num_tokens: int = 0):
     """Call once per scheduling step / model forward."""
     if _is_disabled():
         return
-    global _step_counter, _records, _num_tokens, _step_t0
+    global _step_counter, _records, _num_tokens, _step_t0, _prev_dump_time
     _step_counter += 1
     _num_tokens = num_tokens
     _step_t0 = time.perf_counter()
@@ -126,9 +127,14 @@ def dump():
         return
     if not _records:
         return
-    step_total = (time.perf_counter() - _step_t0) * 1000
-    logger.info("=== Step %d  num_tokens=%d  total=%.3f ms  Timing (ms) ===",
-                _step_counter, _num_tokens, step_total)
+    global _prev_dump_time
+    now = time.perf_counter()
+    step_total = (now - _step_t0) * 1000
+    gap = (now - _prev_dump_time) * 1000 if _prev_dump_time > 0 else 0
+    _prev_dump_time = now
+    logger.info("=== Step %d  num_tokens=%d  total=%.3f ms  "
+                "gap_from_prev_dump=%.3f ms  Timing (ms) ===",
+                _step_counter, _num_tokens, step_total, gap)
     for r in _records:
         _ly = r["layer"] if r["layer"] is not None else -1
         logger.info("  layer=%3d  %-30s  %8.3f ms",
