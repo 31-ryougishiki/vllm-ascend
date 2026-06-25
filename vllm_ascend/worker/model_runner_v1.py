@@ -1913,16 +1913,13 @@ class NPUModelRunner(GPUModelRunner):
                 for i, req_id in enumerate(self.input_batch.req_ids)
                 if i not in invalid_req_indices_set
             }
-            _t_async = time.perf_counter()
-            logger.info("[BK] rank=%d async_caching=%.3f ms",
-                        torch.distributed.get_rank(),
-                        (_t_async - _t0) * 1000)
 
         # Cache the sampled tokens in the model runner, so that the scheduler
         # doesn't need to send them back.
         # NOTE(woosuk): As an exception, when using PP, the scheduler sends
         # the sampled tokens back, because there's no direct communication
         # between the first-stage worker and the last-stage worker.
+        _t_cache = time.perf_counter()
         req_ids = self.input_batch.req_ids
         for req_idx in range(num_sampled_tokens):
             if self.use_async_scheduling:
@@ -1955,9 +1952,12 @@ class NPUModelRunner(GPUModelRunner):
             req_state.output_token_ids.extend(sampled_ids)
 
         _t1 = time.perf_counter()
-        logger.info("[BK] rank=%d to_lists=%.3f ms",
+        logger.info("[BK] rank=%d to_lists=%.3f ms  "
+                    "token_cache_loop=%.3f ms  num_sampled=%d",
                     torch.distributed.get_rank(),
-                    (_t1 - _t0) * 1000)
+                    (_t1 - _t0) * 1000,
+                    (_t1 - _t_cache) * 1000,
+                    num_sampled_tokens)
         logprobs_lists = (logprobs_tensors.tolists(cu_num_tokens)
                           if not self.use_async_scheduling
                           and logprobs_tensors is not None else None)
