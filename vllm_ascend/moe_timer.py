@@ -32,6 +32,7 @@ _current_layer: Optional[int] = None
 # mspti state
 _t0: float = 0.0
 _range_ids: Dict[str, object] = {}
+_segment_layers: Dict[str, int] = {}
 _mspti_enabled: bool = False
 _mstx_range_start = None
 _mstx_range_end = None
@@ -92,9 +93,10 @@ def _on_range_data(data):
     if not name or name.startswith("{"):
         return
     duration_ms = (data.end - data.start) / 1_000_000.0
+    layer = _segment_layers.get(name, _current_layer)
     _records.append({
         "step": _step_counter,
-        "layer": _current_layer,
+        "layer": layer,
         "seg": name,
         "dt_ms": round(duration_ms, 3),
     })
@@ -150,11 +152,12 @@ def tick_always(name: str):
 
 
 def _start_mspti_range(name: str):
-    global _range_ids
+    global _range_ids, _segment_layers
     if _mspti_enabled and name and _mstx_range_start is not None:
         try:
             rid = _mstx_range_start(name)
             _range_ids[name] = rid
+            _segment_layers[name] = _current_layer if _current_layer is not None else -1
         except Exception:
             pass
 
