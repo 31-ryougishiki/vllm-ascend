@@ -1615,6 +1615,8 @@ class NPUModelRunner(GPUModelRunner):
                 # [FIX] In split mode, MoE rank's hidden_states is None after send_to_attn.
                 # Skip computing logits and return None directly.
                 if is_split_attn_enabled() and is_split_moe_rank():
+                    from vllm_ascend import moe_timer
+                    moe_timer.dump()
                     return None
 
                 if self.input_batch.pooling_params:
