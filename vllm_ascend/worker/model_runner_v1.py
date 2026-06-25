@@ -1883,15 +1883,25 @@ class NPUModelRunner(GPUModelRunner):
         logprobs_tensors = sampler_output.logprobs_tensors
         invalid_req_indices = []
         cu_num_tokens: list[int] | None = None
+        _t_pre = time.perf_counter()
+        logger.info("[BK] rank=%d pre_branch=%.3f ms",
+                    torch.distributed.get_rank(),
+                    (_t_pre - _t0) * 1000)
         if not self.use_async_scheduling:
+            _ta = time.perf_counter()
             # Get the valid generated tokens.
             max_gen_len = sampled_token_ids.shape[-1]
             if max_gen_len == 1:
                 # No spec decode tokens.
                 valid_sampled_token_ids = self._to_list(sampled_token_ids)
+                _tb = time.perf_counter()
                 # Mask out the sampled tokens that should not be sampled.
                 for i in discard_sampled_tokens_req_indices:
                     valid_sampled_token_ids[int(i)].clear()
+                _tc = time.perf_counter()
+                logger.info("[BK] rank=%d non_async: to_list=%.3f  clear=%.3f ms",
+                            torch.distributed.get_rank(),
+                            (_tb - _ta) * 1000, (_tc - _tb) * 1000)
             else:
                 # Includes spec decode tokens.
                 valid_sampled_token_ids, cu_num_tokens = RejectionSampler.parse_output(
@@ -1901,9 +1911,12 @@ class NPUModelRunner(GPUModelRunner):
                     return_cu_num_tokens=logprobs_tensors is not None,
                 )
         else:
+            _ta = time.perf_counter()
             valid_sampled_token_ids = []
             invalid_req_indices = discard_sampled_tokens_req_indices.tolist()
+            _tb = time.perf_counter()
             invalid_req_indices_set = set(invalid_req_indices)
+            _tc = time.perf_counter()
 
             if self.num_spec_tokens <= 0:
                 assert sampled_token_ids.shape[-1] == 1
@@ -1911,12 +1924,19 @@ class NPUModelRunner(GPUModelRunner):
                 # These will be copied into input_ids in the next step
                 # when preparing inputs.
                 self.input_batch.prev_sampled_token_ids = sampled_token_ids
+            _td = time.perf_counter()
 
             self.input_batch.prev_req_id_to_index = {
                 req_id: i
                 for i, req_id in enumerate(self.input_batch.req_ids)
                 if i not in invalid_req_indices_set
             }
+            _te = time.perf_counter()
+            logger.info("[BK] rank=%d async_detail: tolist=%.3f  set=%.3f  "
+                        "cache_ids=%.3f  dict=%.3f ms",
+                        torch.distributed.get_rank(),
+                        (_tb - _ta) * 1000, (_tc - _tb) * 1000,
+                        (_td - _tc) * 1000, (_te - _td) * 1000)
 
         # Cache the sampled tokens in the model runner, so that the scheduler
         # doesn't need to send them back.
