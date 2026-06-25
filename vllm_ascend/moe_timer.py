@@ -19,6 +19,7 @@ TIME_LAYERS: List[int] = [24]
 # Accumulated timing records: list of {layer, step, seg, dt_ms}
 _records: List[Dict] = []
 _step_counter: int = 0
+_num_tokens: int = 0
 _current_layer: Optional[int] = None
 _t0: float = 0.0
 
@@ -35,12 +36,13 @@ def _is_disabled() -> bool:
     return _disabled
 
 
-def step_begin():
+def step_begin(num_tokens: int = 0):
     """Call once per scheduling step / model forward."""
     if _is_disabled():
         return
-    global _step_counter, _records
+    global _step_counter, _records, _num_tokens
     _step_counter += 1
+    _num_tokens = num_tokens
     _records.clear()
 
 
@@ -105,7 +107,7 @@ def dump():
         return
     if not _records:
         return
-    logger.info("=== Step %d Timing (ms) ===", _step_counter)
+    logger.info("=== Step %d  num_tokens=%d  Timing (ms) ===", _step_counter, _num_tokens)
     for r in _records:
         logger.info("  layer=%3d  %-30s  %8.3f ms",
                     r["layer"], r["seg"], r["dt_ms"])
