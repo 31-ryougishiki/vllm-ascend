@@ -20,7 +20,6 @@
 import ctypes
 import math
 import sys
-import time
 from collections import defaultdict
 from contextlib import contextmanager, nullcontext
 from copy import copy, deepcopy
@@ -1613,10 +1612,9 @@ class NPUModelRunner(GPUModelRunner):
                     hidden_states.tensors, all_gather_group=get_tp_group())
                 logits = None
             else:
-                # NOTE: MoE rank now receives norm'd hidden_states from attn rank
-                # and participates in lm_head. Only skip if hidden_states is None.
-                if is_split_attn_enabled() and is_split_moe_rank() \
-                        and hidden_states is None:
+                # [FIX] In split mode, MoE rank's hidden_states is None after send_to_attn.
+                # Skip computing logits and return None directly.
+                if is_split_attn_enabled() and is_split_moe_rank():
                     return None
 
                 if self.input_batch.pooling_params:
@@ -1715,14 +1713,8 @@ class NPUModelRunner(GPUModelRunner):
                                   self.input_batch, logits)
             logits = logits.to(self.device).to(logits_dtype)
 
-        _t_s = time.perf_counter()
         with ProfileExecuteDuration().capture_async("Sample"):
             sampler_output = self._sample(logits, spec_decode_metadata)
-        _t_s2 = time.perf_counter()
-        logger.info("[Sample] rank=%d _sample=%.3f ms logits_shape=%s",
-                    torch.distributed.get_rank(),
-                    (_t_s2 - _t_s) * 1000,
-                    tuple(logits.shape) if logits is not None else None)
         def propose_draft_token_ids(sampled_token_ids):
             assert self.spec_decode_common_attn_metadata is not None
             self._draft_token_ids = self.propose_draft_token_ids(
@@ -1737,9 +1729,6 @@ class NPUModelRunner(GPUModelRunner):
                 aux_hidden_states,
             )
 
-        logger.info("[Sample] rank=%d >>> calling _bookkeeping_sync",
-                    torch.distributed.get_rank())
-        _t_bk = time.perf_counter()
         (
             logprobs_lists,
             valid_sampled_token_ids,
@@ -1755,9 +1744,6 @@ class NPUModelRunner(GPUModelRunner):
             scheduler_output.total_num_scheduled_tokens,
             spec_decode_metadata,
         )
-        logger.info("[Sample] rank=%d bookkeeping=%.3f ms",
-                    torch.distributed.get_rank(),
-                    (time.perf_counter() - _t_bk) * 1000)
 
         with ProfileExecuteDuration().capture_async("Draft"):
             if self.speculative_config:
@@ -1862,9 +1848,6 @@ class NPUModelRunner(GPUModelRunner):
             dict[str, int],
             list[int],
     ]:
-        _t0 = time.perf_counter()
-        logger.info("[BK] rank=%d >>> ENTERED _bookkeeping_sync (%.3f ms since _t0)",
-                    torch.distributed.get_rank(), (time.perf_counter() - _t0) * 1000)
         # TODO: implement PR 28597 from vllm
         discard_sampled_tokens_req_indices = \
             self.discard_request_indices.np[:self.num_discarded_requests]
@@ -1883,31 +1866,15 @@ class NPUModelRunner(GPUModelRunner):
         logprobs_tensors = sampler_output.logprobs_tensors
         invalid_req_indices = []
         cu_num_tokens: list[int] | None = None
-        _t_pre = time.perf_counter()
-        logger.info("[BK] rank=%d pre_branch=%.3f ms",
-                    torch.distributed.get_rank(),
-                    (_t_pre - _t0) * 1000)
         if not self.use_async_scheduling:
-            _ta = time.perf_counter()
             # Get the valid generated tokens.
             max_gen_len = sampled_token_ids.shape[-1]
             if max_gen_len == 1:
                 # No spec decode tokens.
-                _tsync0 = time.perf_counter()
-                torch.npu.synchronize()
-                _tsync1 = time.perf_counter()
                 valid_sampled_token_ids = self._to_list(sampled_token_ids)
-                _tb = time.perf_counter()
                 # Mask out the sampled tokens that should not be sampled.
                 for i in discard_sampled_tokens_req_indices:
                     valid_sampled_token_ids[int(i)].clear()
-                _tc = time.perf_counter()
-                logger.info("[BK] rank=%d non_async: sync=%.3f  to_list=%.3f  "
-                            "clear=%.3f ms",
-                            torch.distributed.get_rank(),
-                            (_tsync1 - _tsync0) * 1000,
-                            (_tb - _tsync1) * 1000,
-                            (_tc - _tb) * 1000)
             else:
                 # Includes spec decode tokens.
                 valid_sampled_token_ids, cu_num_tokens = RejectionSampler.parse_output(
@@ -1917,12 +1884,9 @@ class NPUModelRunner(GPUModelRunner):
                     return_cu_num_tokens=logprobs_tensors is not None,
                 )
         else:
-            _ta = time.perf_counter()
             valid_sampled_token_ids = []
             invalid_req_indices = discard_sampled_tokens_req_indices.tolist()
-            _tb = time.perf_counter()
             invalid_req_indices_set = set(invalid_req_indices)
-            _tc = time.perf_counter()
 
             if self.num_spec_tokens <= 0:
                 assert sampled_token_ids.shape[-1] == 1
@@ -1930,26 +1894,18 @@ class NPUModelRunner(GPUModelRunner):
                 # These will be copied into input_ids in the next step
                 # when preparing inputs.
                 self.input_batch.prev_sampled_token_ids = sampled_token_ids
-            _td = time.perf_counter()
 
             self.input_batch.prev_req_id_to_index = {
                 req_id: i
                 for i, req_id in enumerate(self.input_batch.req_ids)
                 if i not in invalid_req_indices_set
             }
-            _te = time.perf_counter()
-            logger.info("[BK] rank=%d async_detail: tolist=%.3f  set=%.3f  "
-                        "cache_ids=%.3f  dict=%.3f ms",
-                        torch.distributed.get_rank(),
-                        (_tb - _ta) * 1000, (_tc - _tb) * 1000,
-                        (_td - _tc) * 1000, (_te - _td) * 1000)
 
         # Cache the sampled tokens in the model runner, so that the scheduler
         # doesn't need to send them back.
         # NOTE(woosuk): As an exception, when using PP, the scheduler sends
         # the sampled tokens back, because there's no direct communication
         # between the first-stage worker and the last-stage worker.
-        _t_cache = time.perf_counter()
         req_ids = self.input_batch.req_ids
         for req_idx in range(num_sampled_tokens):
             if self.use_async_scheduling:
@@ -1981,27 +1937,15 @@ class NPUModelRunner(GPUModelRunner):
             req_state = self.requests[req_id]
             req_state.output_token_ids.extend(sampled_ids)
 
-        _t1 = time.perf_counter()
-        logger.info("[BK] rank=%d to_lists=%.3f ms  "
-                    "token_cache_loop=%.3f ms  num_sampled=%d",
-                    torch.distributed.get_rank(),
-                    (_t1 - _t0) * 1000,
-                    (_t1 - _t_cache) * 1000,
-                    num_sampled_tokens)
         logprobs_lists = (logprobs_tensors.tolists(cu_num_tokens)
                           if not self.use_async_scheduling
                           and logprobs_tensors is not None else None)
 
         # Compute prompt logprobs if needed.
-        _t_p = time.perf_counter()
         prompt_logprobs_dict = self._get_prompt_logprobs_dict(
             hidden_states[:num_scheduled_tokens],
             scheduler_output.num_scheduled_tokens,
         )
-        logger.info("[Sample] rank=%d prompt_logprobs=%.3f ms num_tokens=%d",
-                    torch.distributed.get_rank(),
-                    (time.perf_counter() - _t_p) * 1000,
-                    num_scheduled_tokens)
 
         return (
             logprobs_lists,

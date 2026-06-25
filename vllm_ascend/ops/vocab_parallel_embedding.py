@@ -61,17 +61,11 @@ class AscendVocabParallelEmbedding(VocabParallelEmbedding):
             self.comm_group = get_embed_tp_group()
             self.forward_type = "embed_tp"
         else:
-            # NOTE: [split] In split mode, lm_head should be sharded across
-            # all ranks (attn + moe) via a dedicated group.
-            # embed_tokens on attn rank stays with split_attn_group.
+            # NOTE: [split] split-mode模式下，对于加载attn的rank改成split_attn_group
             from vllm.config import get_current_vllm_config
             config = get_current_vllm_config()
             split_tp_size = config.parallel_config.split_tp_size
-            if split_tp_size > 0 and "head" in prefix:
-                from vllm_ascend.distributed.parallel_state import \
-                    get_mc2_group
-                self.comm_group = get_mc2_group()
-            elif split_tp_size > 0:
+            if split_tp_size > 0:
                 self.comm_group = get_split_attn_group()
             else:
                 self.comm_group = get_tp_group()

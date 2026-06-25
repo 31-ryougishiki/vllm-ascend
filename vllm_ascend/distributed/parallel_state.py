@@ -26,9 +26,6 @@ _FC3_QUANT_X: Optional[GroupCoordinator] = None
 # shard_weight across rank groups
 _SHARD_WEIGHT: Optional[GroupCoordinator] = None
 
-# Group for lm_head across all ranks in split attn/moe mode
-_SPLIT_LMHEAD: Optional[GroupCoordinator] = None
-
 _P_TP: Optional[GroupCoordinator] = None
 
 
@@ -95,7 +92,7 @@ def init_ascend_model_parallel(parallel_config: ParallelConfig, ):
                                           backend,
                                           group_name=f"p_tp_{num}")
 
-    global _MC2, _SPLIT_LMHEAD
+    global _MC2
     group_ranks = all_ranks.unbind(0)
     group_ranks = [x.tolist() for x in group_ranks]
 
@@ -103,17 +100,6 @@ def init_ascend_model_parallel(parallel_config: ParallelConfig, ):
                                      get_world_group().local_rank,
                                      backend,
                                      group_name="mc2")
-
-    # In split attn/moe mode, create a dedicated group for lm_head that
-    # spans all ranks (both attn and moe groups) so that the large
-    # vocabulary is evenly sharded across all available GPUs.
-    if parallel_config.split_tp_size > 0 and \
-            parallel_config.split_ep_size > 0:
-        _SPLIT_LMHEAD = init_model_parallel_group(
-            group_ranks,
-            get_world_group().local_rank,
-            backend,
-            group_name="split_lmhead")
 
     # Initialize fine-grained TP process groups on Ascend for four components:
     # 1. LM Head: output logits projection (`lmhead_tensor_parallel_size`)
@@ -328,12 +314,6 @@ def get_fc3_quant_x_group() -> GroupCoordinator:
     return _FC3_QUANT_X
 
 
-def get_split_lmhead_group() -> GroupCoordinator:
-    assert _SPLIT_LMHEAD is not None, (
-        "split lmhead group is not initialized")
-    return _SPLIT_LMHEAD
-
-
 def destroy_ascend_model_parallel():
     global _MC2
     if _MC2:
@@ -386,8 +366,3 @@ def destroy_ascend_model_parallel():
     if _FC3_QUANT_X:
         _FC3_QUANT_X.destroy()
     _FC3_QUANT_X = None
-
-    global _SPLIT_LMHEAD
-    if _SPLIT_LMHEAD:
-        _SPLIT_LMHEAD.destroy()
-    _SPLIT_LMHEAD = None
