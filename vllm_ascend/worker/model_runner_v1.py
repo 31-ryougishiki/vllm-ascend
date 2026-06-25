@@ -20,6 +20,7 @@
 import ctypes
 import math
 import sys
+import time
 from collections import defaultdict
 from contextlib import contextmanager, nullcontext
 from copy import copy, deepcopy
@@ -1714,8 +1715,14 @@ class NPUModelRunner(GPUModelRunner):
                                   self.input_batch, logits)
             logits = logits.to(self.device).to(logits_dtype)
 
+        _t_s = time.perf_counter()
         with ProfileExecuteDuration().capture_async("Sample"):
             sampler_output = self._sample(logits, spec_decode_metadata)
+        _t_s2 = time.perf_counter()
+        logger.info("[Sample] rank=%d _sample=%.3f ms logits_shape=%s",
+                    torch.distributed.get_rank(),
+                    (_t_s2 - _t_s) * 1000,
+                    tuple(logits.shape) if logits is not None else None)
         def propose_draft_token_ids(sampled_token_ids):
             assert self.spec_decode_common_attn_metadata is not None
             self._draft_token_ids = self.propose_draft_token_ids(
@@ -1730,6 +1737,7 @@ class NPUModelRunner(GPUModelRunner):
                 aux_hidden_states,
             )
 
+        _t_bk = time.perf_counter()
         (
             logprobs_lists,
             valid_sampled_token_ids,
@@ -1745,6 +1753,9 @@ class NPUModelRunner(GPUModelRunner):
             scheduler_output.total_num_scheduled_tokens,
             spec_decode_metadata,
         )
+        logger.info("[Sample] rank=%d bookkeeping=%.3f ms",
+                    torch.distributed.get_rank(),
+                    (time.perf_counter() - _t_bk) * 1000)
 
         with ProfileExecuteDuration().capture_async("Draft"):
             if self.speculative_config:
