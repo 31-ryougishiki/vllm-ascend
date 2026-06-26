@@ -128,10 +128,14 @@ def benchmark_allreduce(
 
     if rank == 0:
         data_size_bytes = tensor.element_size() * tensor.numel()
+        # Effective data moved by ring / recursive-doubling all-reduce.
         effective_bytes = data_size_bytes * 2 * (world_size - 1) / world_size
         avg_ms = np.mean(times)
         min_ms = np.min(times)
         med_ms = np.median(times)
+
+        # GB/s = effective_bytes / 1e9 / (avg_ms / 1e3)
+        bw_gb_s = effective_bytes / 1e6 / avg_ms
 
         print("\n--- All-Reduce Benchmark Results ---")
         print(f"World size (tp)  : {world_size}")
@@ -143,8 +147,7 @@ def benchmark_allreduce(
         print(f"Min   time       : {min_ms:.3f} ms")
         print(f"Avg   time       : {avg_ms:.3f} ms")
         print(f"Median time      : {med_ms:.3f} ms")
-        print(f"Avg bandwidth    : "
-              f"{effective_bytes / 1e6 / (avg_ms / 1e3):.2f} GB/s")
+        print(f"Avg bandwidth    : {bw_gb_s:.2f} GB/s")
 
 
 def main() -> None:
