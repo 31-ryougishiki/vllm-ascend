@@ -143,6 +143,15 @@ env_variables: Dict[str, Callable[[], Any]] = {
     # Set to 1 to disable timing to eliminate performance overhead.
     "VLLM_ASCEND_DISABLE_MOE_TIMER":
     lambda: bool(int(os.getenv("VLLM_ASCEND_DISABLE_MOE_TIMER", '0'))),
+    # Whether to dump the input tensor before the moe_ar all-reduce.
+    # When set to 1, the tensor passed to tensor_model_parallel_all_reduce
+    # (in the ALLGATHER MoE path) is saved to disk for offline benchmarking.
+    "VLLM_ASCEND_DUMP_MOE_AR_TENSOR":
+    lambda: bool(int(os.getenv("VLLM_ASCEND_DUMP_MOE_AR_TENSOR", '0'))),
+    # Directory where moe_ar dump files are written. Defaults to the current
+    # working directory. Created automatically if it does not exist.
+    "VLLM_ASCEND_DUMP_MOE_AR_DIR":
+    lambda: os.getenv("VLLM_ASCEND_DUMP_MOE_AR_DIR", os.getcwd()),
 }
 
 # end-env-vars-definition

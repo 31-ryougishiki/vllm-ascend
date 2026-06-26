@@ -1,3 +1,5 @@
+import os
+
 import torch
 import torch.nn.functional as F
 import torch_npu
@@ -17,6 +19,51 @@ from vllm_ascend.ops.weight_prefetch import maybe_npu_prefetch
 from vllm_ascend.utils import npu_stream_switch, prefetch_stream
 
 logger = init_logger(__name__)
+
+# Per-rank step counter for naming moe_ar dump files.
+_step_counter_by_rank: dict = {}
+
+
+def _get_step_counter() -> int:
+    """Return and increment the step counter for the current rank."""
+    try:
+        rank = torch.distributed.get_rank()
+    except (RuntimeError, ValueError):
+        rank = 0
+    cnt = _step_counter_by_rank.get(rank, 0)
+    _step_counter_by_rank[rank] = cnt + 1
+    return cnt
+
+
+def _dump_moe_ar_tensor(tensor: torch.Tensor) -> None:
+    """Dump the input tensor of moe_ar all-reduce to disk for benchmarking.
+
+    Controlled by env vars:
+      VLLM_ASCEND_DUMP_MOE_AR_TENSOR -- enable/disable (bool)
+      VLLM_ASCEND_DUMP_MOE_AR_DIR    -- output directory (str)
+
+    The tensor is saved as a CPU copy so the benchmark can load without NPU.
+    """
+    if not envs_ascend.VLLM_ASCEND_DUMP_MOE_AR_TENSOR:
+        return
+
+    try:
+        rank = torch.distributed.get_rank()
+    except (RuntimeError, ValueError):
+        rank = 0
+
+    dump_dir = envs_ascend.VLLM_ASCEND_DUMP_MOE_AR_DIR
+    os.makedirs(dump_dir, exist_ok=True)
+
+    step = _get_step_counter()
+    dtype_str = str(tensor.dtype).replace("torch.", "")
+    shape_str = "x".join(str(d) for d in tensor.shape)
+
+    filename = f"moe_ar_input_rank{rank}_step{step}_{dtype_str}_{shape_str}.pt"
+    filepath = os.path.join(dump_dir, filename)
+
+    torch.save(tensor.cpu(), filepath)
+    logger.info("Dumped moe_ar tensor to %s", filepath)
 
 
 def _maybe_chunk_residual_impl(x: torch.Tensor,
@@ -285,6 +332,7 @@ def _maybe_all_reduce_tensor_model_parallel_impl(
     } or forward_context.sp_enabled:
         return final_hidden_states
     else:
+        _dump_moe_ar_tensor(final_hidden_states)
         return tensor_model_parallel_all_reduce(final_hidden_states)
 
 
