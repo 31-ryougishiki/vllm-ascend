@@ -39,12 +39,22 @@ def _dump_moe_ar_tensor(tensor: torch.Tensor) -> None:
     """Dump the input tensor of moe_ar all-reduce to disk for benchmarking.
 
     Controlled by env vars:
-      VLLM_ASCEND_DUMP_MOE_AR_TENSOR -- enable/disable (bool)
-      VLLM_ASCEND_DUMP_MOE_AR_DIR    -- output directory (str)
+      VLLM_ASCEND_DUMP_MOE_AR_TENSOR    -- enable/disable (bool)
+      VLLM_ASCEND_DUMP_MOE_AR_DIR       -- output directory (str)
+      VLLM_ASCEND_DUMP_MOE_AR_START_STEP -- first step to dump, 0-indexed (default 0)
+      VLLM_ASCEND_DUMP_MOE_AR_END_STEP   -- last step to dump, -1 = no limit
 
     The tensor is saved as a CPU copy so the benchmark can load without NPU.
     """
     if not envs_ascend.VLLM_ASCEND_DUMP_MOE_AR_TENSOR:
+        return
+
+    # Increment the step counter first, then check range.
+    step = _get_step_counter()
+    if step < envs_ascend.VLLM_ASCEND_DUMP_MOE_AR_START_STEP:
+        return
+    end_step = envs_ascend.VLLM_ASCEND_DUMP_MOE_AR_END_STEP
+    if end_step >= 0 and step > end_step:
         return
 
     try:
@@ -55,7 +65,6 @@ def _dump_moe_ar_tensor(tensor: torch.Tensor) -> None:
     dump_dir = envs_ascend.VLLM_ASCEND_DUMP_MOE_AR_DIR
     os.makedirs(dump_dir, exist_ok=True)
 
-    step = _get_step_counter()
     dtype_str = str(tensor.dtype).replace("torch.", "")
     shape_str = "x".join(str(d) for d in tensor.shape)
 
