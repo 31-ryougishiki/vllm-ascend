@@ -24,12 +24,20 @@ Usage::
 
 import argparse
 import os
+import sys
+import time
 
 import numpy as np
 import torch
 import torch.distributed as dist
 import torch.multiprocessing as mp
 import torch_npu
+
+
+def _log(rank: int, msg: str) -> None:
+    """Print a timestamped log message from *rank* immediately."""
+    ts = time.strftime("%H:%M:%S")
+    print(f"[{ts}] [rank {rank}] {msg}", flush=True)
 
 
 def benchmark_allreduce(
@@ -40,37 +48,29 @@ def benchmark_allreduce(
     iters: int,
     port: int,
 ) -> None:
-    """Worker function executed on each NPU rank.
+    """Worker function executed on each NPU rank."""
+    _log(rank, "worker started")
 
-    Each rank loads its own dump file (inferred by substituting the rank
-    number in the base filename), moves the tensor to NPU, and runs
-    ``dist.all_reduce`` in a warmup + measurement loop.
-
-    Parameters
-    ----------
-    rank :
-        Local rank of this worker (0 .. world_size-1).
-    world_size :
-        Total number of ranks (tp size).
-    tensor_path :
-        Path to the **rank-0** dump file.  Other ranks derive their path by
-        replacing ``_rank0_`` with ``_rank{rank}_``.
-    warmup_iters :
-        Number of warmup iterations (not measured).
-    iters :
-        Number of timed iterations.
-    port :
-        TCP port for the ``init_process_group`` rendezvous.
-    """
     os.environ["MASTER_ADDR"] = "127.0.0.1"
     os.environ["MASTER_PORT"] = str(port)
+    # Set a timeout so a stuck init_process_group doesn't hang forever.
+    os.environ.setdefault("TORCH_DIST_INIT_TIMEOUT", "60")
 
-    dist.init_process_group(
-        backend="hccl",
-        rank=rank,
-        world_size=world_size,
-    )
+    _log(rank, f"calling init_process_group (backend=hccl, world_size={world_size}, port={port})")
+    try:
+        dist.init_process_group(
+            backend="hccl",
+            rank=rank,
+            world_size=world_size,
+        )
+    except Exception:
+        _log(rank, "FAILED: init_process_group raised exception")
+        raise
+    _log(rank, "init_process_group done")
+
+    _log(rank, f"setting npu device to {rank}")
     torch_npu.npu.set_device(rank)
+    _log(rank, f"npu device set, device count={torch_npu.npu.device_count()}")
 
     # Derive this rank's dump path from the rank-0 path.
     base_dir = os.path.dirname(tensor_path) or "."
@@ -78,47 +78,62 @@ def benchmark_allreduce(
     rank_name = base_name.replace("_rank0_", f"_rank{rank}_")
     rank_path = os.path.join(base_dir, rank_name)
 
+    _log(rank, f"looking for dump file: {rank_path}")
     if not os.path.exists(rank_path):
+        _log(rank, f"ERROR: file not found: {rank_path}")
+        # List files in the dump directory to help diagnose.
+        if os.path.isdir(base_dir):
+            _log(rank, f"files in {base_dir}: {os.listdir(base_dir)[:20]}")
         raise FileNotFoundError(
             f"Rank {rank} dump file not found: {rank_path}.  "
             f"Expected file derived from --tensor-path by substituting "
             f"'_rank0_' → '_rank{rank}_'."
         )
+    _log(rank, "file found, loading tensor ...")
 
     tensor = torch.load(rank_path, weights_only=True, map_location="cpu")
+    _log(rank, f"tensor loaded from disk: shape={tuple(tensor.shape)}, dtype={tensor.dtype}")
     tensor = tensor.npu(rank)
+    _log(rank, "tensor moved to NPU")
 
     def _allreduce_op() -> None:
         dist.all_reduce(tensor)
 
     # Warmup ----------------------------------------------------------------
-    for _ in range(warmup_iters):
+    _log(rank, f"starting {warmup_iters} warmup iterations ...")
+    t0 = time.perf_counter()
+    for i in range(warmup_iters):
         _allreduce_op()
     torch_npu.npu.synchronize(rank)
+    _log(rank, f"warmup done ({warmup_iters} iters, {time.perf_counter() - t0:.1f}s)")
 
     # Measurement -----------------------------------------------------------
+    _log(rank, f"starting {iters} measurement iterations ...")
     start = torch.npu.Event(enable_timing=True)
     end = torch.npu.Event(enable_timing=True)
     times = np.zeros(iters)
 
+    t0 = time.perf_counter()
     for i in range(iters):
         start.record()
         _allreduce_op()
         end.record()
         torch_npu.npu.synchronize(rank)
         times[i] = start.elapsed_time(end)  # ms
+    _log(rank, f"measurement done ({iters} iters, {time.perf_counter() - t0:.1f}s wall)")
 
+    _log(rank, "destroying process group")
     dist.destroy_process_group()
+    _log(rank, "process group destroyed")
 
     if rank == 0:
         data_size_bytes = tensor.element_size() * tensor.numel()
-        # Ring / bidirectional all-reduce bandwidth formula
         effective_bytes = data_size_bytes * 2 * (world_size - 1) / world_size
         avg_ms = np.mean(times)
         min_ms = np.min(times)
         med_ms = np.median(times)
 
-        print("--- All-Reduce Benchmark Results ---")
+        print("\n--- All-Reduce Benchmark Results ---")
         print(f"World size (tp)  : {world_size}")
         print(f"Tensor shape     : {tuple(tensor.shape)}")
         print(f"Tensor dtype     : {tensor.dtype}")
@@ -171,6 +186,9 @@ def main() -> None:
     )
     args = parser.parse_args()
 
+    print(f"[main] spawning {args.world_size} workers, port={args.port}, "
+          f"tensor-path={args.tensor_path}", flush=True)
+
     mp.spawn(
         benchmark_allreduce,
         args=(
@@ -183,6 +201,7 @@ def main() -> None:
         nprocs=args.world_size,
         join=True,
     )
+    print("[main] done", flush=True)
 
 
 if __name__ == "__main__":
