@@ -152,11 +152,12 @@ env_variables: Dict[str, Callable[[], Any]] = {
     # working directory. Created automatically if it does not exist.
     "VLLM_ASCEND_DUMP_MOE_AR_DIR":
     lambda: os.getenv("VLLM_ASCEND_DUMP_MOE_AR_DIR", os.getcwd()),
-    # Only dump steps in the range [START, END] (0-indexed, inclusive).
-    # VLLM_ASCEND_DUMP_MOE_AR_START_STEP defaults to 0.
+    # Only dump steps in the range [START, END] (inclusive), using
+    # moe_timer._step_counter (1-indexed, incremented in step_begin).
+    # VLLM_ASCEND_DUMP_MOE_AR_START_STEP defaults to 1.
     # VLLM_ASCEND_DUMP_MOE_AR_END_STEP defaults to -1 (no upper limit).
     "VLLM_ASCEND_DUMP_MOE_AR_START_STEP":
-    lambda: int(os.getenv("VLLM_ASCEND_DUMP_MOE_AR_START_STEP", '0')),
+    lambda: int(os.getenv("VLLM_ASCEND_DUMP_MOE_AR_START_STEP", '1')),
     "VLLM_ASCEND_DUMP_MOE_AR_END_STEP":
     lambda: int(os.getenv("VLLM_ASCEND_DUMP_MOE_AR_END_STEP", '-1')),
 }

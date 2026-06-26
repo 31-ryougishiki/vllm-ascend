@@ -20,37 +20,40 @@ from vllm_ascend.utils import npu_stream_switch, prefetch_stream
 
 logger = init_logger(__name__)
 
-# Per-rank step counter for naming moe_ar dump files.
-_step_counter_by_rank: dict = {}
-
-
-def _get_step_counter() -> int:
-    """Return and increment the step counter for the current rank."""
-    try:
-        rank = torch.distributed.get_rank()
-    except (RuntimeError, ValueError):
-        rank = 0
-    cnt = _step_counter_by_rank.get(rank, 0)
-    _step_counter_by_rank[rank] = cnt + 1
-    return cnt
-
 
 def _dump_moe_ar_tensor(tensor: torch.Tensor) -> None:
     """Dump the input tensor of moe_ar all-reduce to disk for benchmarking.
 
     Controlled by env vars:
-      VLLM_ASCEND_DUMP_MOE_AR_TENSOR    -- enable/disable (bool)
-      VLLM_ASCEND_DUMP_MOE_AR_DIR       -- output directory (str)
-      VLLM_ASCEND_DUMP_MOE_AR_START_STEP -- first step to dump, 0-indexed (default 0)
+      VLLM_ASCEND_DUMP_MOE_AR_TENSOR     -- enable/disable (bool)
+      VLLM_ASCEND_DUMP_MOE_AR_DIR        -- output directory (str)
+      VLLM_ASCEND_DUMP_MOE_AR_START_STEP -- first step to dump (moe_timer step, 1-indexed)
       VLLM_ASCEND_DUMP_MOE_AR_END_STEP   -- last step to dump, -1 = no limit
+
+    Uses ``moe_timer._step_counter`` for step numbering.  Dumps are only
+    written when a moe_timer step is active (i.e. ``step_begin`` has been
+    called and ``dump`` has not yet executed for this step).  Within a
+    single step multiple layers may hit the all-reduce path — a per-step
+    sequence number is appended to disambiguate them.
 
     The tensor is saved as a CPU copy so the benchmark can load without NPU.
     """
     if not envs_ascend.VLLM_ASCEND_DUMP_MOE_AR_TENSOR:
         return
 
-    # Increment the step counter first, then check range.
-    step = _get_step_counter()
+    # Defer the moe_timer import to avoid circular dependencies at module
+    # load time (moe_timer may import vllm_ascend.envs).
+    from vllm_ascend import moe_timer  # noqa: W0621
+
+    step = moe_timer._step_counter
+    # Don't dump outside an active moe_timer step.
+    if step <= 0:
+        return
+    # Only dump layers listed in moe_timer.TIME_LAYERS (when non-empty).
+    layer = moe_timer._current_layer
+    if moe_timer.TIME_LAYERS and layer not in moe_timer.TIME_LAYERS:
+        return
+    # Range check (moe_timer steps are 1-indexed; env vars use the same).
     if step < envs_ascend.VLLM_ASCEND_DUMP_MOE_AR_START_STEP:
         return
     end_step = envs_ascend.VLLM_ASCEND_DUMP_MOE_AR_END_STEP
@@ -68,11 +71,38 @@ def _dump_moe_ar_tensor(tensor: torch.Tensor) -> None:
     dtype_str = str(tensor.dtype).replace("torch.", "")
     shape_str = "x".join(str(d) for d in tensor.shape)
 
-    filename = f"moe_ar_input_rank{rank}_step{step}_{dtype_str}_{shape_str}.pt"
+    filename = _make_dump_filename(rank, step, layer, dtype_str, shape_str, dump_dir)
     filepath = os.path.join(dump_dir, filename)
 
     torch.save(tensor.cpu(), filepath)
     logger.info("Dumped moe_ar tensor to %s", filepath)
+
+
+def _make_dump_filename(
+    rank: int,
+    step: int,
+    layer: int | None,
+    dtype_str: str,
+    shape_str: str,
+    dump_dir: str,
+) -> str:
+    """Generate a unique filename for this (rank, step, layer, shape) combination."""
+    layer_str = f"_layer{layer}" if layer is not None else ""
+    prefix = f"moe_ar_input_rank{rank}_step{step}{layer_str}_{dtype_str}_{shape_str}"
+    existing = [
+        f for f in os.listdir(dump_dir)
+        if f.startswith(prefix) and f.endswith(".pt")
+    ]
+    if not existing:
+        return f"{prefix}.pt"
+    elif len(existing) == 1:
+        # Rename the first one to include _seq0, this one becomes _seq1.
+        old_path = os.path.join(dump_dir, existing[0])
+        new_name = f"{prefix}_seq0.pt"
+        os.rename(old_path, os.path.join(dump_dir, new_name))
+        return f"{prefix}_seq1.pt"
+    else:
+        return f"{prefix}_seq{len(existing)}.pt"
 
 
 def _maybe_chunk_residual_impl(x: torch.Tensor,
