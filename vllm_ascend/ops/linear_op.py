@@ -589,7 +589,7 @@ class SequenceRowParallelOp(CustomRowParallelOp):
         if is_split_attn_enabled():
             output_parallel = self.layer.quant_method.apply(
                 self.layer, input_parallel, bias=bias_)
-            moe_timer.tock("attn_compute")
+            logger.info("[zcx] [debug] output here")
             moe_timer.tick("attn_ar")
             result = tensor_model_parallel_all_reduce(output_parallel)
             moe_timer.tock("attn_ar")
@@ -665,7 +665,6 @@ class SequenceRowParallelOp(CustomRowParallelOp):
             output_parallel = self.layer.quant_method.apply(self.layer,
                                                             x,
                                                             bias=bias_)
-            moe_timer.tock("attn_compute")
             moe_timer.tick("attn_rs")
             output = tensor_model_parallel_reduce_scatter(output_parallel, 0)
             moe_timer.tock("attn_rs")
