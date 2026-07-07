@@ -4334,6 +4334,28 @@ class NPUModelRunner(GPUModelRunner):
                 if kv_cache_spec[layer_name].page_size_bytes < mamba_page_size_padded:  # type: ignore[attr-defined]
                     object.__setattr__(kv_cache_spec[layer_name], "page_size_padded", mamba_page_size_padded)
 
+        # DEBUG: log per-layer KV cache spec
+        for layer_name, spec in kv_cache_spec.items():
+            logger.info(
+                "KV_SPEC_PER_LAYER: layer=%s type=%s block_size=%s "
+                "page_size_bytes=%s compress_ratio=%s storage_block_size=%s "
+                "alignment=%s page_size_padded=%s model_version=%s "
+                "cache_dtype=%s num_kv_heads=%s head_size=%s dtype=%s",
+                layer_name,
+                type(spec).__name__,
+                getattr(spec, "block_size", "N/A"),
+                spec.page_size_bytes if hasattr(spec, "page_size_bytes") else "N/A",
+                getattr(spec, "compress_ratio", "N/A"),
+                getattr(spec, "storage_block_size", "N/A"),
+                getattr(spec, "alignment", "N/A"),
+                getattr(spec, "page_size_padded", "N/A"),
+                getattr(spec, "model_version", "N/A"),
+                getattr(spec, "cache_dtype_str", "N/A"),
+                getattr(spec, "num_kv_heads", "N/A"),
+                getattr(spec, "head_size", "N/A"),
+                getattr(spec, "dtype", "N/A"),
+            )
+
         return kv_cache_spec
 
     def _check_and_update_cudagraph_mode(
