@@ -18,6 +18,7 @@
 #
 
 import math
+import os
 import sys
 import time
 from collections import defaultdict
@@ -50,6 +51,7 @@ from vllm.utils.import_utils import LazyLoader
 from vllm.utils.math_utils import cdiv, round_up
 from vllm.utils.mem_utils import DeviceMemoryProfiler
 from vllm.utils.torch_utils import get_dtype_size
+from vllm.utils.callstack import _NOOP_SPAN
 from vllm.v1.attention.backend import AttentionBackend, AttentionMetadata
 from vllm.v1.attention.backends.gdn_attn import GDNAttentionMetadataBuilder
 from vllm.v1.attention.backends.utils import CommonAttentionMetadata
@@ -243,8 +245,36 @@ class ExecuteModelState(NamedTuple):
     batch_desc: BatchDescriptor
 
 
+def _format_span_summary(root) -> str:
+    """Walk a CallStack span tree and format a one-line timing summary.
+
+    Each leaf / inner node is emitted as ``path=dur_ms%`` where the
+    percentage is relative to *root* so the caller can see at a glance
+    where time is spent inside the step.
+    """
+    if root is None or root.duration_us <= 0:
+        return "(no timing data)"
+
+    total_us = root.duration_us
+    parts: list[str] = []
+
+    def _walk(node, prefix: str) -> None:
+        dur_us = node.duration_us
+        if dur_us > 0 and node is not root:
+            pct = dur_us / total_us * 100
+            parts.append(f"{prefix}{node.name}={dur_us / 1000:.1f}ms({pct:.0f}%)")
+        for child in node.children:
+            _walk(child, f"{prefix}{node.name}/" if node is not root else "")
+
+    _walk(root, "")
+    return " | ".join(parts)
+
+
 class NPUModelRunner(GPUModelRunner):
     def __init__(self, vllm_config: VllmConfig, device: torch.device):
+        _init_t0 = time.perf_counter()
+        from vllm.utils.callstack import snapshot as _cs_snapshot
+        _cs_snapshot("NPUModelRunner.__init__", module_filter="vllm", max_depth=12)
         # TODO(qcs): These manual pad and unpad for GPUModelRunner are
         # used to expand some buffers, which need to be reverted after
         # the following PR is merged:
@@ -517,6 +547,72 @@ class NPUModelRunner(GPUModelRunner):
             self.kvcomp_meta_data = initialize_kvcomp_metadata(max_num_reqs=self.max_num_reqs,
                 block_size=self.block_size, device=self.device, vllm_config=self.vllm_config,
                 parallel_config=self.parallel_config, dtype=self.dtype)
+        self._cs_step_counter = 0  # monotonic step counter for CallStack tracer
+
+        # --- CallStack tracing setup (one-time, not on hot path) ---
+        self._cs_span = _NOOP_SPAN
+        self._cs_tracer = None
+        self._cs_collector = None
+        self._cs_output_dir = ""
+
+        _cs_cfg = getattr(self.ascend_config, "callstack_tracing", None) or {}
+        if _cs_cfg.get("enabled", False):
+            try:
+                from vllm.utils.callstack import (  # noqa: F811
+                    get_tracer as _get_cs_tracer,
+                    get_collector as _get_cs_collector,
+                )
+                _cs_enable_timing = _cs_cfg.get("enable_timing", True)
+                # When timing is on, record ALL steps for aggregate stats.
+                # When off, only record the first step (tree-only mode).
+                _cs_first_only = _cs_cfg.get(
+                    "first_step_only", not _cs_enable_timing
+                )
+                _cs_flush_interval = _cs_cfg.get(
+                    "flush_interval", 100
+                )  # flush every N steps
+                _cs_step_interval = _cs_cfg.get(
+                    "step_interval", 1
+                )  # record every N steps (1 = every step)
+                _cs_use_npu_timing = _cs_cfg.get(
+                    "use_npu_timing", _cs_enable_timing
+                )  # default: True when timing enabled
+
+                self._cs_tracer = _get_cs_tracer(
+                    enabled=True,
+                    first_step_only=_cs_first_only,
+                    enable_timing=_cs_enable_timing,
+                    use_npu_timing=_cs_use_npu_timing,
+                    step_interval=_cs_step_interval,
+                )
+                self._cs_span = self._cs_tracer.span  # bound method, hot-path ready
+
+                self._cs_output_dir = (
+                    _cs_cfg.get("output_dir", "") or "/tmp/callstack_traces"
+                )
+                self._cs_collector = _get_cs_collector(
+                    output_dir=self._cs_output_dir,
+                    flush_interval=_cs_flush_interval,
+                    enabled=True,
+                )
+                logger.info(
+                    "CallStack tracer initialized: "
+                    "first_step_only=%s, enable_timing=%s, "
+                    "use_npu_timing=%s, step_interval=%s, "
+                    "flush_interval=%s, output_dir=%s",
+                    _cs_first_only,
+                    _cs_enable_timing,
+                    _cs_use_npu_timing,
+                    _cs_step_interval,
+                    _cs_flush_interval,
+                    self._cs_output_dir,
+                )
+            except Exception as e:
+                logger.warning("CallStack init failed, tracing disabled: %s", e)
+                self._cs_tracer = None
+                self._cs_collector = None
+                self._cs_span = _NOOP_SPAN
+        _init_elapsed = (time.perf_counter() - _init_t0) * 1000
 
     @property
     def use_cp(self) -> bool:
@@ -1667,6 +1763,8 @@ class NPUModelRunner(GPUModelRunner):
         scheduler_output: "SchedulerOutput",
         intermediate_tensors: IntermediateTensors | None = None,
     ) -> ModelRunnerOutput | IntermediateTensors | None:
+        self._cs_step_counter += 1
+        self._step_start_time = time.perf_counter()
         if self.vllm_config.model_config.enable_return_routed_experts:
             if vllm_version_is("0.20.2"):
                 capturer = RoutedExpertsCapturer.get_instance()
@@ -1725,7 +1823,19 @@ class NPUModelRunner(GPUModelRunner):
         )):
             scheduler_output = deepcopy(scheduler_output)
         num_scheduled_tokens = scheduler_output.total_num_scheduled_tokens
-        with record_function_or_nullcontext("prepare input"):
+
+        # --- CallStack tracing per-step lifecycle ---
+        # Uses pre-bound self._cs_span (set in __init__) to avoid
+        # lambda / closure creation on the hot path.
+        _cs_tracer = self._cs_tracer
+        _cs_active = _cs_tracer is not None and num_scheduled_tokens > 0
+        if _cs_active:
+            _cs_tracer.step_begin(
+                f"step_{self._cs_step_counter}",
+                metadata={"num_tokens": num_scheduled_tokens},
+            )
+
+        with self._cs_span("prepare_input"), record_function_or_nullcontext("prepare input"):
             with self.synchronize_input_prep():
                 # Fix up prev_req_id_to_index for requests that were discarded
                 # in the previous sample_tokens step. If a request has
@@ -1756,6 +1866,7 @@ class NPUModelRunner(GPUModelRunner):
                     ) as ec_connector_output:
                         self._execute_mm_encoder(scheduler_output)
                         self._finalize_dump_data()
+                        self._cs_step_end(num_scheduled_tokens)
                         return make_empty_encoder_model_runner_output(scheduler_output)
 
                 if not num_scheduled_tokens:
@@ -1772,7 +1883,9 @@ class NPUModelRunner(GPUModelRunner):
                         self._dummy_run(1)
                     if not has_kv_transfer_group():
                         # Return empty ModelRunnerOutput if no work to do.
+                        self._cs_step_end(num_scheduled_tokens)
                         return EMPTY_MODEL_RUNNER_OUTPUT
+                    self._cs_step_end(num_scheduled_tokens)
                     return self.kv_connector_no_forward(scheduler_output, self.vllm_config)
                 if self.cache_config.kv_sharing_fast_prefill:
                     assert not self.num_prompt_logprobs, (
@@ -1784,6 +1897,13 @@ class NPUModelRunner(GPUModelRunner):
                 num_reqs = self.input_batch.num_reqs
                 req_ids = self.input_batch.req_ids
                 tokens = [scheduler_output.num_scheduled_tokens[i] for i in req_ids]
+                logger.info(
+                    "Step %d executing: num_reqs=%d, req_ids=%s, tokens_per_req=%s",
+                    self._cs_step_counter,
+                    num_reqs,
+                    req_ids,
+                    tokens,
+                )
                 num_scheduled_tokens_np = np.array(tokens, dtype=np.int32)
                 max_num_scheduled_tokens = int(num_scheduled_tokens_np.max())
 
@@ -1982,6 +2102,7 @@ class NPUModelRunner(GPUModelRunner):
         # Run forward pass
         clear_kv_metadata = self.speculative_config is None
         with (
+            self._cs_span("model_forward"),
             record_function_or_nullcontext("forward"),
             set_ascend_forward_context(
                 attn_metadata,
@@ -2004,10 +2125,24 @@ class NPUModelRunner(GPUModelRunner):
                 ),
             ) as kv_connector_output,
         ):
+            logger.info(
+                "Step %d _model_forward args: num_tokens_padded=%d, "
+                "input_ids=%s, positions=%s, "
+                "intermediate_tensors=%s, inputs_embeds=%s, "
+                "model_kwargs=%s",
+                self._cs_step_counter,
+                num_tokens_padded,
+                tuple(input_ids.shape) if input_ids is not None else None,
+                tuple(positions.shape) if positions is not None else None,
+                type(intermediate_tensors).__name__ if intermediate_tensors is not None else None,
+                tuple(inputs_embeds.shape) if inputs_embeds is not None else None,
+                {k: tuple(v.shape) if hasattr(v, 'shape') else type(v).__name__
+                 for k, v in model_kwargs.items()},
+            )
             hidden_states = self._model_forward(
                 num_tokens_padded, input_ids, positions, intermediate_tensors, inputs_embeds, **model_kwargs
             )
-        with record_function_or_nullcontext("post process"):
+        with self._cs_span("post_process"), record_function_or_nullcontext("post process"):
             aux_hidden_states = None
             if self.use_aux_hidden_state_outputs:
                 hidden_states, aux_hidden_states = hidden_states
@@ -2029,6 +2164,7 @@ class NPUModelRunner(GPUModelRunner):
                     hidden_states.kv_connector_output = kv_connector_output
                     self.kv_connector_output = kv_connector_output
                     self._finalize_dump_data()
+                    self._cs_step_end(num_scheduled_tokens)
                     return hidden_states
                 if self.is_pooling_model:
                     # Return the pooling output.
@@ -2037,6 +2173,7 @@ class NPUModelRunner(GPUModelRunner):
                     )
                     output.kv_connector_output = kv_connector_output
                     self._finalize_dump_data()
+                    self._cs_step_end(num_scheduled_tokens)
                     return output
 
                 sample_hidden_states = hidden_states[logits_indices]
@@ -2083,7 +2220,63 @@ class NPUModelRunner(GPUModelRunner):
         # previous model forward without breaking async scheduling.
         if deferred_state_corrections_fn:
             deferred_state_corrections_fn()
+        self._cs_step_end(num_scheduled_tokens)
         return None
+
+    def _cs_step_end(self, num_tokens: int) -> None:
+        """Finalize the current callstack step: step_end, print, collect, persist.
+
+        Called before every return in ``execute_model`` so it runs on all
+        exit paths.  A no-op when the tracer is None or inactive.
+
+        .. note::
+           The tree is only **logged** on step 1 to avoid log spam, but
+           ``collect_step`` is called for **every** step so aggregate
+           statistics (avg/min/max) are still computed across all steps.
+        """
+        elapsed_ms = (time.perf_counter() - self._step_start_time) * 1000
+        logger.info(
+            "Step %d end: elapsed=%.3f ms, num_tokens=%d",
+            self._cs_step_counter,
+            elapsed_ms,
+            num_tokens,
+        )
+        tracer = self._cs_tracer
+        if tracer is None or not tracer.active:
+            return
+        tracer.step_end()
+
+        # Print per-span timing for this step.
+        _root = tracer._root
+        if _root is not None and _root.duration_us > 0:
+            _summary = _format_span_summary(_root)
+            logger.info("CallStack span timings (step %d): %s",
+                        self._cs_step_counter, _summary)
+
+        # Only log the tree text on the first recorded step.
+        # Subsequent steps are still recorded and collected, but
+        # printing the identical tree every iteration is noisy.
+        if self._cs_step_counter == 1:
+            tree_text = tracer.tree_text()
+            logger.info("CallStack trace (step 1):\n%s", tree_text)
+
+            # Persist the tree to disk — once is enough (the structure
+            # and relative proportions are stable across steps).
+            if self._cs_output_dir:
+                try:
+                    rank = dist.get_rank() if dist.is_initialized() else 0
+                except Exception:
+                    rank = 0
+                os.makedirs(self._cs_output_dir, exist_ok=True)
+                tree_path = os.path.join(
+                    self._cs_output_dir, f"callstack_tree_rank_{rank}.txt"
+                )
+                with open(tree_path, "w", encoding="utf-8") as f:
+                    f.write(tree_text)
+
+        # Collect every step for cross-step aggregate statistics.
+        if self._cs_collector is not None:
+            self._cs_collector.collect_step(tracer, num_tokens=num_tokens)
 
     @torch.inference_mode()
     def sample_tokens(
@@ -3348,6 +3541,7 @@ class NPUModelRunner(GPUModelRunner):
         return output
 
     def profile_run(self) -> None:
+        _t0 = time.perf_counter()
         self.eplb_warmup()
         mc2_tokens_capacity = get_mc2_tokens_capacity()
         if self.max_num_tokens > mc2_tokens_capacity and select_moe_comm_method(
@@ -3371,6 +3565,7 @@ class NPUModelRunner(GPUModelRunner):
             self.eplb_updator.warm_up_eplb()
 
     def load_model(self) -> None:
+        _load_t0 = time.perf_counter()
         logger.info("Starting to load model %s...", self.model_config.model)
 
         if self.ascend_config.mix_placement:
@@ -3381,6 +3576,8 @@ class NPUModelRunner(GPUModelRunner):
             rocm_aiter_ops.is_fusion_moe_shared_experts_enabled = mock_true
             rocm_aiter_ops.is_fused_moe_enabled = mock_true
 
+        # ---- Phase 1: model instantiation + weight loading ----
+        _t1 = time.perf_counter()
         with DeviceMemoryProfiler() as m:  # noqa: SIM117
             if self.eplb_enable:
                 def mock_pass(param1, param2):
@@ -3388,6 +3585,14 @@ class NPUModelRunner(GPUModelRunner):
                 from vllm.model_executor.model_loader.default_loader import DefaultModelLoader
                 DefaultModelLoader._init_ep_weight_filter = mock_pass
             self.model: nn.Module = get_model(vllm_config=self.vllm_config)
+
+            # Log per-rank weight statistics
+            _total_params = sum(p.numel() for p in self.model.parameters())
+            _total_bytes = sum(p.numel() * p.element_size() for p in self.model.parameters())
+            logger.info(">>> [LoadModel] get_model done: params=%s size=%.2f GB in %.0fms <<<",
+                        f"{_total_params:,}", _total_bytes / (2**30),
+                        (time.perf_counter() - _t1) * 1000)
+
             for name, _ in self.model.named_parameters():
                 # sinks is a kind of parameter in attention
                 # only set in weight name
@@ -3397,7 +3602,10 @@ class NPUModelRunner(GPUModelRunner):
                     break
             if self.dynamic_eplb:
                 model_register(self.model)
+
+            # ---- Phase 2: drafter model (speculative decode) ----
             if self.drafter:
+                _t2 = time.perf_counter()
                 logger.info("Loading drafter model...")
                 if self.vllm_config.quant_config is not None:
                     patch_load_weights(self.vllm_config)
@@ -3414,14 +3622,19 @@ class NPUModelRunner(GPUModelRunner):
                     if not aux_layers:
                         aux_layers = self.model.get_eagle3_default_aux_hidden_state_layers()
                     self.model.set_aux_hidden_state_layers(aux_layers)
+                logger.info(">>> [LoadModel] drafter loaded in %.0fms <<<", (time.perf_counter() - _t2) * 1000)
 
             if self.lora_config:
+                _t_lora = time.perf_counter()
                 self.model = self.load_lora_model(self.model, self.vllm_config, self.device)
+                logger.info(">>> [LoadModel] LoRA loaded in %.0fms <<<", (time.perf_counter() - _t_lora) * 1000)
+
         self.model_memory_usage = m.consumed_memory
         logger.info("Loading model weights took %.4f GB", m.consumed_memory / float(2**30))
 
-        # wrap the model with full graph wrapper if needed.
+        # ---- Phase 3: ACL graph wrapper ----
         if self.compilation_config.cudagraph_mode.has_full_cudagraphs():
+            _t_aclg = time.perf_counter()
             self.update_stream: torch.npu.Stream = torch.npu.Stream()
             self.model = ACLGraphWrapper(
                 self.model,
@@ -3430,9 +3643,11 @@ class NPUModelRunner(GPUModelRunner):
                 use_eagle=self.use_eagle,
                 enable_enpu=self.enable_enpu,
             )
+            logger.info(">>> [LoadModel] ACLGraphWrapper in %.0fms <<<", (time.perf_counter() - _t_aclg) * 1000)
 
         if self.compilation_config.cudagraph_mode != CUDAGraphMode.NONE:
             self._start_dump_data()
+        _load_elapsed = (time.perf_counter() - _load_t0) * 1000
 
     def _start_dump_data(self) -> None:
         if self.debugger is None or self._debugger_started:
@@ -3456,6 +3671,7 @@ class NPUModelRunner(GPUModelRunner):
             kv_cache_config: Configuration for the KV cache, including the KV
             cache size of each layer
         """
+        _t0 = time.perf_counter()
         kv_cache_config = deepcopy(kv_cache_config)
         self.kv_cache_config = kv_cache_config
         self._mamba_bufs = None
@@ -4361,9 +4577,11 @@ class NPUModelRunner(GPUModelRunner):
 
     def capture_model(self) -> int:
         """Capture NPU graphs and return actual graph pool memory bytes consumed."""
+        _t0 = time.perf_counter()
         parent_module_name = _get_gpu_model_runner_module_name(self)
         with _torch_cuda_wrapper(), _replace_gpu_model_runner_function_wrapper(parent_module_name):
-            return GPUModelRunner.capture_model(self)
+            result = GPUModelRunner.capture_model(self)
+        return result
 
     def _prepare_multimodal_fields(self):
         """

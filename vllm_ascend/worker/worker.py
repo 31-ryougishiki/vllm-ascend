@@ -20,6 +20,7 @@
 import copy
 import gc
 import logging
+import time
 from types import NoneType
 
 import torch
@@ -89,6 +90,8 @@ class NPUWorker(WorkerBase):
         **kwargs,
     ):
         """Initialize the worker for Ascend."""
+        _nw_t0 = time.time()
+
         if not envs_ascend.COMPILE_CUSTOM_KERNELS:
             logger.warning(
                 "COMPILE_CUSTOM_KERNELS is set to False. "
@@ -96,11 +99,14 @@ class NPUWorker(WorkerBase):
             )
 
         # register patch for vllm
+        _t_patch = time.time()
         from vllm_ascend.utils import adapt_patch
 
         adapt_patch()
+        _t_patch_elapsed = (time.time() - _t_patch) * 1000
 
         # Register ops when worker init.
+        _t_ops = time.time()
         from vllm_ascend import ops
 
         ops.register_dummy_fusion_op()
@@ -110,7 +116,9 @@ class NPUWorker(WorkerBase):
         # init ascend config and soc version
         init_ascend_config(vllm_config)
         check_ascend_device_type()
+        _t_ops_elapsed = (time.time() - _t_ops) * 1000
 
+        _t_super = time.time()
         super().__init__(
             vllm_config=vllm_config,
             local_rank=local_rank,
@@ -118,6 +126,7 @@ class NPUWorker(WorkerBase):
             distributed_init_method=distributed_init_method,
             is_driver_worker=is_driver_worker,
         )
+        _t_super_elapsed = (time.time() - _t_super) * 1000
 
         if self.cache_config.cache_dtype == "auto":
             self.cache_dtype = self.model_config.dtype
@@ -160,6 +169,8 @@ class NPUWorker(WorkerBase):
 
             signal.signal(signal.SIGTERM, signal_handler)
             signal.signal(signal.SIGINT, signal_handler)
+
+        _nw_elapsed = (time.time() - _nw_t0) * 1000
 
     def uninstall_static_kernel(self):
         import fcntl
@@ -254,6 +265,7 @@ class NPUWorker(WorkerBase):
         self.cache_config.num_cpu_blocks = num_cpu_blocks
 
     def _init_device(self):
+        _t0 = time.time()
         device = torch.device(f"npu:{self.local_rank}")
         torch.npu.set_device(device)
 
@@ -308,6 +320,7 @@ class NPUWorker(WorkerBase):
         return device
 
     def init_device(self):
+        _t0 = time.time()
         # NOTE: KEEP device the member of `NPUWorker`, as it will be checked
         # in ray scenario. see https://github.com/vllm-project/vllm/pull/26845
         # for more details
@@ -480,6 +493,7 @@ class NPUWorker(WorkerBase):
             self.model_runner.load_model()
 
     def compile_or_warm_up_model(self) -> CompilationTimes:
+        _t_cw_total = time.time()
         # Note: need to adapt for graph mode.
         warmup_sizes = (self.vllm_config.compilation_config.compile_sizes or []).copy()
         if not self.model_config.enforce_eager:
@@ -499,12 +513,16 @@ class NPUWorker(WorkerBase):
                 if not any(x in compile_range for x in all_sizes):
                     warmup_sizes.append(compile_range.end)
 
+        _t_dummy = time.time()
         for size in sorted(warmup_sizes, reverse=True):
+            _t_one = time.time()
             logger.info("Compile and warming up model for size %d", size)
             self.model_runner._dummy_run(size)
+        _t_dummy_elapsed = (time.time() - _t_dummy) * 1000
 
         npugraph_memory_bytes = 0
         if not self.model_config.enforce_eager:
+            _t_capture = time.time()
             npugraph_memory_bytes = self.model_runner.capture_model()
 
         # Suggest an optimal --kv-cache-memory value for future runs.
@@ -547,18 +565,22 @@ class NPUWorker(WorkerBase):
 
         # Call ATB matmul to warm up; otherwise, the first operation (ReshapeAndCache)
         # may cause performance degradation at runtime.
+        _t_atb = time.time()
         if get_ascend_device_type() != AscendDeviceType.A5:
             self._warm_up_atb()
         # Bind after warmup so hot allocations are already materialized on the
         # worker process before migratepages/taskset run.
+        _t_bind = time.time()
         if get_ascend_config().enable_cpu_binding:
             try:
                 bind_cpus(self.local_rank)
             except Exception as e:
                 logger.warning("Bind cpus failed in rank%s: %s Skip binding cpu.", self.local_rank, e)
+        _t_bind_elapsed = (time.time() - _t_bind) * 1000
         # Reset the seed to ensure that the random state is not affected by
         # the model initialization and profiling.
         set_random_seed(self.model_config.seed)
+        _t_cw_elapsed = (time.time() - _t_cw_total) * 1000
         return CompilationTimes(
             language_model=self.vllm_config.compilation_config.compilation_time,
             # `encoder_compilation_time` was added after v0.19.1 (vLLM #39240); fall
@@ -673,6 +695,7 @@ class NPUWorker(WorkerBase):
 
     def initialize_from_config(self, kv_cache_config: KVCacheConfig) -> None:
         """Allocate NPU KV cache with the specified kv_cache_config."""
+        _t_kv_init = time.time()
         ensure_kv_transfer_initialized(self.vllm_config, kv_cache_config)
         if self.vllm_config.model_config.enable_sleep_mode:
             allocator = CaMemAllocator.get_instance()

@@ -13,6 +13,8 @@ from vllm.triton_utils import HAS_TRITON
 from vllm.v1.attention.backend import AttentionBackend, AttentionCGSupport, AttentionMetadataBuilder
 from vllm.v1.kv_cache_interface import AttentionSpec, MLAAttentionSpec
 
+from vllm.utils.callstack import get_tracer as _get_cs_tracer
+
 from vllm_ascend.ascend_config import get_ascend_config
 from vllm_ascend.attention.abstract import DSAAttentionImpl
 from vllm_ascend.attention.attention_mask import AttentionMaskBuilder
@@ -1453,6 +1455,10 @@ class AscendDSAImpl(DSAAttentionImpl):
             False,
         )
 
+        # Cache the tracer singleton once to avoid repeated _get_cs_tracer()
+        # calls on the hot path (double-check locking on every call).
+        self._cs_tracer = _get_cs_tracer()
+
     def dsa_warmup_with_multistream(self, hidden_states: torch.Tensor) -> None:
         """
         Warmup function for DSA profiling run.
@@ -1600,57 +1606,60 @@ class AscendDSAImpl(DSAAttentionImpl):
         o_proj_input_shape = (forward_context.num_tokens, self.n_local_heads, self.head_dim)
         o_proj_input = torch.empty(o_proj_input_shape, dtype=hidden_states.dtype, device=hidden_states.device)
         assert kv_cache is not None, "kv_cache tensor tuple must be provided."
-        if has_prefill:
-            assert attn_metadata[0].prefill is not None
-            output_prefill = self._forward_prefill(
-                layer_name,
-                prefill_hidden_states,
-                kv_cache,
-                attn_metadata,
-                need_prefill_gather,
-            )  # type: ignore[arg-type]
-            o_proj_input[decode_tokens:actual_tokens] = output_prefill
-            cos = attn_metadata[0].prefill.cos[layer_name]
-            sin = attn_metadata[0].prefill.sin[layer_name]
 
-        if has_decode:
-            assert attn_metadata[0].decode is not None
-            output_decode = self._forward_decode(layer_name, decode_hidden_states, kv_cache, attn_metadata)
-            o_proj_input[:decode_tokens] = output_decode
-            cos = attn_metadata[0].decode.cos[layer_name]
-            sin = attn_metadata[0].decode.sin[layer_name]
+        _cs_t = self._cs_tracer
+        with _cs_t.span("model/attn"):
+            if has_prefill:
+                assert attn_metadata[0].prefill is not None
+                output_prefill = self._forward_prefill(
+                    layer_name,
+                    prefill_hidden_states,
+                    kv_cache,
+                    attn_metadata,
+                    need_prefill_gather,
+                )  # type: ignore[arg-type]
+                o_proj_input[decode_tokens:actual_tokens] = output_prefill
+                cos = attn_metadata[0].prefill.cos[layer_name]
+                sin = attn_metadata[0].prefill.sin[layer_name]
 
-        cos = attn_metadata[0].cos[layer_name]
-        sin = attn_metadata[0].sin[layer_name]
-        num_tokens = o_proj_input.shape[0]
+            if has_decode:
+                assert attn_metadata[0].decode is not None
+                output_decode = self._forward_decode(layer_name, decode_hidden_states, kv_cache, attn_metadata)
+                o_proj_input[:decode_tokens] = output_decode
+                cos = attn_metadata[0].decode.cos[layer_name]
+                sin = attn_metadata[0].decode.sin[layer_name]
 
-        torch.ops._C_ascend.inplace_partial_rotary_mul(
-            o_proj_input.unsqueeze(1),
-            cos,
-            -sin,
-            rotary_mode="interleave",
-            partial_slice=[self.nope_head_dim, self.head_dim],
-        )
+            cos = attn_metadata[0].cos[layer_name]
+            sin = attn_metadata[0].sin[layer_name]
+            num_tokens = o_proj_input.shape[0]
 
-        # o
-        o_proj_input = o_proj_input.view(num_tokens, self.n_local_groups, -1)
-        if olora_tp_enable():
-            o_proj_input = self.wo_a(o_proj_input)
-        else:
-            # wo_a = self.wo_a.weight.view(self.n_local_groups, self.o_lora_rank, -1)
-            # o = torch.einsum("tgd,grd->tgr", o, wo_a)
-            o_proj_input = torch_npu.npu_transpose_batchmatmul(
-                o_proj_input,
-                self.wo_a.weight,
-                bias=None,
-                scale=None,
-                perm_x1=(1, 0, 2),
-                perm_x2=(0, 1, 2),
-                perm_y=(1, 0, 2),
-                batch_split_factor=1,
+            torch.ops._C_ascend.inplace_partial_rotary_mul(
+                o_proj_input.unsqueeze(1),
+                cos,
+                -sin,
+                rotary_mode="interleave",
+                partial_slice=[self.nope_head_dim, self.head_dim],
             )
-            o_proj_input = o_proj_input.reshape(num_tokens, -1)
-        output[...] = self.wo_b(o_proj_input)
+
+            # o
+            o_proj_input = o_proj_input.view(num_tokens, self.n_local_groups, -1)
+            if olora_tp_enable():
+                o_proj_input = self.wo_a(o_proj_input)
+            else:
+                # wo_a = self.wo_a.weight.view(self.n_local_groups, self.o_lora_rank, -1)
+                # o = torch.einsum("tgd,grd->tgr", o, wo_a)
+                o_proj_input = torch_npu.npu_transpose_batchmatmul(
+                    o_proj_input,
+                    self.wo_a.weight,
+                    bias=None,
+                    scale=None,
+                    perm_x1=(1, 0, 2),
+                    perm_x2=(0, 1, 2),
+                    perm_y=(1, 0, 2),
+                    batch_split_factor=1,
+                )
+                o_proj_input = o_proj_input.reshape(num_tokens, -1)
+            output[...] = self.wo_b(o_proj_input)
 
         return output_padded
 
@@ -1893,6 +1902,7 @@ class AscendDSAImpl(DSAAttentionImpl):
             # q
             qr = self.q_norm(self.wq_a(hidden_states))
             q = self.wq_b(qr).unflatten(-1, (self.n_local_heads, self.head_dim))
+
             q = triton_q_rms(q, self.eps)
 
             torch.ops._C_ascend.inplace_partial_rotary_mul(
@@ -1902,6 +1912,7 @@ class AscendDSAImpl(DSAAttentionImpl):
                 rotary_mode="interleave",
                 partial_slice=[self.nope_head_dim, self.head_dim],
             )
+
             # win kv & tok_dis
             kv = self.wkv(hidden_states)
             kv = self.kv_norm(kv)
@@ -2045,6 +2056,7 @@ class AscendDSAImpl(DSAAttentionImpl):
 
             if self.compress_ratio == 4 and self.use_index_cache:
                 self._update_indexcache_topk_indices(compress_topk_idxs, offset=prefill_offset)
+
 
         if self.compress_ratio <= 1:
             attn_output = torch.ops._C_ascend.npu_sparse_attn_sharedkv(
@@ -2335,6 +2347,7 @@ class AscendDSAImpl(DSAAttentionImpl):
 
             if self.compress_ratio == 4 and self.use_index_cache:
                 self._update_indexcache_topk_indices(compress_topk_idxs, offset=0)
+
 
         if self.compress_ratio <= 1:
             attn_output = torch.ops._C_ascend.npu_sparse_attn_sharedkv(

@@ -279,6 +279,14 @@ class AscendConfig:
         self.sparse_json = self.hamming_sparse["sparse_json_location"]
         self._check_enable_hamming_sparse()
 
+        # CallStack tracing configuration (see vllm.utils.callstack).
+        self.callstack_tracing = additional_config.get("callstack_tracing", {})
+        if self.callstack_tracing:
+            logger.info(">>> [CallStack] AscendConfig: callstack_tracing parsed: %s", self.callstack_tracing)
+        else:
+            logger.info(">>> [CallStack] AscendConfig: callstack_tracing NOT SET (additional_config has %d keys: %s)",
+                        len(additional_config), list(additional_config.keys())[:10])
+
     @staticmethod
     def _get_config_value(additional_config: dict[str, Any], config_key: str, env_key: str, env_value: Any) -> Any:
         if config_key in additional_config:
