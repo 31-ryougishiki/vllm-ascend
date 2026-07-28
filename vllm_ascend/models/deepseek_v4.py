@@ -46,6 +46,8 @@ from vllm.distributed import (
 )
 from vllm.model_executor.layers.activation import SiluAndMul
 from vllm.model_executor.layers.fused_moe import FusedMoE
+from vllm.logger import logger
+from vllm.utils.callstack import get_tracer as _get_cs_tracer
 from vllm.model_executor.layers.layernorm import RMSNorm
 from vllm.model_executor.layers.linear import (
     ColumnParallelLinear,
@@ -331,6 +333,7 @@ class DeepseekV4MoE(nn.Module):
             hash=layer_idx < config.num_hash_layers and not is_draft_layer,
             tid2eid=self.gate.tid2eid,
         )
+        self._cs_tracer = _get_cs_tracer()
 
     def forward(self, hidden_states: torch.Tensor, input_ids=None) -> torch.Tensor:
         num_tokens, hidden_dim = hidden_states.shape
@@ -343,44 +346,46 @@ class DeepseekV4MoE(nn.Module):
         if self.is_sequence_parallel:
             hidden_states = sequence_parallel_chunk(hidden_states)
 
-        if self.experts.is_internal_router:
-            # In this case, the gate/router runs inside the FusedMoE class
-            fused_moe_out = self.experts(hidden_states=hidden_states, router_logits=hidden_states)
-        else:
-            # router_logits: (num_tokens, n_experts)
-            router_logits = F.linear(hidden_states.float(), self.gate.weight)
-            fused_moe_out = self.experts(hidden_states=hidden_states, router_logits=router_logits)
+        _cs_t = self._cs_tracer
+        with _cs_t.span("model/moe"):
+            if self.experts.is_internal_router:
+                # In this case, the gate/router runs inside the FusedMoE class
+                fused_moe_out = self.experts(hidden_states=hidden_states, router_logits=hidden_states)
+            else:
+                # router_logits: (num_tokens, n_experts)
+                router_logits = F.linear(hidden_states.float(), self.gate.weight)
+                fused_moe_out = self.experts(hidden_states=hidden_states, router_logits=router_logits)
 
-        fused_moe_out_is_tuple = isinstance(fused_moe_out, tuple)
-        if fused_moe_out_is_tuple:
-            shared_output, final_hidden_states = fused_moe_out
-            if self.shared_experts is None:
-                assert shared_output is None
+            fused_moe_out_is_tuple = isinstance(fused_moe_out, tuple)
+            if fused_moe_out_is_tuple:
+                shared_output, final_hidden_states = fused_moe_out
+                if self.shared_experts is None:
+                    assert shared_output is None
 
-            if hidden_states.dtype != torch.float16:
-                if not self.is_rocm_aiter_moe_enabled:
-                    if self.shared_experts is not None:
-                        assert shared_output is not None
-                        final_hidden_states = muls_add_triton(
-                            final_hidden_states, shared_output, self.routed_scaling_factor
-                        )
-                    else:
-                        final_hidden_states *= self.routed_scaling_factor
-            elif self.shared_experts is not None:
-                assert shared_output is not None
-                final_hidden_states = muls_add_triton(
-                    shared_output, final_hidden_states, 1.0 / self.routed_scaling_factor
-                )
-        else:
-            final_hidden_states = fused_moe_out
+                if hidden_states.dtype != torch.float16:
+                    if not self.is_rocm_aiter_moe_enabled:
+                        if self.shared_experts is not None:
+                            assert shared_output is not None
+                            final_hidden_states = muls_add_triton(
+                                final_hidden_states, shared_output, self.routed_scaling_factor
+                            )
+                        else:
+                            final_hidden_states *= self.routed_scaling_factor
+                elif self.shared_experts is not None:
+                    assert shared_output is not None
+                    final_hidden_states = muls_add_triton(
+                        shared_output, final_hidden_states, 1.0 / self.routed_scaling_factor
+                    )
+            else:
+                final_hidden_states = fused_moe_out
 
-        if self.is_sequence_parallel:
-            final_hidden_states = tensor_model_parallel_all_gather(final_hidden_states, 0)
-            final_hidden_states = final_hidden_states[:num_tokens]
-        elif self.tp_size > 1 and fused_moe_out_is_tuple:
-            # Legacy tuple outputs are reduced here. Tensor outputs from the
-            # upstream MoERunner have already gone through its final reduction.
-            final_hidden_states = self.experts.maybe_all_reduce_tensor_model_parallel(final_hidden_states)
+            if self.is_sequence_parallel:
+                final_hidden_states = tensor_model_parallel_all_gather(final_hidden_states, 0)
+                final_hidden_states = final_hidden_states[:num_tokens]
+            elif self.tp_size > 1 and fused_moe_out_is_tuple:
+                # Legacy tuple outputs are reduced here. Tensor outputs from the
+                # upstream MoERunner have already gone through its final reduction.
+                final_hidden_states = self.experts.maybe_all_reduce_tensor_model_parallel(final_hidden_states)
 
         return final_hidden_states.view(num_tokens, hidden_dim)
 
@@ -825,6 +830,7 @@ class DeepseekV2DecoderLayer(nn.Module):
         self.hc_ffn_base = nn.Parameter(torch.empty(mix_hc, dtype=torch.float32))
         self.hc_attn_scale = nn.Parameter(torch.empty(3, dtype=torch.float32))
         self.hc_ffn_scale = nn.Parameter(torch.empty(3, dtype=torch.float32))
+        self._cs_tracer = _get_cs_tracer()
 
     def hc_pre(self, x: torch.Tensor, hc_fn: torch.Tensor, hc_scale: torch.Tensor, hc_base: torch.Tensor):
         y = torch.ops._C_ascend.npu_hc_pre(
@@ -845,19 +851,25 @@ class DeepseekV2DecoderLayer(nn.Module):
         residual: torch.Tensor | None,
         llama_4_scaling: torch.Tensor | None = None,
     ) -> torch.Tensor:
-        residual = hidden_states.clone()
-        hidden_states, post, comb = self.hc_pre(hidden_states, self.hc_attn_fn, self.hc_attn_scale, self.hc_attn_base)
-        hidden_states = self.input_layernorm(hidden_states)
-        attn_kwargs = {"positions": positions, "hidden_states": hidden_states, "llama_4_scaling": llama_4_scaling}
-        hidden_states = self.self_attn(**attn_kwargs)
-        hidden_states = self.hc_post(hidden_states, residual, post, comb)
-        residual = hidden_states.clone()
-        hidden_states, post, comb = self.hc_pre(hidden_states, self.hc_ffn_fn, self.hc_ffn_scale, self.hc_ffn_base)
-        hidden_states = self.post_attention_layernorm(hidden_states)
-        hidden_states = self.mlp(hidden_states)
-        hidden_states = self.hc_post(hidden_states, residual, post, comb)
+        _cs_t = self._cs_tracer
+        with _cs_t.span(f"model/layer_{self.layer_idx}"):
+            if self.layer_idx == 0:
+                logger.info_once(">>> VV [CallStack] layer_0 forward triggered — "
+                                 "code change CONFIRMED, tracer active=%s <<<",
+                                 _cs_t.active)
+            residual = hidden_states.clone()
+            hidden_states, post, comb = self.hc_pre(hidden_states, self.hc_attn_fn, self.hc_attn_scale, self.hc_attn_base)
+            hidden_states = self.input_layernorm(hidden_states)
+            attn_kwargs = {"positions": positions, "hidden_states": hidden_states, "llama_4_scaling": llama_4_scaling}
+            hidden_states = self.self_attn(**attn_kwargs)
+            hidden_states = self.hc_post(hidden_states, residual, post, comb)
+            residual = hidden_states.clone()
+            hidden_states, post, comb = self.hc_pre(hidden_states, self.hc_ffn_fn, self.hc_ffn_scale, self.hc_ffn_base)
+            hidden_states = self.post_attention_layernorm(hidden_states)
+            hidden_states = self.mlp(hidden_states)
+            hidden_states = self.hc_post(hidden_states, residual, post, comb)
 
-        return hidden_states, residual
+            return hidden_states, residual
 
 
 @support_torch_compile
@@ -930,6 +942,7 @@ class DeepseekV4Model(nn.Module):
             dtype=vllm_config.model_config.dtype,
             device=self.device,
         )
+        self._cs_tracer = _get_cs_tracer()
 
     def embed_input_ids(self, input_ids: torch.Tensor) -> torch.Tensor:
         return self.embed_tokens(input_ids)
@@ -974,35 +987,37 @@ class DeepseekV4Model(nn.Module):
             llama_4_scaling = None
 
         hidden_states = hidden_states.unsqueeze(1).repeat(1, self.hc_mult, 1)  # (b,s, c, h)
-        for layer in islice(self.layers, self.start_layer, self.end_layer):
-            hidden_states, residual = layer(positions, hidden_states, residual, llama_4_scaling)
+        _cs_t = self._cs_tracer
+        with _cs_t.span("model/model_body"):
+            for layer in islice(self.layers, self.start_layer, self.end_layer):
+                hidden_states, residual = layer(positions, hidden_states, residual, llama_4_scaling)
 
-        # Stash pre-hc_head residual for the MTP draft (captured copy_).
-        # When FlashComm1 (sequence parallelism) is enabled, tokens are
-        # partitioned across TP ranks via reduce_scatter in each layer's
-        # row-parallel output projection.  We must all_gather here so the
-        # MTP layers receive the full token set — otherwise only rank 0's
-        # partition is valid and the rest of the buffer holds stale data,
-        # leading to NaN values and low acceptance rate.
-        from vllm_ascend.ascend_forward_context import get_forward_context
+            # Stash pre-hc_head residual for the MTP draft (captured copy_).
+            # When FlashComm1 (sequence parallelism) is enabled, tokens are
+            # partitioned across TP ranks via reduce_scatter in each layer's
+            # row-parallel output projection.  We must all_gather here so the
+            # MTP layers receive the full token set — otherwise only rank 0's
+            # partition is valid and the rest of the buffer holds stale data,
+            # leading to NaN values and low acceptance rate.
+            from vllm_ascend.ascend_forward_context import get_forward_context
 
-        forward_ctx = get_forward_context()
-        if forward_ctx is not None and forward_ctx.flash_comm_v1_enabled:
-            h_states_flat = tensor_model_parallel_all_gather(hidden_states.flatten(1), dim=0)
-            pad_size = forward_ctx.pad_size
-            if pad_size > 0:
-                h_states_flat = h_states_flat[:-pad_size]
-            num_tokens = h_states_flat.shape[0]
-            self._mtp_hidden_buffer[:num_tokens].copy_(h_states_flat)
-        else:
-            num_tokens = hidden_states.shape[0]
-            self._mtp_hidden_buffer[:num_tokens].copy_(hidden_states.flatten(1))
+            forward_ctx = get_forward_context()
+            if forward_ctx is not None and forward_ctx.flash_comm_v1_enabled:
+                h_states_flat = tensor_model_parallel_all_gather(hidden_states.flatten(1), dim=0)
+                pad_size = forward_ctx.pad_size
+                if pad_size > 0:
+                    h_states_flat = h_states_flat[:-pad_size]
+                num_tokens = h_states_flat.shape[0]
+                self._mtp_hidden_buffer[:num_tokens].copy_(h_states_flat)
+            else:
+                num_tokens = hidden_states.shape[0]
+                self._mtp_hidden_buffer[:num_tokens].copy_(hidden_states.flatten(1))
 
-        hidden_states = self.hc_head(hidden_states, self.hc_head_fn, self.hc_head_scale, self.hc_head_base)
-        if not get_pp_group().is_last_rank:
-            return IntermediateTensors({"hidden_states": hidden_states, "residual": residual})
+            hidden_states = self.hc_head(hidden_states, self.hc_head_fn, self.hc_head_scale, self.hc_head_base)
+            if not get_pp_group().is_last_rank:
+                return IntermediateTensors({"hidden_states": hidden_states, "residual": residual})
 
-        hidden_states = self.norm(hidden_states)
+            hidden_states = self.norm(hidden_states)
         return hidden_states
 
 
