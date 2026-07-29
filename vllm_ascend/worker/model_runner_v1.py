@@ -246,28 +246,42 @@ class ExecuteModelState(NamedTuple):
 
 
 def _format_span_summary(root) -> str:
-    """Walk a CallStack span tree and format a one-line timing summary.
+    """Format a CallStack span tree as a multi-line hierarchical timing summary.
 
-    Each leaf / inner node is emitted as ``path=dur_ms%`` where the
-    percentage is relative to *root* so the caller can see at a glance
-    where time is spent inside the step.
+    Each non-root span is rendered on its own line with tree-drawing
+    characters so that the nesting and per-span contribution are
+    immediately visible without horizontal scrolling.
     """
     if root is None or root.duration_us <= 0:
         return "(no timing data)"
 
+    total_ms = root.duration_us / 1000.0
     total_us = root.duration_us
-    parts: list[str] = []
+    lines: list[str] = [f"total={total_ms:.1f}ms"]
 
-    def _walk(node, prefix: str) -> None:
-        dur_us = node.duration_us
-        if dur_us > 0 and node is not root:
-            pct = dur_us / total_us * 100
-            parts.append(f"{prefix}{node.name}={dur_us / 1000:.1f}ms({pct:.0f}%)")
-        for child in node.children:
-            _walk(child, f"{prefix}{node.name}/" if node is not root else "")
+    def _tree(node, indent: str, first: bool) -> None:
+        n = len(node.children)
+        for i, child in enumerate(node.children):
+            last = i == n - 1
+            branch = "└── " if last else "├── "
+            child_indent = indent + ("    " if last else "│   ")
 
-    _walk(root, "")
-    return " | ".join(parts)
+            # Use the last path segment as the short label.
+            label = child.name.rsplit("/", 1)[-1]
+
+            if child.duration_us > 0:
+                dur_ms = child.duration_us / 1000.0
+                pct = child.duration_us / total_us * 100
+                lines.append(
+                    f"{indent}{branch}{label:<24s} {dur_ms:>7.1f}ms ({pct:>3.0f}%)"
+                )
+            else:
+                lines.append(f"{indent}{branch}{label}  (untimed)")
+
+            _tree(child, child_indent, False)
+
+    _tree(root, "", True)
+    return "\n".join(lines)
 
 
 class NPUModelRunner(GPUModelRunner):
@@ -2246,12 +2260,14 @@ class NPUModelRunner(GPUModelRunner):
             return
         tracer.step_end()
 
-        # Print per-span timing for this step.
+        # Print per-span timing for this step (rank 0 only).
         _root = tracer._root
         if _root is not None and _root.duration_us > 0:
-            _summary = _format_span_summary(_root)
-            logger.info("CallStack span timings (step %d): %s",
-                        self._cs_step_counter, _summary)
+            _rank0 = not dist.is_initialized() or dist.get_rank() == 0
+            if _rank0:
+                _summary = _format_span_summary(_root)
+                logger.info("CallStack span timings (step %d):\n%s",
+                            self._cs_step_counter, _summary)
 
         # Only log the tree text on the first recorded step.
         # Subsequent steps are still recorded and collected, but
