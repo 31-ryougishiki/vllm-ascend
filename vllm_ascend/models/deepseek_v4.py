@@ -348,44 +348,64 @@ class DeepseekV4MoE(nn.Module):
 
         _cs_t = self._cs_tracer
         with _cs_t.span("model/moe"):
+            # -- Phase 1: gate + expert dispatch ---------------------------------
             if self.experts.is_internal_router:
-                # In this case, the gate/router runs inside the FusedMoE class
-                fused_moe_out = self.experts(hidden_states=hidden_states, router_logits=hidden_states)
+                _cs_t.mark("moe/router:internal")
+                with _cs_t.span("model/moe/experts"):
+                    fused_moe_out = self.experts(hidden_states=hidden_states, router_logits=hidden_states)
             else:
-                # router_logits: (num_tokens, n_experts)
-                router_logits = F.linear(hidden_states.float(), self.gate.weight)
-                fused_moe_out = self.experts(hidden_states=hidden_states, router_logits=router_logits)
+                _cs_t.mark("moe/router:external")
+                with _cs_t.span("model/moe/gate"):
+                    router_logits = F.linear(hidden_states.float(), self.gate.weight)
+                with _cs_t.span("model/moe/experts"):
+                    fused_moe_out = self.experts(hidden_states=hidden_states, router_logits=router_logits)
 
+            # -- Phase 2: shared-expert fusion -----------------------------------
             fused_moe_out_is_tuple = isinstance(fused_moe_out, tuple)
-            if fused_moe_out_is_tuple:
-                shared_output, final_hidden_states = fused_moe_out
-                if self.shared_experts is None:
-                    assert shared_output is None
+            with _cs_t.span("model/moe/post"):
+                if fused_moe_out_is_tuple:
+                    shared_output, final_hidden_states = fused_moe_out
+                    if self.shared_experts is None:
+                        _cs_t.mark("moe/post:no_shared")
+                        assert shared_output is None
 
-                if hidden_states.dtype != torch.float16:
-                    if not self.is_rocm_aiter_moe_enabled:
-                        if self.shared_experts is not None:
-                            assert shared_output is not None
-                            final_hidden_states = muls_add_triton(
-                                final_hidden_states, shared_output, self.routed_scaling_factor
-                            )
+                    if hidden_states.dtype != torch.float16:
+                        if not self.is_rocm_aiter_moe_enabled:
+                            if self.shared_experts is not None:
+                                _cs_t.mark("moe/post:routed_scaling")
+                                assert shared_output is not None
+                                final_hidden_states = muls_add_triton(
+                                    final_hidden_states, shared_output, self.routed_scaling_factor
+                                )
+                            else:
+                                _cs_t.mark("moe/post:scale_only")
+                                final_hidden_states *= self.routed_scaling_factor
                         else:
-                            final_hidden_states *= self.routed_scaling_factor
-                elif self.shared_experts is not None:
-                    assert shared_output is not None
-                    final_hidden_states = muls_add_triton(
-                        shared_output, final_hidden_states, 1.0 / self.routed_scaling_factor
-                    )
-            else:
-                final_hidden_states = fused_moe_out
+                            _cs_t.mark("moe/post:rocm_aiter")
+                    elif self.shared_experts is not None:
+                        _cs_t.mark("moe/post:fp16_shared")
+                        assert shared_output is not None
+                        final_hidden_states = muls_add_triton(
+                            shared_output, final_hidden_states, 1.0 / self.routed_scaling_factor
+                        )
+                    else:
+                        _cs_t.mark("moe/post:fp16_noop")
+                else:
+                    _cs_t.mark("moe/post:tensor_output")
+                    final_hidden_states = fused_moe_out
 
+            # -- Phase 3: final reduction ----------------------------------------
             if self.is_sequence_parallel:
-                final_hidden_states = tensor_model_parallel_all_gather(final_hidden_states, 0)
-                final_hidden_states = final_hidden_states[:num_tokens]
+                _cs_t.mark("moe/reduce:sp_all_gather")
+                with _cs_t.span("model/moe/reduce"):
+                    final_hidden_states = tensor_model_parallel_all_gather(final_hidden_states, 0)
+                    final_hidden_states = final_hidden_states[:num_tokens]
             elif self.tp_size > 1 and fused_moe_out_is_tuple:
-                # Legacy tuple outputs are reduced here. Tensor outputs from the
-                # upstream MoERunner have already gone through its final reduction.
-                final_hidden_states = self.experts.maybe_all_reduce_tensor_model_parallel(final_hidden_states)
+                _cs_t.mark("moe/reduce:tp_reduce")
+                with _cs_t.span("model/moe/reduce"):
+                    final_hidden_states = self.experts.maybe_all_reduce_tensor_model_parallel(final_hidden_states)
+            else:
+                _cs_t.mark("moe/reduce:none")
 
         return final_hidden_states.view(num_tokens, hidden_dim)
 
