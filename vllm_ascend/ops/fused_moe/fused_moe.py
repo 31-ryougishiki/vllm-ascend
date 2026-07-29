@@ -29,7 +29,7 @@ from vllm.model_executor.layers.fused_moe.config import FusedMoEConfig
 from vllm.model_executor.layers.fused_moe.layer import FusedMoE, UnquantizedFusedMoEMethod
 from vllm.model_executor.layers.fused_moe.routed_experts_capturer import RoutedExpertsCapturer
 from vllm.model_executor.layers.fused_moe.runner.moe_runner import MoERunner  # type: ignore
-
+from vllm.utils.callstack import get_tracer as _get_cs_tracer
 from vllm_ascend.ascend_config import get_ascend_config
 from vllm_ascend.ascend_forward_context import _EXTRA_CTX, MoECommType
 from vllm_ascend.distributed.parallel_state import get_mc2_group
@@ -459,6 +459,7 @@ class AscendFusedMoE(FusedMoE):
 
         setup_moe_comm_method(self.moe_config)
         self.quant_type = self._get_quant_type()
+        self._cs_tracer = _get_cs_tracer()
 
         self.runner = AscendMoERunner(
             self.layer_name,
@@ -598,89 +599,93 @@ class AscendFusedMoE(FusedMoE):
         # This approach may overlook some extreme scenarios.
         enable_force_load_balance = _EXTRA_CTX.in_profile_run
 
+        _cs = self._cs_tracer
         forward_context = get_forward_context()
         if self.multistream_overlap_gate:
-            assert AscendFusedMoE.gate_stream is not None
-            fc3_context = get_flash_common3_context()
-            assert fc3_context is not None
-            AscendFusedMoE.gate_stream.wait_stream(torch.npu.current_stream())
-            with npu_stream_switch(AscendFusedMoE.gate_stream, enabled=self.multistream_overlap_gate):
-                # share_expert
-                assert fc3_context.shared_experts is not None
-                shared_out = fc3_context.shared_experts(hidden_states)
-                # NOTE: This is exactly the opposite of `maybe_all_reduce_tensor_model_parallel`
-                moe_comm_type = _EXTRA_CTX.moe_comm_type
-                if (
-                    moe_comm_type in {MoECommType.ALLTOALL, MoECommType.MC2, MoECommType.FUSED_MC2}
-                    and not shared_expert_dp_enabled()
-                ):
-                    shared_out = tensor_model_parallel_all_reduce(shared_out)
-                set_flash_common3_context(shared_out=shared_out)
-                input_ids = getattr(get_forward_context(), "input_ids", None)
-                topk_weights, topk_ids = select_experts(
-                    hidden_states=hidden_states,
-                    router_logits=router_logits,
-                    top_k=self.top_k,
-                    use_grouped_topk=self.use_grouped_topk,
-                    renormalize=self.renormalize,
-                    topk_group=self.topk_group,
-                    num_expert_group=self.num_expert_group,
-                    custom_routing_function=self.custom_routing_function,
-                    scoring_func=self.scoring_func,
-                    routed_scaling_factor=self._original_routed_scaling_factor,
-                    e_score_correction_bias=self.e_score_correction_bias,
-                    num_experts=self.moe_config.num_experts,
-                    input_ids=input_ids,
-                    tid2eid=self.tid2eid,
-                )
+            with _cs.span("model/moe/experts/gate"):
+                assert AscendFusedMoE.gate_stream is not None
+                fc3_context = get_flash_common3_context()
+                assert fc3_context is not None
+                AscendFusedMoE.gate_stream.wait_stream(torch.npu.current_stream())
+                with npu_stream_switch(AscendFusedMoE.gate_stream, enabled=self.multistream_overlap_gate):
+                    # share_expert
+                    assert fc3_context.shared_experts is not None
+                    shared_out = fc3_context.shared_experts(hidden_states)
+                    # NOTE: This is exactly the opposite of `maybe_all_reduce_tensor_model_parallel`
+                    moe_comm_type = _EXTRA_CTX.moe_comm_type
+                    if (
+                        moe_comm_type in {MoECommType.ALLTOALL, MoECommType.MC2, MoECommType.FUSED_MC2}
+                        and not shared_expert_dp_enabled()
+                    ):
+                        shared_out = tensor_model_parallel_all_reduce(shared_out)
+                    set_flash_common3_context(shared_out=shared_out)
+                    input_ids = getattr(get_forward_context(), "input_ids", None)
+                    topk_weights, topk_ids = select_experts(
+                        hidden_states=hidden_states,
+                        router_logits=router_logits,
+                        top_k=self.top_k,
+                        use_grouped_topk=self.use_grouped_topk,
+                        renormalize=self.renormalize,
+                        topk_group=self.topk_group,
+                        num_expert_group=self.num_expert_group,
+                        custom_routing_function=self.custom_routing_function,
+                        scoring_func=self.scoring_func,
+                        routed_scaling_factor=self._original_routed_scaling_factor,
+                        e_score_correction_bias=self.e_score_correction_bias,
+                        num_experts=self.moe_config.num_experts,
+                        input_ids=input_ids,
+                        tid2eid=self.tid2eid,
+                    )
 
-                if isinstance(_EXTRA_CTX.moe_comm_method, AllGatherCommImpl):
-                    topk_weights = torch.ops.vllm.maybe_all_gather_and_maybe_unpad(topk_weights, True, True)
-                    topk_ids = torch.ops.vllm.maybe_all_gather_and_maybe_unpad(topk_ids, True, True)
+                    if isinstance(_EXTRA_CTX.moe_comm_method, AllGatherCommImpl):
+                        topk_weights = torch.ops.vllm.maybe_all_gather_and_maybe_unpad(topk_weights, True, True)
+                        topk_ids = torch.ops.vllm.maybe_all_gather_and_maybe_unpad(topk_ids, True, True)
 
-                set_flash_common3_context(topk_weights=topk_weights, topk_ids=topk_ids)
+                    set_flash_common3_context(topk_weights=topk_weights, topk_ids=topk_ids)
 
-        prepare_output = _EXTRA_CTX.moe_comm_method.prepare(
-            hidden_states=hidden_states,
-            router_logits=router_logits,
-            replace_allreduce=_EXTRA_CTX.flash_comm_v1_enabled,
-            enable_shared_expert_dp=self.enable_shared_expert_dp,
-            quant_type=self.quant_type,
-        )
-        hidden_states = prepare_output.hidden_states
-        router_logits = prepare_output.router_logits
-        mc2_mask = prepare_output.mc2_mask
-        padded_hidden_states_shape = prepare_output.padded_hidden_states_shape
-        pertoken_scale = prepare_output.pertoken_scale
+        with _cs.span("model/moe/experts/comm_prepare"):
+            prepare_output = _EXTRA_CTX.moe_comm_method.prepare(
+                hidden_states=hidden_states,
+                router_logits=router_logits,
+                replace_allreduce=_EXTRA_CTX.flash_comm_v1_enabled,
+                enable_shared_expert_dp=self.enable_shared_expert_dp,
+                quant_type=self.quant_type,
+            )
+            hidden_states = prepare_output.hidden_states
+            router_logits = prepare_output.router_logits
+            mc2_mask = prepare_output.mc2_mask
+            padded_hidden_states_shape = prepare_output.padded_hidden_states_shape
+            pertoken_scale = prepare_output.pertoken_scale
 
         # Make sure the default stream waits for the gate stream to finish.
         if self.multistream_overlap_gate:
             torch.npu.current_stream().wait_stream(AscendFusedMoE.gate_stream)
 
         # Matrix multiply.
-        fused_experts_results: FusedExpertsResult = self.quant_method.apply(
-            layer=self,
-            x=hidden_states,
-            router_logits=router_logits,
-            pertoken_scale=pertoken_scale,
-            top_k=self.top_k,
-            renormalize=self.renormalize,
-            use_grouped_topk=self.use_grouped_topk,
-            num_experts=self.moe_config.num_experts,
-            expert_map=self._expert_map,
-            topk_group=self.topk_group,
-            num_expert_group=self.num_expert_group,
-            custom_routing_function=self.custom_routing_function,
-            scoring_func=self.scoring_func,
-            routed_scaling_factor=self._original_routed_scaling_factor,
-            e_score_correction_bias=self.e_score_correction_bias,
-            activation=self.activation,
-            apply_router_weight_on_input=self.apply_router_weight_on_input,
-            enable_force_load_balance=enable_force_load_balance,
-            log2phy=self.log2phy,
-            global_redundant_expert_num=self.global_redundant_expert_num,
-            mc2_mask=mc2_mask,
-        )
+        with _cs.span("model/moe/experts/quant_apply"):
+            fused_experts_results: FusedExpertsResult = self.quant_method.apply(
+                layer=self,
+                x=hidden_states,
+                router_logits=router_logits,
+                pertoken_scale=pertoken_scale,
+                top_k=self.top_k,
+                renormalize=self.renormalize,
+                use_grouped_topk=self.use_grouped_topk,
+                num_experts=self.moe_config.num_experts,
+                expert_map=self._expert_map,
+                topk_group=self.topk_group,
+                num_expert_group=self.num_expert_group,
+                custom_routing_function=self.custom_routing_function,
+                scoring_func=self.scoring_func,
+                routed_scaling_factor=self._original_routed_scaling_factor,
+                e_score_correction_bias=self.e_score_correction_bias,
+                activation=self.activation,
+                apply_router_weight_on_input=self.apply_router_weight_on_input,
+                enable_force_load_balance=enable_force_load_balance,
+                log2phy=self.log2phy,
+                global_redundant_expert_num=self.global_redundant_expert_num,
+                mc2_mask=mc2_mask,
+            )
 
         if self.dynamic_eplb:
             expert_tokens = fused_experts_results.expert_tokens
@@ -702,11 +707,12 @@ class AscendFusedMoE(FusedMoE):
             else:
                 self.moe_load.add_(local_load)
 
-        routed_out = _EXTRA_CTX.moe_comm_method.finalize(
-            hidden_states=fused_experts_results.routed_out,
-            reduce_results=isinstance(_EXTRA_CTX.moe_comm_method, AllGatherCommImpl),
-            padded_hidden_states_shape=padded_hidden_states_shape,
-        )
+        with _cs.span("model/moe/experts/comm_finalize"):
+            routed_out = _EXTRA_CTX.moe_comm_method.finalize(
+                hidden_states=fused_experts_results.routed_out,
+                reduce_results=isinstance(_EXTRA_CTX.moe_comm_method, AllGatherCommImpl),
+                padded_hidden_states_shape=padded_hidden_states_shape,
+            )
 
         if return_with_event:
             return FusedMoEResult(

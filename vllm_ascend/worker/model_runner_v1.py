@@ -1912,8 +1912,9 @@ class NPUModelRunner(GPUModelRunner):
                 req_ids = self.input_batch.req_ids
                 tokens = [scheduler_output.num_scheduled_tokens[i] for i in req_ids]
                 logger.info(
-                    "Step %d executing: num_reqs=%d, req_ids=%s, tokens_per_req=%s",
+                    "Step %d executing [%s]: num_reqs=%d, req_ids=%s, tokens_per_req=%s",
                     self._cs_step_counter,
+                    getattr(scheduler_output, "step_marker", "?"),
                     num_reqs,
                     req_ids,
                     tokens,
