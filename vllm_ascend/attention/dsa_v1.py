@@ -1990,8 +1990,7 @@ class AscendDSAImpl(DSAAttentionImpl):
             coff = 2 if self.compressor_overlap else 1
 
             # Inline compressor + scatter (c128, c4 non-dual)
-            with _cs_t.span("model/attn/prefill/compressor_kernel",
-                            cmp_ratio=self.compress_ratio):
+            with _cs_t.span(f"model/attn/prefill/compressor/c{self.compress_ratio}"):
                 compressed_kv = torch.ops._C_ascend.compressor(
                     hidden_states,
                     self.compressor_wkv.weight,
@@ -2076,8 +2075,7 @@ class AscendDSAImpl(DSAAttentionImpl):
 
 
         if self.compress_ratio <= 1:
-            with _cs_t.span("model/attn/prefill/sparse_attn_kernel",
-                            cmp_ratio=0, mask_mode=4):
+            with _cs_t.span("model/attn/prefill/sparse_attn/c0"):
                 attn_output = torch.ops._C_ascend.npu_sparse_attn_sharedkv(
                     q,
                     ori_kv=swa_kv_cache,
@@ -2096,8 +2094,7 @@ class AscendDSAImpl(DSAAttentionImpl):
                     layout_kv="PA_ND",
                 )[0]
         elif self.compress_ratio == 4:
-            with _cs_t.span("model/attn/prefill/sparse_attn_kernel",
-                            cmp_ratio=4, ori_mask_mode=4, cmp_mask_mode=3):
+            with _cs_t.span("model/attn/prefill/sparse_attn/c4"):
                 attn_output = torch.ops._C_ascend.npu_sparse_attn_sharedkv(
                     q,
                     ori_kv=swa_kv_cache,
@@ -2121,8 +2118,7 @@ class AscendDSAImpl(DSAAttentionImpl):
                     layout_kv="PA_ND",
                 )[0]
         else:
-            with _cs_t.span("model/attn/prefill/sparse_attn_kernel",
-                            cmp_ratio=128, ori_mask_mode=4, cmp_mask_mode=3):
+            with _cs_t.span("model/attn/prefill/sparse_attn/c128"):
                 attn_output = torch.ops._C_ascend.npu_sparse_attn_sharedkv(
                     q,
                     ori_kv=swa_kv_cache,
@@ -2298,8 +2294,7 @@ class AscendDSAImpl(DSAAttentionImpl):
             coff = 2 if self.compressor_overlap else 1
 
             # Inline compressor + scatter (c128, c4 non-dual)
-            with _cs_t.span("model/attn/decode/compressor_kernel",
-                            cmp_ratio=self.compress_ratio):
+            with _cs_t.span(f"model/attn/decode/compressor/c{self.compress_ratio}"):
                 compressed_kv = torch.ops._C_ascend.compressor(
                     hidden_states,
                     self.compressor_wkv.weight,
@@ -2381,8 +2376,7 @@ class AscendDSAImpl(DSAAttentionImpl):
 
 
         if self.compress_ratio <= 1:
-            with _cs_t.span("model/attn/decode/sparse_attn_kernel",
-                            cmp_ratio=0, mask_mode=4):
+            with _cs_t.span("model/attn/decode/sparse_attn/c0"):
                 attn_output = torch.ops._C_ascend.npu_sparse_attn_sharedkv(
                     q,
                     ori_kv=swa_kv_cache,
@@ -2400,8 +2394,7 @@ class AscendDSAImpl(DSAAttentionImpl):
                     layout_kv="PA_ND",
                 )[0]
         elif self.compress_ratio == 4:
-            with _cs_t.span("model/attn/decode/sparse_attn_kernel",
-                            cmp_ratio=4, ori_mask_mode=4, cmp_mask_mode=3):
+            with _cs_t.span("model/attn/decode/sparse_attn/c4"):
                 attn_output = torch.ops._C_ascend.npu_sparse_attn_sharedkv(
                     q,
                     ori_kv=swa_kv_cache,
@@ -2423,8 +2416,7 @@ class AscendDSAImpl(DSAAttentionImpl):
                     layout_kv="PA_ND",
                 )[0]
         else:
-            with _cs_t.span("model/attn/decode/sparse_attn_kernel",
-                            cmp_ratio=128, ori_mask_mode=4, cmp_mask_mode=3):
+            with _cs_t.span("model/attn/decode/sparse_attn/c128"):
                 attn_output = torch.ops._C_ascend.npu_sparse_attn_sharedkv(
                     q,
                     ori_kv=swa_kv_cache,
