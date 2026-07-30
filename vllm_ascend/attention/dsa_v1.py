@@ -1649,23 +1649,25 @@ class AscendDSAImpl(DSAAttentionImpl):
             # o
             with _cs_t.span("model/attn/o_proj"):
                 o_proj_input = o_proj_input.view(num_tokens, self.n_local_groups, -1)
-                if olora_tp_enable():
-                    o_proj_input = self.wo_a(o_proj_input)
-                else:
-                    # wo_a = self.wo_a.weight.view(self.n_local_groups, self.o_lora_rank, -1)
-                    # o = torch.einsum("tgd,grd->tgr", o, wo_a)
-                    o_proj_input = torch_npu.npu_transpose_batchmatmul(
-                        o_proj_input,
-                        self.wo_a.weight,
-                        bias=None,
-                        scale=None,
-                        perm_x1=(1, 0, 2),
-                        perm_x2=(0, 1, 2),
-                        perm_y=(1, 0, 2),
-                        batch_split_factor=1,
-                    )
-                    o_proj_input = o_proj_input.reshape(num_tokens, -1)
-                output[...] = self.wo_b(o_proj_input)
+                with _cs_t.span("model/attn/o_proj/wo_a"):
+                    if olora_tp_enable():
+                        o_proj_input = self.wo_a(o_proj_input)
+                    else:
+                        # wo_a = self.wo_a.weight.view(self.n_local_groups, self.o_lora_rank, -1)
+                        # o = torch.einsum("tgd,grd->tgr", o, wo_a)
+                        o_proj_input = torch_npu.npu_transpose_batchmatmul(
+                            o_proj_input,
+                            self.wo_a.weight,
+                            bias=None,
+                            scale=None,
+                            perm_x1=(1, 0, 2),
+                            perm_x2=(0, 1, 2),
+                            perm_y=(1, 0, 2),
+                            batch_split_factor=1,
+                        )
+                        o_proj_input = o_proj_input.reshape(num_tokens, -1)
+                with _cs_t.span("model/attn/o_proj/wo_b"):
+                    output[...] = self.wo_b(o_proj_input)
 
         return output_padded
 
@@ -1909,36 +1911,35 @@ class AscendDSAImpl(DSAAttentionImpl):
         else:
             # mlaprolog
             with _cs_t.span("model/attn/prefill/mla_prolog/standard"):
-                # q
-                qr = self.q_norm(self.wq_a(hidden_states))
-                q = self.wq_b(qr).unflatten(-1, (self.n_local_heads, self.head_dim))
+                with _cs_t.span("model/attn/prefill/mla_prolog/standard/q_proj"):
+                    qr = self.q_norm(self.wq_a(hidden_states))
+                    q = self.wq_b(qr).unflatten(-1, (self.n_local_heads, self.head_dim))
 
-                q = triton_q_rms(q, self.eps)
+                with _cs_t.span("model/attn/prefill/mla_prolog/standard/q_rms_rope"):
+                    q = triton_q_rms(q, self.eps)
+                    torch.ops._C_ascend.inplace_partial_rotary_mul(
+                        q.unsqueeze(1),
+                        cos,
+                        sin,
+                        rotary_mode="interleave",
+                        partial_slice=[self.nope_head_dim, self.head_dim],
+                    )
 
-                torch.ops._C_ascend.inplace_partial_rotary_mul(
-                    q.unsqueeze(1),
-                    cos,
-                    sin,
-                    rotary_mode="interleave",
-                    partial_slice=[self.nope_head_dim, self.head_dim],
-                )
+                with _cs_t.span("model/attn/prefill/mla_prolog/standard/kv_proj"):
+                    kv = self.wkv(hidden_states)
+                    kv = self.kv_norm(kv)
+                    assert self.rope_head_dim is not None
+                    kv = kv.view(-1, 1, self.nope_head_dim + self.rope_head_dim)
 
-                # win kv & tok_dis
-                kv = self.wkv(hidden_states)
-                kv = self.kv_norm(kv)
-                assert self.rope_head_dim is not None
-                kv = kv.view(-1, 1, self.nope_head_dim + self.rope_head_dim)
-
-                torch.ops._C_ascend.inplace_partial_rotary_mul(
-                    kv.unsqueeze(1),
-                    cos,
-                    sin,
-                    rotary_mode="interleave",
-                    partial_slice=[self.nope_head_dim, self.head_dim],
-                )
-
-                # swa exec kv
-                torch.ops._C_ascend.npu_scatter_nd_update_v2(swa_kv_cache, swa_prefill_metadata.slot_mapping, kv)
+                with _cs_t.span("model/attn/prefill/mla_prolog/standard/kv_rope_scatter"):
+                    torch.ops._C_ascend.inplace_partial_rotary_mul(
+                        kv.unsqueeze(1),
+                        cos,
+                        sin,
+                        rotary_mode="interleave",
+                        partial_slice=[self.nope_head_dim, self.head_dim],
+                    )
+                    torch.ops._C_ascend.npu_scatter_nd_update_v2(swa_kv_cache, swa_prefill_metadata.slot_mapping, kv)
 
         compress_cos = common_prefill_metadata.compress_cos[layer_name]
         compress_sin = common_prefill_metadata.compress_sin[layer_name]
@@ -1946,7 +1947,6 @@ class AscendDSAImpl(DSAAttentionImpl):
             compressor_prefill_metadata = _require_prefill_metadata(compressor_attn_metadata)
             compressor_state_prefill_metadata = _require_prefill_metadata(compressor_kv_state_metadata)
             compress_topk_idxs = None
-            _cs_t.mark("model/attn/prefill/compress_ratio", ratio=self.compress_ratio)
             # Only call indexer_select_qli when compress_ratio == 4 (requires 5 elements in attn_metadata)
             if self.compress_ratio == 4:
                 # IndexCache: prefill segment lives at buffer[num_decode_tokens:]
@@ -1958,32 +1958,34 @@ class AscendDSAImpl(DSAAttentionImpl):
                     compress_topk_idxs = self._get_indexcache_topk_indices(prefill_num_tokens, offset=prefill_offset)
                 else:
                     if self.multistream_dsv4_dsa_overlap:
-                        indexer_q = self.cv_indexer_select_qli(  # multistream version
-                            x=hidden_states,
-                            qr=qr,
-                            kv_cache=kv_cache,
-                            attn_metadata=attn_metadata,
-                            cos=cos,
-                            sin=sin,
-                            compressed_cos=compress_cos,
-                            compressed_sin=compress_sin,
-                            actual_seq_lengths_query=actual_seq_lengths_query,
-                            with_prefill=True,
-                        )
+                        with _cs_t.span("model/attn/prefill/cv_indexer_select_qli"):
+                            indexer_q = self.cv_indexer_select_qli(  # multistream version
+                                x=hidden_states,
+                                qr=qr,
+                                kv_cache=kv_cache,
+                                attn_metadata=attn_metadata,
+                                cos=cos,
+                                sin=sin,
+                                compressed_cos=compress_cos,
+                                compressed_sin=compress_sin,
+                                actual_seq_lengths_query=actual_seq_lengths_query,
+                                with_prefill=True,
+                            )
                     else:
-                        compress_topk_idxs = self.indexer_select_qli(  # original version
-                            x=hidden_states,
-                            qr=qr,
-                            kv_cache=kv_cache,
-                            attn_metadata=attn_metadata,
-                            cos=cos,
-                            sin=sin,
-                            compressed_cos=compress_cos,
-                            compressed_sin=compress_sin,
-                            actual_seq_lengths_query=actual_seq_lengths_query,
-                            actual_seq_lengths_key=actual_seq_lengths_key,
-                            with_prefill=True,
-                        )
+                        with _cs_t.span("model/attn/prefill/indexer_select_qli"):
+                            compress_topk_idxs = self.indexer_select_qli(  # original version
+                                x=hidden_states,
+                                qr=qr,
+                                kv_cache=kv_cache,
+                                attn_metadata=attn_metadata,
+                                cos=cos,
+                                sin=sin,
+                                compressed_cos=compress_cos,
+                                compressed_sin=compress_sin,
+                                actual_seq_lengths_query=actual_seq_lengths_query,
+                                actual_seq_lengths_key=actual_seq_lengths_key,
+                                with_prefill=True,
+                            )
 
             coff = 2 if self.compressor_overlap else 1
 
@@ -2073,7 +2075,6 @@ class AscendDSAImpl(DSAAttentionImpl):
                 self._update_indexcache_topk_indices(compress_topk_idxs, offset=prefill_offset)
 
 
-        _cs_t.mark("model/attn/prefill/sparse_attn_mode", cmp_ratio=self.compress_ratio)
         if self.compress_ratio <= 1:
             with _cs_t.span("model/attn/prefill/sparse_attn_kernel",
                             cmp_ratio=0, mask_mode=4):
@@ -2192,57 +2193,56 @@ class AscendDSAImpl(DSAAttentionImpl):
                     torch.npu.current_stream().record_event() if self.multistream_dsa_preprocess else None
                 )
 
-                # q
-                if (not isinstance(self.wq_b.quant_method, AscendUnquantizedLinearMethod)) and isinstance(
-                    self.wq_b.quant_method.quant_method, AscendW8A8DynamicLinearMethod
-                ):
-                    q_a = self.wq_a(hidden_states)
-                    qr, qr_pertoken_scale = torch.ops._C_ascend.npu_rms_norm_dynamic_quant(
-                        q_a, self.q_norm.weight, epsilon=self.eps
-                    )
-                    q = torch_npu.npu_quant_matmul(
-                        qr,
-                        self.wq_b.weight,
-                        self.wq_b.weight_scale,
-                        pertoken_scale=qr_pertoken_scale,
-                        bias=self.wq_b.bias,
-                        output_dtype=hidden_states.dtype,
-                    ).unflatten(-1, (self.n_local_heads, self.head_dim))
-                else:
-                    qr = q = self.q_norm(self.wq_a(hidden_states))
-                    q = self.wq_b(q).unflatten(-1, (self.n_local_heads, self.head_dim))
-                    qr_pertoken_scale = None
+                with _cs_t.span("model/attn/decode/mla_prolog/standard/q_proj"):
+                    if (not isinstance(self.wq_b.quant_method, AscendUnquantizedLinearMethod)) and isinstance(
+                        self.wq_b.quant_method.quant_method, AscendW8A8DynamicLinearMethod
+                    ):
+                        q_a = self.wq_a(hidden_states)
+                        qr, qr_pertoken_scale = torch.ops._C_ascend.npu_rms_norm_dynamic_quant(
+                            q_a, self.q_norm.weight, epsilon=self.eps
+                        )
+                        q = torch_npu.npu_quant_matmul(
+                            qr,
+                            self.wq_b.weight,
+                            self.wq_b.weight_scale,
+                            pertoken_scale=qr_pertoken_scale,
+                            bias=self.wq_b.bias,
+                            output_dtype=hidden_states.dtype,
+                        ).unflatten(-1, (self.n_local_heads, self.head_dim))
+                    else:
+                        qr = q = self.q_norm(self.wq_a(hidden_states))
+                        q = self.wq_b(q).unflatten(-1, (self.n_local_heads, self.head_dim))
+                        qr_pertoken_scale = None
 
-                q = triton_q_rms(q, self.eps)
-
-                torch.ops._C_ascend.inplace_partial_rotary_mul(
-                    q.unsqueeze(1),
-                    cos,
-                    sin,
-                    rotary_mode="interleave",
-                    partial_slice=[self.nope_head_dim, self.head_dim],
-                )
-
-                with npu_stream_switch(attention_calculation_stream(), enabled=self.multistream_dsa_preprocess):
-                    if wait_hidden_state_cal_event:
-                        torch.npu.current_stream().wait_event(wait_hidden_state_cal_event)
-
-                    # win kv & tok_dis
-                    kv = self.wkv(hidden_states)
-                    kv = self.kv_norm(kv)
-                    assert self.rope_head_dim is not None
-                    kv = kv.view(-1, 1, self.nope_head_dim + self.rope_head_dim)
-
+                with _cs_t.span("model/attn/decode/mla_prolog/standard/q_rms_rope"):
+                    q = triton_q_rms(q, self.eps)
                     torch.ops._C_ascend.inplace_partial_rotary_mul(
-                        kv.unsqueeze(1),
+                        q.unsqueeze(1),
                         cos,
                         sin,
                         rotary_mode="interleave",
                         partial_slice=[self.nope_head_dim, self.head_dim],
                     )
 
-                    # swa exec kv
-                    torch.ops._C_ascend.npu_scatter_nd_update_v2(swa_kv_cache, swa_decode_metadata.slot_mapping, kv)
+                with npu_stream_switch(attention_calculation_stream(), enabled=self.multistream_dsa_preprocess):
+                    if wait_hidden_state_cal_event:
+                        torch.npu.current_stream().wait_event(wait_hidden_state_cal_event)
+
+                    with _cs_t.span("model/attn/decode/mla_prolog/standard/kv_proj"):
+                        kv = self.wkv(hidden_states)
+                        kv = self.kv_norm(kv)
+                        assert self.rope_head_dim is not None
+                        kv = kv.view(-1, 1, self.nope_head_dim + self.rope_head_dim)
+
+                    with _cs_t.span("model/attn/decode/mla_prolog/standard/kv_rope_scatter"):
+                        torch.ops._C_ascend.inplace_partial_rotary_mul(
+                            kv.unsqueeze(1),
+                            cos,
+                            sin,
+                            rotary_mode="interleave",
+                            partial_slice=[self.nope_head_dim, self.head_dim],
+                        )
+                        torch.ops._C_ascend.npu_scatter_nd_update_v2(swa_kv_cache, swa_decode_metadata.slot_mapping, kv)
 
                     wait_attention_cal_event = (
                         torch.npu.current_stream().record_event() if self.multistream_dsa_preprocess else None
@@ -2257,7 +2257,6 @@ class AscendDSAImpl(DSAAttentionImpl):
             compress_cos = common_decode_metadata.compress_cos[layer_name]
             compress_sin = common_decode_metadata.compress_sin[layer_name]
             compress_topk_idxs = None
-            _cs_t.mark("model/attn/decode/compress_ratio", ratio=self.compress_ratio)
             if self.compress_ratio == 4:
                 # IndexCache: decode segment occupies buffer[:num_decode_tokens]
                 decode_num_tokens = hidden_states.shape[0]
@@ -2265,34 +2264,36 @@ class AscendDSAImpl(DSAAttentionImpl):
                     compress_topk_idxs = self._get_indexcache_topk_indices(decode_num_tokens, offset=0)
                 else:
                     if self.multistream_dsv4_dsa_overlap:
-                        indexer_q = self.cv_indexer_select_qli(  # multistream version
-                            x=hidden_states,
-                            qr=qr,
-                            kv_cache=kv_cache,
-                            attn_metadata=attn_metadata,
-                            cos=cos,
-                            sin=sin,
-                            compressed_cos=compress_cos,
-                            compressed_sin=compress_sin,
-                            actual_seq_lengths_query=actual_seq_lengths_query,
+                        with _cs_t.span("model/attn/decode/cv_indexer_select_qli"):
+                            indexer_q = self.cv_indexer_select_qli(  # multistream version
+                                x=hidden_states,
+                                qr=qr,
+                                kv_cache=kv_cache,
+                                attn_metadata=attn_metadata,
+                                cos=cos,
+                                sin=sin,
+                                compressed_cos=compress_cos,
+                                compressed_sin=compress_sin,
+                                actual_seq_lengths_query=actual_seq_lengths_query,
                             with_prefill=False,
                             qr_pertoken_scale=qr_pertoken_scale,
                         )
                     else:
-                        compress_topk_idxs = self.indexer_select_qli(  # original version
-                            x=hidden_states,
-                            qr=qr,
-                            kv_cache=kv_cache,
-                            attn_metadata=attn_metadata,
-                            cos=cos,
-                            sin=sin,
-                            compressed_cos=compress_cos,
-                            compressed_sin=compress_sin,
-                            actual_seq_lengths_query=actual_seq_lengths_query,
-                            actual_seq_lengths_key=actual_seq_lengths_key,
-                            with_prefill=False,
-                            qr_pertoken_scale=qr_pertoken_scale,
-                        )
+                        with _cs_t.span("model/attn/decode/indexer_select_qli"):
+                            compress_topk_idxs = self.indexer_select_qli(  # original version
+                                x=hidden_states,
+                                qr=qr,
+                                kv_cache=kv_cache,
+                                attn_metadata=attn_metadata,
+                                cos=cos,
+                                sin=sin,
+                                compressed_cos=compress_cos,
+                                compressed_sin=compress_sin,
+                                actual_seq_lengths_query=actual_seq_lengths_query,
+                                actual_seq_lengths_key=actual_seq_lengths_key,
+                                with_prefill=False,
+                                qr_pertoken_scale=qr_pertoken_scale,
+                            )
 
             coff = 2 if self.compressor_overlap else 1
 
@@ -2379,7 +2380,6 @@ class AscendDSAImpl(DSAAttentionImpl):
                 self._update_indexcache_topk_indices(compress_topk_idxs, offset=0)
 
 
-        _cs_t.mark("model/attn/decode/sparse_attn_mode", cmp_ratio=self.compress_ratio)
         if self.compress_ratio <= 1:
             with _cs_t.span("model/attn/decode/sparse_attn_kernel",
                             cmp_ratio=0, mask_mode=4):
