@@ -2261,12 +2261,14 @@ class NPUModelRunner(GPUModelRunner):
             return
         tracer.step_end()
 
-        # Print per-span timing for this step (all ranks).
+        # Print per-span timing for this step (rank 0 only).
         _root = tracer._root
         if _root is not None and _root.duration_us > 0:
-            _summary = _format_span_summary(_root)
-            logger.info("CallStack span timings (step %d):\n%s",
-                        self._cs_step_counter, _summary)
+            _rank0 = not dist.is_initialized() or dist.get_rank() == 0
+            if _rank0:
+                _summary = _format_span_summary(_root)
+                logger.info("CallStack span timings (step %d):\n%s",
+                            self._cs_step_counter, _summary)
 
         # Only log the tree text on the first recorded step.
         # Subsequent steps are still recorded and collected, but
