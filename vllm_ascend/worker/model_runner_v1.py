@@ -1849,6 +1849,7 @@ class NPUModelRunner(GPUModelRunner):
                 metadata={"num_tokens": num_scheduled_tokens},
             )
 
+        torch.npu.synchronize()
         with self._cs_span("prepare_input"), record_function_or_nullcontext("prepare input"):
             with self.synchronize_input_prep():
                 # Fix up prev_req_id_to_index for requests that were discarded
@@ -2116,6 +2117,7 @@ class NPUModelRunner(GPUModelRunner):
 
         # Run forward pass
         clear_kv_metadata = self.speculative_config is None
+        torch.npu.synchronize()
         with (
             self._cs_span("model_forward"),
             record_function_or_nullcontext("forward"),
