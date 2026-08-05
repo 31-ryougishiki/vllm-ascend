@@ -211,8 +211,10 @@ def dsa_forward(
     kv_cache = _build_kv_cache(self, forward_context)
     logger.info(
         "[DSA_ENTRY] dsa_forward (real): layer=%s, "
+        "hidden_states_shape=%s, output_shape=%s, "
         "kv_cache_len=%d, attn_metadata_len=%d",
-        layer_name, len(kv_cache), len(attn_metadata),
+        layer_name, tuple(hidden_states.shape), tuple(output.shape),
+        len(kv_cache), len(attn_metadata),
     )
 
     self.dsa_attn.impl.forward(

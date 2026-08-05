@@ -1707,10 +1707,12 @@ class AscendDSAImpl(DSAAttentionImpl):
             return output
         logger.info(
             "[DSA_IMPL_FWD] layer=%s, hidden_states_shape=%s, "
-            "has_decode=%s, has_prefill=%s, decode_tokens=%d, need_gather_q_kv=%s",
+            "has_decode=%s, has_prefill=%s, decode_tokens=%d, need_gather_q_kv=%s, "
+            "forward_ctx_num_tokens=%d, output_shape=%s",
             layer_name, tuple(hidden_states.shape),
             attn_metadata[0].num_decodes > 0, attn_metadata[0].num_prefills > 0,
             attn_metadata[0].num_decode_tokens, need_gather_q_kv,
+            forward_context.num_tokens, tuple(output.shape),
         )
         if not isinstance(attn_metadata, list):
             attn_metadata = [attn_metadata]
@@ -1780,6 +1782,12 @@ class AscendDSAImpl(DSAAttentionImpl):
         )
 
         # o
+        logger.info(
+            "[DSA_IMPL_FWD] before o_proj: o_proj_input_shape=%s, output_shape=%s, "
+            "hidden_states_shape=%s",
+            tuple(o_proj_input.shape), tuple(output.shape),
+            tuple(hidden_states.shape),
+        )
         self._forward_o_proj(o_proj_input, output)
 
         maybe_save_kv_layer_to_connector(layer_name, list(kv_cache))
