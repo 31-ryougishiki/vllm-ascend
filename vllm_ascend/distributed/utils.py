@@ -3,7 +3,6 @@ import torch.distributed as dist
 from vllm.distributed import get_dcp_group
 from vllm.distributed.parallel_state import GroupCoordinator, get_dp_group
 from vllm.forward_context import get_forward_context
-from vllm.logger import logger
 
 from vllm_ascend.ascend_forward_context import _EXTRA_CTX
 from vllm_ascend.distributed.parallel_state import get_fc3_quant_x_group
@@ -26,11 +25,6 @@ def fc3_all_gather_and_maybe_unpad_impl(
         forward_context = get_forward_context()
     except AssertionError:
         return x
-    logger.info(
-        "[DP_COMM][FC3] all_gather (hidden_states): "
-        "input_shape=%s, dim=0, dp_size=%d",
-        tuple(x.shape), get_dp_group().world_size,
-    )
     x = get_fc3_quant_x_group().all_gather(x, 0)
     dp_metadata = forward_context.dp_metadata
     if dp_metadata is None:

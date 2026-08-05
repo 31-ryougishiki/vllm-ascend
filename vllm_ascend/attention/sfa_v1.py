@@ -1180,16 +1180,7 @@ class AscendSFAImpl(MLAAttentionImpl):
             )
 
             attn_output = torch.empty_like(send)
-            logger.info(
-                "[TP_COMM][SFA] all_to_all_single (o_proj input activations): "
-                "send_shape=%s, recv_shape=%s, tp_size=%d",
-                tuple(send.shape), tuple(attn_output.shape), self.tp_size,
-            )
             torch.distributed.all_to_all_single(attn_output, send, group=get_tp_group().device_group)
-            logger.info(
-                "[TP_COMM][SFA] all_to_all_single done: result_shape=%s",
-                tuple(attn_output.shape),
-            )
 
             return attn_output, True
 
@@ -1729,11 +1720,6 @@ class AscendSFAImpl(MLAAttentionImpl):
                         fused_kv_parts.append(k_li.view(-1, k_li.shape[-1]))
 
                 fused_kv_input = torch.cat(fused_kv_parts, dim=1)
-                logger.info(
-                    "[TP_COMM][SFA] all_gather_async (fused KV): "
-                    "input_shape=%s, tp_size=%d",
-                    tuple(fused_kv_input.shape), get_tp_group().world_size,
-                )
                 fused_kv_no_split, kv_ag_handle = all_gather_async(
                     fused_kv_input,
                     get_tp_group(),
@@ -1741,10 +1727,6 @@ class AscendSFAImpl(MLAAttentionImpl):
                 )
                 if kv_ag_handle is not None:
                     kv_ag_handles.append(kv_ag_handle)
-                    logger.info(
-                        "[TP_COMM][SFA] all_gather_async (fused KV) started: async_handle=%s",
-                        str(kv_ag_handle),
-                    )
 
                 if self.has_indexer and (self.enable_sparse_sfa_c8 or self.enable_sparse_li_c8):
                     assert k_li is not None

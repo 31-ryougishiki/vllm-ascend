@@ -25,7 +25,6 @@ from vllm.distributed import (
     get_dcp_group,
     get_pcp_group,
 )
-from vllm.logger import logger
 from vllm.v1.attention.backend import AttentionCGSupport
 from vllm.v1.kv_cache_interface import AttentionSpec
 
@@ -576,17 +575,8 @@ class AscendAttentionCPImpl(AscendAttentionBackendImpl):
         assert self.value_cache is not None
 
         if self.dcp_size > 1:
-            logger.info(
-                "[CP_COMM][DCP] all_gather (decode query): "
-                "input_shape=%s, dim=1, dcp_size=%d",
-                tuple(query.shape), self.dcp_size,
-            )
             query = get_dcp_group().all_gather(query.contiguous(), 1)
             num_heads = self.num_heads * self.dcp_size
-            logger.info(
-                "[CP_COMM][DCP] all_gather done: result_shape=%s, num_heads=%d",
-                tuple(query.shape), num_heads,
-            )
         else:
             num_heads = self.num_heads
 
@@ -732,30 +722,12 @@ class AscendAttentionCPImpl(AscendAttentionBackendImpl):
 
     def _prefill_query_all_gather(self, attn_metadata, prefill_query):
         if self.pcp_size > 1:
-            logger.info(
-                "[CP_COMM][PCP] all_gather (chunked prefill query): "
-                "input_shape=%s, dim=0, pcp_size=%d",
-                tuple(prefill_query.shape), self.pcp_size,
-            )
             prefill_query = get_pcp_group().all_gather(prefill_query, 0)
-            logger.info(
-                "[CP_COMM][PCP] all_gather done (before restore): shape=%s",
-                tuple(prefill_query.shape),
-            )
             prefill_query = torch.index_select(
                 prefill_query, 0, attn_metadata.prefill.chunked_context.cp_kv_recover_idx_for_chunk
             )
         if self.dcp_size > 1:
-            logger.info(
-                "[CP_COMM][DCP] all_gather (chunked prefill query): "
-                "input_shape=%s, dim=1, dcp_size=%d",
-                tuple(prefill_query.shape), self.dcp_size,
-            )
             prefill_query = get_dcp_group().all_gather(prefill_query, 1)
-            logger.info(
-                "[CP_COMM][DCP] all_gather done: shape=%s",
-                tuple(prefill_query.shape),
-            )
         return prefill_query
 
     def _compute_prefill_context(
@@ -861,16 +833,7 @@ class AscendAttentionCPImpl(AscendAttentionBackendImpl):
                     if not attn_metadata.prefill.pcp_metadata.pcp_use_hybrid_attn:
                         kv = torch.cat([key, value], dim=-1)
                         num_actual_tokens_pcp_padded = attn_metadata.num_actual_tokens_pcp_padded // self.pcp_size
-                        logger.info(
-                            "[CP_COMM][PCP] all_gather (prefill KV for cache): "
-                            "input_shape=%s, dim=0, pcp_size=%d, pcp_rank=%d",
-                            tuple(kv[:num_actual_tokens_pcp_padded].shape), self.pcp_size, self.pcp_rank,
-                        )
                         all_kv = get_pcp_group().all_gather(kv[:num_actual_tokens_pcp_padded].contiguous(), dim=0)
-                        logger.info(
-                            "[CP_COMM][PCP] all_gather done: result_shape=%s",
-                            tuple(all_kv.shape),
-                        )
                         pcp_allgather_restore_idx = attn_metadata.prefill.pcp_metadata.pcp_allgather_restore_idx
                         all_kv = torch.index_select(all_kv, 0, pcp_allgather_restore_idx)
                         key, value = all_kv.split([self.head_size, self.head_size], dim=-1)
@@ -923,19 +886,8 @@ class AscendAttentionCPImpl(AscendAttentionBackendImpl):
         qkv_fla = qkv_fla[:real_num_tokens]
         if pcp_padded_tokens_fla > 0:
             qkv_fla = F.pad(qkv_fla, pad=(0, 0, 0, pcp_padded_tokens_fla), mode="constant", value=0)
-        logger.info(
-            "[CP_COMM][PCP] all_gather (hybrid-attn QKV): "
-            "input_shape=%s, dim=0, pcp_size=%d, pcp_rank=%d, max_num_tokens_across_pcp=%d",
-            tuple(qkv_fla[: attn_metadata.prefill.pcp_metadata.max_num_tokens_across_pcp].shape),
-            self.pcp_size, self.pcp_rank,
-            attn_metadata.prefill.pcp_metadata.max_num_tokens_across_pcp,
-        )
         all_qkv = get_pcp_group().all_gather(
             qkv_fla[: attn_metadata.prefill.pcp_metadata.max_num_tokens_across_pcp].contiguous(), dim=0
-        )
-        logger.info(
-            "[CP_COMM][PCP] all_gather done: result_shape=%s",
-            tuple(all_qkv.shape),
         )
         # Restore the original sequence order using pre-computed indices
         pcp_enter_fa_restore_idx = (
@@ -976,31 +928,13 @@ class AscendAttentionCPImpl(AscendAttentionBackendImpl):
     def _gather_global_context_output(self, local_context_attn_output):
         if self.dcp_size > 1:
             dcp_context_attn_output = torch.empty_like(local_context_attn_output)
-            logger.info(
-                "[CP_COMM][DCP] all_to_all_single (chunked context output): "
-                "input_shape=%s, dcp_size=%d, dcp_rank=%d",
-                tuple(local_context_attn_output.shape), self.dcp_size, self.dcp_rank,
-            )
             dist.all_to_all_single(dcp_context_attn_output, local_context_attn_output, group=self.dcp_group)
-            logger.info(
-                "[CP_COMM][DCP] all_to_all_single done: result_shape=%s",
-                tuple(dcp_context_attn_output.shape),
-            )
         else:
             dcp_context_attn_output = local_context_attn_output
 
         if self.pcp_size > 1:
             # AllGather out&lse within CP group
-            logger.info(
-                "[CP_COMM][PCP] all_gather (chunked context output): "
-                "input_shape=%s, dim=-1, pcp_size=%d, pcp_rank=%d",
-                tuple(dcp_context_attn_output.shape), self.pcp_size, self.pcp_rank,
-            )
             global_context_attn_output = get_pcp_group().all_gather(dcp_context_attn_output, dim=-1)
-            logger.info(
-                "[CP_COMM][PCP] all_gather done: result_shape=%s",
-                tuple(global_context_attn_output.shape),
-            )
         else:
             global_context_attn_output = dcp_context_attn_output
 
@@ -1041,17 +975,6 @@ class AscendAttentionCPImpl(AscendAttentionBackendImpl):
             assert attn_metadata.prefill is not None and attn_metadata.prefill.pcp_metadata is not None
             pcp_use_hybrid_attn = attn_metadata.prefill.pcp_metadata.pcp_use_hybrid_attn
         has_chunked_context = has_prefill and attn_metadata.prefill.chunked_context is not None
-
-        logger.info(
-            "[CP_ATTN_FWD] has_decode=%s, has_prefill=%s, has_chunked_context=%s, "
-            "pcp_size=%d, dcp_size=%d, pcp_rank=%d, dcp_rank=%d, "
-            "num_decode_tokens=%d, num_prefills=%d, pcp_use_hybrid_attn=%s, "
-            "query_shape=%s",
-            has_decode, has_prefill, has_chunked_context,
-            self.pcp_size, self.dcp_size, self.pcp_rank, self.dcp_rank,
-            num_decode_tokens, attn_metadata.num_prefills, pcp_use_hybrid_attn,
-            tuple(query.shape),
-        )
 
         if has_decode:
             decode_query = query[:num_decode_tokens].contiguous()
@@ -1143,16 +1066,7 @@ class AscendAttentionCPImpl(AscendAttentionBackendImpl):
                 # layer_idx != num_layers - 1
                 assert attn_metadata.prefill.pcp_metadata is not None
                 pcp_exit_fa_scatter_idx = attn_metadata.prefill.pcp_exit_fa_scatter_idx
-                logger.info(
-                    "[CP_COMM][PCP] all_gather (hybrid-attn output): "
-                    "input_shape=%s, dim=0, pcp_size=%d, pcp_rank=%d",
-                    tuple(attn_output_prefill.shape), self.pcp_size, self.pcp_rank,
-                )
                 attn_output_prefill = get_pcp_group().all_gather(attn_output_prefill.contiguous(), dim=0)
-                logger.info(
-                    "[CP_COMM][PCP] all_gather done: result_shape=%s",
-                    tuple(attn_output_prefill.shape),
-                )
                 attn_output_prefill = torch.index_select(attn_output_prefill, 0, pcp_exit_fa_scatter_idx)
 
             output[num_decode_tokens : attn_output_prefill.shape[0] + num_decode_tokens] = attn_output_prefill

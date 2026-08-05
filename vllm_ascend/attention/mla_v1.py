@@ -1671,8 +1671,18 @@ class AscendMLAImpl(MLAAttentionImpl):
             kv_no_split = self.kv_a_proj_with_mqa(hidden_states)[0]  # type: ignore[misc]
 
         # Process for Flash Comm V1
+        logger.info(
+            "[MLA_COMM][DP] maybe_all_gather_and_maybe_unpad: "
+            "q_c_shape=%s, kv_no_split_shape=%s, need_gather_q_kv=%s",
+            tuple(q_c.shape), tuple(kv_no_split.shape), need_gather_q_kv,
+        )
         q_c = torch.ops.vllm.maybe_all_gather_and_maybe_unpad(q_c.contiguous(), need_gather_q_kv)
         kv_no_split = torch.ops.vllm.maybe_all_gather_and_maybe_unpad(kv_no_split.contiguous(), need_gather_q_kv)
+        logger.info(
+            "[MLA_COMM][DP] maybe_all_gather_and_maybe_unpad done: "
+            "q_c_shape=%s, kv_no_split_shape=%s",
+            tuple(q_c.shape), tuple(kv_no_split.shape),
+        )
 
         for layer in self.layer_sharding_kwargs or []:
             if is_hidden_layer(layer):
@@ -1754,8 +1764,18 @@ class AscendMLAImpl(MLAAttentionImpl):
         if (self.fa_quant_layer or self.enable_mlapo) and (
             attn_metadata.num_decode_tokens <= MLAPO_MAX_SUPPORTED_TOKENS and attn_metadata.num_prefills == 0
         ):
+            logger.info(
+                "[MLA_COMM][DP] maybe_all_gather_and_maybe_unpad (mlapo path): "
+                "input_shape=%s, need_gather_q_kv=%s",
+                tuple(hidden_states.shape), need_gather_q_kv,
+            )
             hidden_states = torch.ops.vllm.maybe_all_gather_and_maybe_unpad(
                 hidden_states.contiguous(), need_gather_q_kv
+            )
+            logger.info(
+                "[MLA_COMM][DP] maybe_all_gather_and_maybe_unpad done: "
+                "result_shape=%s",
+                tuple(hidden_states.shape),
             )
             decode_preprocess_res, prefill_preprocess_res = DeviceOperator.mla_preprocess_only_decode(
                 self, hidden_states, kv_cache, attn_metadata

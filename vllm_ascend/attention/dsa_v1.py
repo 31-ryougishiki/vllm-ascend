@@ -10,6 +10,7 @@ import vllm.envs as envs_vllm
 from vllm.config import VllmConfig, get_current_vllm_config
 from vllm.distributed import get_tensor_model_parallel_world_size
 from vllm.forward_context import get_forward_context
+from vllm.logger import logger
 from vllm.triton_utils import HAS_TRITON
 from vllm.v1.attention.backend import AttentionBackend, AttentionCGSupport, AttentionMetadataBuilder
 from vllm.v1.kv_cache_interface import AttentionSpec
@@ -1557,6 +1558,10 @@ class AscendDSAImpl(DSAAttentionImpl):
         num_tokens = o_proj_input.shape[0]
         group_hidden_dim = o_proj_input.shape[1] * o_proj_input.shape[2] // self.n_local_groups
         o_proj_input = o_proj_input.view(num_tokens, self.n_local_groups, group_hidden_dim)
+        logger.info(
+            "[DSA_O_PROJ] num_tokens=%d, o_proj_input_shape=%s, oproj_tp=%s, olora_tp=%s",
+            num_tokens, tuple(o_proj_input.shape), oproj_tp_enable(), olora_tp_enable(),
+        )
         # A5 (Ascend950) uses an FP8-quantized o_proj path (dynamic MX quant
         # + quantized batch matmul). Preserve it as-is: it predates and is
         # orthogonal to the OTP / olora_tp paths below, so it must win first.
@@ -1617,7 +1622,15 @@ class AscendDSAImpl(DSAAttentionImpl):
             # tail, then copy the real tokens.
             send.zero_()
             send[:, :num_tokens].copy_(o_proj_input.transpose(1, 0))
+            logger.info(
+                "[DSA_COMM][OTP] all_to_all_single (o_proj): "
+                "send_shape=%s, recv_shape=%s, oproj_tp_size=%d",
+                tuple(send.shape), tuple(recv.shape), oproj_tp_size,
+            )
             dist.all_to_all_single(recv.view(-1), send.view(-1), group=oproj_group.device_group)
+            logger.info(
+                "[DSA_COMM][OTP] all_to_all_single done",
+            )
             o_proj_input = recv.view(oproj_tp_size * exchange_num_tokens, groups_per_rank, group_hidden_dim)
             o_proj_input = torch_npu.npu_transpose_batchmatmul(
                 o_proj_input,
@@ -1642,7 +1655,15 @@ class AscendDSAImpl(DSAAttentionImpl):
                     dtype=o_proj_output.dtype,
                     device=o_proj_output.device,
                 )
+            logger.info(
+                "[DSA_COMM][OTP] reduce_scatter_tensor (o_proj): "
+                "input_shape=%s, output_shape=%s, oproj_tp_size=%d",
+                tuple(o_proj_output.shape), tuple(self._oproj_rs_out_buf.shape), oproj_tp_size,
+            )
             dist.reduce_scatter_tensor(self._oproj_rs_out_buf, o_proj_output, group=oproj_group.device_group)
+            logger.info(
+                "[DSA_COMM][OTP] reduce_scatter_tensor done",
+            )
             output[...] = self._oproj_rs_out_buf[:num_tokens]
         elif olora_tp_enable():
             o_proj_input = self.wo_a(o_proj_input)
@@ -1692,8 +1713,29 @@ class AscendDSAImpl(DSAAttentionImpl):
         decode_tokens = attn_metadata[0].num_decode_tokens
         actual_tokens = attn_metadata[0].num_actual_tokens
 
+        oproj_tp = oproj_tp_enable()
+        logger.info(
+            "[DSA_FWD] layer=%s, hidden_states_shape=%s, output_shape=%s, "
+            "has_prefill=%s, has_decode=%s, decode_tokens=%d, actual_tokens=%d, "
+            "need_gather_q_kv=%s, oproj_tp=%s, olora_tp=%s, tp_size=%d",
+            layer_name, tuple(hidden_states.shape), tuple(output.shape),
+            has_prefill, has_decode, decode_tokens, actual_tokens,
+            need_gather_q_kv, oproj_tp, olora_tp_enable(),
+            get_tensor_model_parallel_world_size(),
+        )
+
         # Process for Flash Comm V1
+        logger.info(
+            "[DSA_COMM][DP] maybe_all_gather_and_maybe_unpad: "
+            "input_shape=%s, need_gather_q_kv=%s",
+            tuple(hidden_states.shape), need_gather_q_kv,
+        )
         hidden_states = torch.ops.vllm.maybe_all_gather_and_maybe_unpad(hidden_states, need_gather_q_kv)
+        logger.info(
+            "[DSA_COMM][DP] maybe_all_gather_and_maybe_unpad done: "
+            "result_shape=%s",
+            tuple(hidden_states.shape),
+        )
         prefill_hidden_states = hidden_states[decode_tokens:actual_tokens]
         decode_hidden_states = hidden_states[:decode_tokens]
 

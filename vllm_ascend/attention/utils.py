@@ -7,7 +7,6 @@ import torch.nn.functional as F
 from vllm.config import VllmConfig, get_current_vllm_config
 from vllm.distributed.kv_transfer import get_kv_transfer_group, has_kv_transfer_group, is_v1_kv_transfer_group
 from vllm.forward_context import ForwardContext, get_forward_context
-from vllm.logger import logger
 from vllm.utils.torch_utils import get_dtype_size
 from vllm.v1.attention.backends.utils import CommonAttentionMetadata
 
@@ -437,13 +436,7 @@ def wait_for_kv_layer_from_connector(layer_name: str):
     if attn_metadata is None:
         return
     # TODO: assert ascendMetadata
-    logger.info(
-        "[KV_TRANSFER] wait_for_kv_layer_from_connector: layer_name=%s", layer_name
-    )
     connector.wait_for_layer_load(layer_name)
-    logger.info(
-        "[KV_TRANSFER] wait_for_kv_layer_from_connector done: layer_name=%s", layer_name
-    )
 
 
 def maybe_save_kv_layer_to_connector(
@@ -460,15 +453,7 @@ def maybe_save_kv_layer_to_connector(
     if attn_metadata is None:
         return
     # TODO: assert ascendMetadata
-    logger.info(
-        "[KV_TRANSFER] save_kv_layer: layer_name=%s, kv_cache_shape=%s",
-        layer_name,
-        tuple(kv_cache_layer[0].shape) if kv_cache_layer else None,
-    )
     connector.save_kv_layer(layer_name, kv_cache_layer, attn_metadata)
-    logger.info(
-        "[KV_TRANSFER] save_kv_layer done: layer_name=%s", layer_name
-    )
 
 
 def notify_kv_cache_written(layer_name: str = ""):

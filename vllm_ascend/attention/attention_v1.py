@@ -39,8 +39,6 @@ from vllm.v1.attention.backends.registry import (  # type: ignore
 from vllm.v1.core.sched.output import SchedulerOutput
 from vllm.v1.kv_cache_interface import AttentionSpec, CrossAttentionSpec
 
-from vllm.logger import logger
-
 from vllm_ascend.ascend_forward_context import _EXTRA_CTX
 from vllm_ascend.attention.attention_mask import AttentionMaskBuilder
 from vllm_ascend.attention.context_parallel.common_cp import AscendMetadataForDecode, AscendMetadataForPrefill
@@ -1443,14 +1441,6 @@ class AscendAttentionBackendImpl(AttentionImpl):
                 self.key_cache, self.value_cache = kv_cache[0], kv_cache[1]
             slots = attn_metadata.slot_mapping
             encoder_decoder = self.attn_type == AttentionType.ENCODER_DECODER
-            logger.info(
-                "[ATTN_FWD] reshape_and_cache: key_shape=%s, value_shape=%s, "
-                "key_cache_shape=%s, value_cache_shape=%s, slot_mapping_shape=%s, "
-                "num_actual_tokens=%d",
-                tuple(key.shape), tuple(value.shape),
-                tuple(self.key_cache.shape), tuple(self.value_cache.shape),
-                tuple(slots.shape), attn_metadata.num_actual_tokens,
-            )
             DeviceOperator.reshape_and_cache(
                 key=key[: attn_metadata.num_actual_tokens] if not encoder_decoder else key,
                 value=value[: attn_metadata.num_actual_tokens] if not encoder_decoder else value,
@@ -1475,18 +1465,11 @@ class AscendAttentionBackendImpl(AttentionImpl):
         num_tokens = query.shape[0]
         record_attention_compute_start()
 
-        use_pa = (
+        if (
             attn_metadata.attn_state == AscendAttentionState.DecodeOnly
             and self.sliding_window is None
             and using_paged_attention(num_tokens, self.vllm_config, self.head_size)
-        )
-        logger.info(
-            "[ATTN_PATH] attn_state=%s, num_tokens=%d, sliding_window=%s, "
-            "head_size=%d, use_paged_attention=%s",
-            attn_metadata.attn_state, num_tokens,
-            self.sliding_window, self.head_size, use_pa,
-        )
-        if use_pa:
+        ):
             output = self.forward_paged_attention(query, attn_metadata, output)
         else:
             output = self.forward_fused_infer_attention(query, key, value, attn_metadata, output, kv_cache)
@@ -1529,18 +1512,6 @@ class AscendAttentionBackendImpl(AttentionImpl):
         num_tokens = query.shape[0]
         if attn_metadata is None:
             return output.fill_(0)
-
-        logger.info(
-            "[ATTN_FWD] layer=%s, query_shape=%s, key_shape=%s, value_shape=%s, "
-            "output_shape=%s, num_tokens=%d, attn_state=%s",
-            layer.layer_name,
-            tuple(query.shape),
-            tuple(key.shape) if key is not None else None,
-            tuple(value.shape) if value is not None else None,
-            tuple(output.shape),
-            num_tokens,
-            attn_metadata.attn_state if attn_metadata else None,
-        )
 
         # Initialize key_cache and value_cache from kv_cache if not already set.
         # This is needed for DecodeOnly mode where key/value are None but we still
