@@ -1705,6 +1705,13 @@ class AscendDSAImpl(DSAAttentionImpl):
             else:
                 output.fill_(0)
             return output
+        logger.info(
+            "[DSA_IMPL_FWD] layer=%s, hidden_states_shape=%s, "
+            "has_decode=%s, has_prefill=%s, decode_tokens=%d, need_gather_q_kv=%s",
+            layer_name, tuple(hidden_states.shape),
+            attn_metadata[0].num_decodes > 0, attn_metadata[0].num_prefills > 0,
+            attn_metadata[0].num_decode_tokens, need_gather_q_kv,
+        )
         if not isinstance(attn_metadata, list):
             attn_metadata = [attn_metadata]
         # Process for Flash Comm V1

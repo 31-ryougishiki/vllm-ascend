@@ -25,6 +25,7 @@ import torch
 from torch import nn
 from vllm.config import CacheConfig, get_current_vllm_config
 from vllm.forward_context import ForwardContext, get_forward_context
+from vllm.logger import logger
 from vllm.model_executor.layers.mla import MultiHeadLatentAttentionWrapper
 from vllm.model_executor.layers.quantization import QuantizationConfig
 from vllm.utils.torch_utils import direct_register_custom_op
@@ -188,13 +189,31 @@ def dsa_forward(
     else:
         attn_metadata = forward_context.attn_metadata
 
+    logger.info(
+        "[DSA_ENTRY] dsa_forward: layer=%s, "
+        "hidden_states_shape=%s, output_shape=%s, "
+        "need_gather_q_kv=%s, attn_metadata_is_none=%s",
+        layer_name, tuple(hidden_states.shape), tuple(output.shape),
+        need_gather_q_kv, attn_metadata is None,
+    )
+
     if attn_metadata is None:
         # Profiling run: forward() handles OTP by running _forward_o_proj on a
         # zero input so HCCL collectives are captured by the ACL graph.
+        logger.info(
+            "[DSA_ENTRY] dsa_forward (profiling): layer=%s, "
+            "hidden_states_shape=%s",
+            layer_name, tuple(hidden_states.shape),
+        )
         self.dsa_attn.impl.forward(self.dsa_attn.layer_name, hidden_states, None, None, need_gather_q_kv, output)
         return
 
     kv_cache = _build_kv_cache(self, forward_context)
+    logger.info(
+        "[DSA_ENTRY] dsa_forward (real): layer=%s, "
+        "kv_cache_len=%d, attn_metadata_len=%d",
+        layer_name, len(kv_cache), len(attn_metadata),
+    )
 
     self.dsa_attn.impl.forward(
         self.dsa_attn.layer_name, hidden_states, kv_cache, attn_metadata, need_gather_q_kv, output
