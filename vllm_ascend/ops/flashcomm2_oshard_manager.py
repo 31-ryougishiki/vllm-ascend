@@ -86,7 +86,15 @@ class Flashcomm2OShardManager:
 
         # Ensure the layer exists and meets the sharding criteria.
         if target_layer and is_hidden_layer(target_layer):
+            logger.info(
+                "[O_SHARD] trigger_broadcast: layer_prefix=%s, layer_idx=%d",
+                layer_prefix, layer_idx,
+            )
             reach_layer_for_shard_weight_series(target_layer)
+            logger.info(
+                "[O_SHARD] broadcast done: layer_prefix=%s, layer_idx=%d",
+                layer_prefix, layer_idx,
+            )
 
     def post_process_after_loading(self):
         """Performs post-processing on all registered layers after weight loading.

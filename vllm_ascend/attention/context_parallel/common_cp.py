@@ -4,6 +4,7 @@ import torch
 import torch.distributed as dist
 import torch_npu
 from vllm.distributed import get_dcp_group, get_pcp_group
+from vllm.logger import logger
 
 from vllm_ascend.distributed.utils import get_decode_context_model_parallel_world_size
 
@@ -120,12 +121,30 @@ def _process_attn_out_lse(attn_output: torch.Tensor, softmax_lse: torch.Tensor) 
         # permute: [bs, num_heads, v_head_dim+1] -> [num_heads, v_head_dim+1, bs]
         attn_out_lse = attn_out_lse.permute([1, 2, 0]).contiguous()
         attn_out_lse_all2all = torch.empty_like(attn_out_lse)
+        logger.info(
+            "[CP_COMM][DCP] all_to_all_single (decode output+LSE): "
+            "input_shape=%s, output_shape=%s, dcp_size=%d",
+            tuple(attn_out_lse.shape), tuple(attn_out_lse_all2all.shape), dcp_size,
+        )
         dist.all_to_all_single(attn_out_lse_all2all, attn_out_lse, group=dcp_group)
         attn_out_lse = attn_out_lse_all2all.permute([2, 0, 1])
+        logger.info(
+            "[CP_COMM][DCP] all_to_all_single done: result_shape=%s",
+            tuple(attn_out_lse.shape),
+        )
 
     if pcp_size > 1:
         # AllGather out&lse within CP group
+        logger.info(
+            "[CP_COMM][PCP] all_gather (decode output+LSE): "
+            "input_shape=%s, dim=0, pcp_size=%d",
+            tuple(attn_out_lse.shape), pcp_size,
+        )
         attn_out_lse = get_pcp_group().all_gather(attn_out_lse.contiguous(), dim=0)
+        logger.info(
+            "[CP_COMM][PCP] all_gather done: result_shape=%s",
+            tuple(attn_out_lse.shape),
+        )
 
     return attn_out_lse
 
