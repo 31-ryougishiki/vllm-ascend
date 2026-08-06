@@ -272,20 +272,17 @@ class PrepareAndFinalizeWithMC2(PrepareAndFinalizeWithAll2All):
         self.replace_allreduce = replace_allreduce
         self.enable_shared_expert_dp = enable_shared_expert_dp
         mc2_mask = _EXTRA_CTX.mc2_mask
-        logger.info(
-            "PREPARE_DBG hidden=%s mc2_mask_before=%s tp_size=%d tp_rank=%d",
-            tuple(hidden_states.shape),
-            tuple(mc2_mask.shape) if mc2_mask is not None else None,
-            self.tp_size, self.tp_rank,
+        print(
+            f"PREP_DBG hidden={tuple(hidden_states.shape)} "
+            f"mc2_mask={tuple(mc2_mask.shape) if mc2_mask is not None else None} "
+            f"tp_size={self.tp_size} tp_rank={self.tp_rank}",
+            flush=True,
         )
         if self.tp_size > 1:
             # Also slice mc2_mask
             split_mc2_mask = torch.tensor_split(mc2_mask, self.tp_size, dim=0)
             mc2_mask = split_mc2_mask[self.tp_rank]
-            logger.info(
-                "PREPARE_DBG mc2_mask_after=%s",
-                tuple(mc2_mask.shape),
-            )
+            print(f"PREP_DBG mc2_mask_after={tuple(mc2_mask.shape)}", flush=True)
 
         padded_hidden_states_shape = hidden_states.shape
         if not self.replace_allreduce:
