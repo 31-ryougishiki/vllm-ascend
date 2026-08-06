@@ -3744,13 +3744,20 @@ class NPUModelRunner(GPUModelRunner):
             "MODEL_PARAMS_TOTAL numel=%d (%.2fB)",
             total_params, total_params / 1e9,
         )
-        for _name, _p in self.model.named_parameters():
-            if ".experts.0.gate_up_proj.weight" in _name:
-                logger.info(
-                    "EXPERT_W0 %s shape=%s device=%s norm=%.3f",
-                    _name, tuple(_p.shape), _p.device, _p.norm().item(),
-                )
-                break
+        # All params whose name mentions experts
+        _exp = [(n, p) for n, p in self.model.named_parameters()
+                if ".experts." in n]
+        logger.info(
+            "EXPERT_PARAMS_COUNT=%d total_numel=%d",
+            len(_exp), sum(p.numel() for _, p in _exp),
+        )
+        if _exp:
+            _n, _p = _exp[0]
+            logger.info(
+                "EXPERT_PARAM_0 %s shape=%s device=%s norm=%.3f",
+                _n, tuple(_p.shape), _p.device, _p.norm().item(),
+            )
+        # Sample some weights
         for _name, _p in self.model.named_parameters():
             if "embed_tokens" in _name and "weight" in _name:
                 logger.info(
