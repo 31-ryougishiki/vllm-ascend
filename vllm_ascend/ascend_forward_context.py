@@ -275,7 +275,14 @@ def _select_a3_moe_comm_method(
     # TODO: drop the EP-size guard when dispatch_ffn_combine supports larger EP sizes
     # TODO: drop speculative method guard when dispatch_gmm_combine_decode supports w16a16
     dispatch_ffn_combine_enable = get_ep_group().world_size <= 32
-    if num_tokens <= mc2_tokens_capacity:
+    # MC2 kernel requires num_experts % (ep_world_size - shared_expert_rank_num) == 0.
+    # Under heterogeneous TP the EP world size may not divide the expert count
+    # (e.g. 256 experts over 15 ranks), so fall back to ALLGATHER in that case.
+    num_experts = vllm_config.model_config.get_num_experts()
+    ep_world_size = get_ep_group().world_size
+    expert_divisible = (num_experts % ep_world_size) == 0
+
+    if num_tokens <= mc2_tokens_capacity and expert_divisible:
         fused_decode_enable = enable_fused_mc2
         if enable_fused_mc2 == 1:
             fused_decode_enable = enable_fused_mc2 and dispatch_ffn_combine_enable
@@ -286,6 +293,11 @@ def _select_a3_moe_comm_method(
                 and quant_type == "w8a8_dynamic"
             )
         return MoECommType.FUSED_MC2 if fused_decode_enable else MoECommType.MC2
+
+    if num_tokens <= mc2_tokens_capacity:
+        # Experts not evenly divisible across EP ranks: the MC2 kernel cannot
+        # be used. Fall back to ALLGATHER (the A2 fallback path).
+        return MoECommType.ALLGATHER
 
     fused_prefill_enable = enable_fused_mc2
     if enable_fused_mc2 == 1:

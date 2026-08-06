@@ -184,13 +184,6 @@ class TokenDispatcherWithMC2(MoETokenDispatcher[MoEMC2CombineMetadata]):
         }
         if self.global_bs == 0:
             kwargs_mc2["x_active_mask"] = token_dispatch_input.routing.mc2_mask
-            if token_dispatch_input.routing.mc2_mask is not None:
-                logger.info(
-                    "DISPATCH_DBG x=%s mask=%s global_bs=%s",
-                    tuple(token_dispatch_input.hidden_states.shape),
-                    tuple(token_dispatch_input.routing.mc2_mask.shape),
-                    self.global_bs,
-                )
 
         stage1_kwargs = {
             "scales": None,
