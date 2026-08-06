@@ -209,12 +209,25 @@ def set_mc2_tokens_capacity(vllm_config, max_num_reqs, uniform_decode_query_len)
         max_num_tokens = vllm_config.compilation_config.max_cudagraph_capture_size
     else:
         max_num_tokens = max_num_reqs * uniform_decode_query_len
-    tp_size = vllm_config.parallel_config.tensor_parallel_size
+    pc = vllm_config.parallel_config
+    tp_size = pc.tensor_parallel_size
+    # Under heterogeneous TP, `_mc2_tokens_capacity` is computed once (in the
+    # API-server process) and inherited by every worker via fork. Since
+    # different DP ranks have different tp_size, align the capacity to the LCM
+    # of all DP-rank TP sizes so it is divisible by every rank's tp_size.
+    if pc.is_heterogeneous_tp:
+        from math import lcm
+
+        align = lcm(
+            *[pc.get_tp_size_for_dp(i) for i in range(pc.data_parallel_size)]
+        )
+    else:
+        align = tp_size
     # Use integer arithmetic for ceiling division.
-    num_tokens_per_tp_rank = (max_num_tokens + tp_size - 1) // tp_size
+    num_tokens_per_tp_rank = (max_num_tokens + align - 1) // align
     # NOTE: To save memory, we cap the max number of tokens to 512.
     num_tokens_per_tp_rank = min(num_tokens_per_tp_rank, 512)
-    _mc2_tokens_capacity = num_tokens_per_tp_rank * tp_size
+    _mc2_tokens_capacity = num_tokens_per_tp_rank * align
 
 
 def get_mc2_tokens_capacity():
