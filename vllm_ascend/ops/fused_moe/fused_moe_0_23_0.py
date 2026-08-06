@@ -232,7 +232,16 @@ class AscendFusedMoE(FusedMoE):
         )
         self.global_num_experts = num_experts + self.global_redundant_expert_num
         self.dynamic_eplb = eplb_config.dynamic_eplb and (self.log2phy is not None)
+        # Match determine_expert_map's remainder-based distribution so that
+        # local_num_experts agrees with expert_map (the first `remainder` EP
+        # ranks get one extra expert). This matters when
+        # global_num_experts % ep_size != 0 (e.g. 256 experts over 15 ranks).
         self.local_num_experts = self.global_num_experts // self.ep_size
+        if (
+            self.global_num_experts % self.ep_size != 0
+            and self.ep_rank < self.global_num_experts % self.ep_size
+        ):
+            self.local_num_experts += 1
         self.expert_map_manager._local_num_experts = self.local_num_experts
         self.expert_map_manager._expert_map = self._expert_map
         if self._expert_map is not None:

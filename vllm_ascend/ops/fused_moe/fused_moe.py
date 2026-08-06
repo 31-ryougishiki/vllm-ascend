@@ -422,7 +422,16 @@ else:
             )
 
             moe_config.global_redundant_expert_num = self.global_redundant_expert_num
-            local_num_experts = (moe_config.num_experts + self.global_redundant_expert_num) // moe_config.ep_size
+            # Match determine_expert_map's remainder-based distribution so
+            # local_num_experts agrees with expert_map when
+            # num_experts % ep_size != 0.
+            global_experts = moe_config.num_experts + self.global_redundant_expert_num
+            local_num_experts = global_experts // moe_config.ep_size
+            if (
+                global_experts % moe_config.ep_size != 0
+                and moe_config.ep_rank < global_experts % moe_config.ep_size
+            ):
+                local_num_experts += 1
             moe_config.num_local_experts = local_num_experts
             routed_experts.expert_map_manager._local_num_experts = local_num_experts
             routed_experts.expert_map_manager._expert_map = self._expert_map
