@@ -15,6 +15,7 @@
 # limitations under the License.
 #
 
+from math import lcm
 
 import torch
 import torch.distributed as dist
@@ -76,9 +77,13 @@ class AscendVocabParallelEmbedding(VocabParallelEmbedding):
         self.padding_size = padding_size
         self.org_vocab_size = org_num_embeddings or num_embeddings
         num_added_embeddings = num_embeddings - self.org_vocab_size
-        self.org_vocab_size_padded = pad_vocab_size(self.org_vocab_size, self.padding_size)
+        # Pad vocab to a multiple of tp_size so every rank gets an equal
+        # (uniform) partition. Asymmetric sharding is NOT supported for the
+        # vocab dimension because logits all_gather requires uniform sizes.
+        pad_to = lcm(self.padding_size, self.tp_size)
+        self.org_vocab_size_padded = pad_vocab_size(self.org_vocab_size, pad_to)
         self.num_embeddings_padded = pad_vocab_size(
-            self.org_vocab_size_padded + num_added_embeddings, self.padding_size
+            self.org_vocab_size_padded + num_added_embeddings, pad_to
         )
         assert self.org_vocab_size_padded <= self.num_embeddings_padded
 
