@@ -284,9 +284,37 @@ class DeepSeekV4MTP(nn.Module, SupportsPP, DeepseekV2MixtureOfExperts):
         tp_rank = get_tensor_model_parallel_rank()
         tp_size = get_tensor_model_parallel_world_size()
 
-        # Attention heads per rank
-        heads_per_rank = self.config.num_attention_heads // tp_size
-        head_start = tp_rank * heads_per_rank
+        # Attention heads per rank (with asymmetric sharding support, matching
+        # the main model in deepseek_v4.py)
+        from vllm.config import get_current_vllm_config_or_none
+
+        _cfg = get_current_vllm_config_or_none()
+        if _cfg is not None and _cfg.parallel_config.is_heterogeneous_tp:
+            _ratios = _cfg.parallel_config.get_sharding_ratios_for_dp(
+                _cfg.parallel_config.data_parallel_rank
+            )
+            if _ratios is not None:
+                from vllm.distributed.utils import (
+                    get_tp_partition_offset,
+                    get_tp_partition_size,
+                )
+
+                heads_per_rank = get_tp_partition_size(
+                    self.config.num_attention_heads, tp_rank, tp_size, _ratios
+                )
+                head_start = get_tp_partition_offset(
+                    self.config.num_attention_heads, tp_rank, tp_size, _ratios
+                )
+            else:
+                heads_per_rank = self.config.num_attention_heads // tp_size
+                head_start = tp_rank * heads_per_rank
+        else:
+            heads_per_rank = self.config.num_attention_heads // tp_size
+            head_start = tp_rank * heads_per_rank
+        logger.info(
+            "MTP_LOAD_DBG tp_size=%d tp_rank=%d heads_per_rank=%d head_start=%d",
+            tp_size, tp_rank, heads_per_rank, head_start,
+        )
 
         params_dict = dict(self.named_parameters())
         loaded_params: set[str] = set()
