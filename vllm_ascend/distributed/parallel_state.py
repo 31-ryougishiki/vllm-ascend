@@ -27,10 +27,63 @@ _P_TP: GroupCoordinator | None = None
 _DYNAMIC_EPLB: GroupCoordinator | None = None
 
 
+def _init_ascend_heterogeneous_fallbacks():
+    """Initialize Ascend-specific groups that the MoE runner requires even
+    under heterogeneous TP.  Fine-grained TP and prefill-TP groups are
+    NOT created (they are not supported under heterogeneous TP)."""
+    from vllm.distributed.parallel_state import (
+        get_ep_group,
+        get_tp_group,
+        get_world_group,
+        init_model_parallel_group,
+    )
+
+    local_rank = get_world_group().local_rank
+    backend = torch.distributed.get_backend(get_world_group().device_group)
+
+    # MC2 = EP group (all ranks in one group for all-to-all in MoE)
+    ep_group = get_ep_group()
+    if ep_group is not None:
+        global _MC2, _DYNAMIC_EPLB, _FC3_QUANT_X
+        all_ranks = [list(range(get_world_group().world_size))]
+        _MC2 = init_model_parallel_group(
+            all_ranks, local_rank, backend, group_name="mc2",
+        )
+        _DYNAMIC_EPLB = None
+        _FC3_QUANT_X = None
+
+    # FlashComm2 fallbacks use TP group
+    global _FLASHCOMM2_ODP
+    _FLASHCOMM2_ODP = get_tp_group()
+
+    # All fine-grained TP groups remain None (not supported)
+    global _OTP, _LMTP, _EMBED_TP, _MLP_TP, _OLORA_TP
+    _OTP = None
+    _LMTP = None
+    _EMBED_TP = None
+    _MLP_TP = None
+    _OLORA_TP = None
+
+    # Prefill TP group not supported
+    global _P_TP
+    _P_TP = None
+
+    # FlashComm2 OTP not supported
+    global _FLASHCOMM2_OTP
+    _FLASHCOMM2_OTP = None
+
+
 def init_ascend_model_parallel(
     parallel_config: ParallelConfig,
 ):
     if model_parallel_initialized():
+        return
+    # Heterogeneous TP: main TP/DP/EP/PP groups are already initialized by the
+    # upstream initialize_model_parallel.  The Ascend-specific fine-grained TP
+    # and prefill-TP groups are not supported.  MC2 and other groups needed by
+    # the Ascend MoE runner are initialized as compatible fallbacks.
+    if parallel_config.is_heterogeneous_tp:
+        _init_ascend_heterogeneous_fallbacks()
         return
     assert torch.distributed.is_initialized()
     world_size = torch.distributed.get_world_size()

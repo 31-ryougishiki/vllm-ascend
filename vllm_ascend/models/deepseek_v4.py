@@ -722,16 +722,38 @@ class DeepseekV4Attention(nn.Module):
         self.layer_idx = layer_idx
         config_layer_idx = extract_dsv4_layer_index(config, prefix)
         tp_size = get_tensor_model_parallel_world_size()
+        tp_rank = get_tensor_model_parallel_rank()
         self.dim = config.hidden_size
         self.n_heads = config.num_attention_heads
-        self.n_local_heads = config.num_attention_heads // tp_size
+        self.n_groups = config.o_groups
+        # Compute per-rank heads/groups with optional asymmetric sharding
+        from vllm.config import get_current_vllm_config_or_none
+
+        _cfg = get_current_vllm_config_or_none()
+        if _cfg is not None and _cfg.parallel_config.is_heterogeneous_tp:
+            _ratios = _cfg.parallel_config.get_sharding_ratios_for_dp(
+                _cfg.parallel_config.data_parallel_rank
+            )
+            if _ratios is not None:
+                from vllm.distributed.utils import get_tp_partition_size
+
+                self.n_local_heads = get_tp_partition_size(
+                    config.num_attention_heads, tp_rank, tp_size, _ratios
+                )
+                self.n_local_groups = get_tp_partition_size(
+                    self.n_groups, tp_rank, tp_size, _ratios
+                )
+            else:
+                self.n_local_heads = config.num_attention_heads // tp_size
+                self.n_local_groups = self.n_groups // tp_size
+        else:
+            self.n_local_heads = config.num_attention_heads // tp_size
+            self.n_local_groups = self.n_groups // tp_size
         self.q_lora_rank = config.q_lora_rank
         self.o_lora_rank = config.o_lora_rank
         self.head_dim = config.head_dim
         self.rope_head_dim = config.qk_rope_head_dim
         self.nope_head_dim = config.head_dim - config.qk_rope_head_dim
-        self.n_groups = config.o_groups
-        self.n_local_groups = self.n_groups // tp_size
         self.window_size = config.sliding_window
         self.eps = config.rms_norm_eps
         self.norm_eps = config.rms_norm_eps
@@ -1344,9 +1366,32 @@ class AscendDeepseekV4ForCausalLM(nn.Module, SupportsPP, DeepseekV2MixtureOfExpe
         tp_rank = get_tensor_model_parallel_rank()
         tp_size = get_tensor_model_parallel_world_size()
 
-        # Attention heads per rank
-        heads_per_rank = self.config.num_attention_heads // tp_size
-        head_start = tp_rank * heads_per_rank
+        # Attention heads per rank (with asymmetric sharding support)
+        from vllm.config import get_current_vllm_config_or_none
+
+        _cfg = get_current_vllm_config_or_none()
+        if _cfg is not None and _cfg.parallel_config.is_heterogeneous_tp:
+            _ratios = _cfg.parallel_config.get_sharding_ratios_for_dp(
+                _cfg.parallel_config.data_parallel_rank
+            )
+            if _ratios is not None:
+                from vllm.distributed.utils import (
+                    get_tp_partition_offset,
+                    get_tp_partition_size,
+                )
+
+                heads_per_rank = get_tp_partition_size(
+                    self.config.num_attention_heads, tp_rank, tp_size, _ratios
+                )
+                head_start = get_tp_partition_offset(
+                    self.config.num_attention_heads, tp_rank, tp_size, _ratios
+                )
+            else:
+                heads_per_rank = self.config.num_attention_heads // tp_size
+                head_start = tp_rank * heads_per_rank
+        else:
+            heads_per_rank = self.config.num_attention_heads // tp_size
+            head_start = tp_rank * heads_per_rank
 
         for name, loaded_weight in weights:
             spec_layer = get_spec_layer_idx_from_weight_name(self.config, name)
