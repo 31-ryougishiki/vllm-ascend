@@ -244,7 +244,12 @@ class AscendMergedColumnParallelLinear(MergedColumnParallelLinear):
         # TODO(realliujiaxu): Replace the initialization code below with super().__init__ after
         # linear of vllm supports custom comm group
         self.output_sizes = output_sizes
-        assert all(output_size % self.tp_size == 0 for output_size in output_sizes)
+        from vllm.distributed.utils import get_current_tp_sharding_ratios
+
+        _ratios = get_current_tp_sharding_ratios() if not disable_tp else None
+        self._tp_sharding_ratios = _ratios
+        if _ratios is None:
+            assert all(output_size % self.tp_size == 0 for output_size in output_sizes)
         AscendColumnParallelLinear.__init__(
             self,
             input_size=input_size,
@@ -308,7 +313,12 @@ class AscendRowParallelLinear(RowParallelLinear):
         # TODO(realliujiaxu): Replace the initialization code below with super().__init__ after
         # linear of vllm supports custom comm group
         # Divide the weight matrix along the first dimension.
-        self.input_size_per_partition = divide(input_size, self.tp_size)
+        from vllm.distributed.utils import get_current_tp_sharding_ratios, get_tp_partition_size
+
+        _ratios = get_current_tp_sharding_ratios() if not disable_tp else None
+        self._tp_sharding_ratios = _ratios
+        self.input_size_per_partition = get_tp_partition_size(
+            input_size, self.tp_rank, self.tp_size, _ratios)
         self.output_size_per_partition = output_size
         self.output_partition_sizes = [output_size]
         self.out_dtype = out_dtype
@@ -398,11 +408,18 @@ class AscendColumnParallelLinear(ColumnParallelLinear):
         # TODO(realliujiaxu): Replace the initialization code below with super().__init__ after
         # linear of vllm supports custom comm group
         self.input_size_per_partition = input_size
-        self.output_size_per_partition = divide(output_size, self.tp_size)
+        from vllm.distributed.utils import get_current_tp_sharding_ratios, get_tp_partition_size
+
+        _ratios = get_current_tp_sharding_ratios() if not disable_tp else None
+        self._tp_sharding_ratios = _ratios
+        self.output_size_per_partition = get_tp_partition_size(
+            output_size, self.tp_rank, self.tp_size, _ratios)
         self.output_partition_sizes = [self.output_size_per_partition]
         # If QKV or MergedColumn, use output size of each partition.
         if hasattr(self, "output_sizes"):
-            self.output_partition_sizes = [divide(output_size, self.tp_size) for output_size in self.output_sizes]
+            self.output_partition_sizes = [
+                get_tp_partition_size(osz, self.tp_rank, self.tp_size, _ratios)
+                for osz in self.output_sizes]
 
         AscendLinearBase.__init__(
             self,
@@ -475,7 +492,15 @@ class AscendColumnParallelLinear(ColumnParallelLinear):
                 # In RL update flows, wo_a can be loaded again after being
                 # transformed into [n_local_groups, hidden_size, o_lora_rank].
                 shard_size = self.n_local_groups * self.o_lora_rank
-                start_idx = self.tp_rank * shard_size
+                if getattr(self, "_tp_sharding_ratios", None) is not None:
+                    from vllm.distributed.utils import get_tp_partition_offset
+
+                    start_idx = get_tp_partition_offset(
+                        loaded_weight.shape[0], self.tp_rank, self.tp_size,
+                        self._tp_sharding_ratios,
+                    )
+                else:
+                    start_idx = self.tp_rank * shard_size
                 if loaded_weight.shape[0] != shard_size:
                     loaded_weight = loaded_weight.narrow(0, start_idx, shard_size)
                 loaded_weight = (
