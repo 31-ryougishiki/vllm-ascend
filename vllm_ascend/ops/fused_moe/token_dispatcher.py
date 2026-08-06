@@ -23,6 +23,7 @@
 from abc import ABC, abstractmethod
 from typing import Generic
 
+import numpy as np
 import torch
 import torch_npu
 from vllm.config import get_current_vllm_config
@@ -453,21 +454,45 @@ class TokenDispatcherWithAll2AllV(MoETokenDispatcher[MoEAllToAllCombineMetadata]
         self.num_local_experts = kwargs.get("num_local_experts", 0)
 
         assert self.num_local_experts > 0, "Expected at least one expert"
-        if self.num_local_experts > 1:
-            self.expert_ids_per_ep_rank = torch.tensor(
-                [i % self.num_local_experts for i in range(self.num_experts)],
-                dtype=torch.int32,
-                device=torch.npu.current_device(),
-            )
+        # Expert ranges per EP rank under linear placement. May be uneven
+        # (e.g. 256 experts over 15 ranks -> rank 0 holds 18, others 17),
+        # so do NOT assume num_experts is evenly divisible by ep_size.
+        ep_size = self.ep_size
+        num_experts = self.num_experts
+        base = num_experts // ep_size
+        remainder = num_experts % ep_size
+        self._per_rank_expert_counts = [
+            base + (1 if r < remainder else 0) for r in range(ep_size)
+        ]
+        self._per_rank_expert_starts = []
+        _s = 0
+        for _n in self._per_rank_expert_counts:
+            self._per_rank_expert_starts.append(_s)
+            _s += _n
 
-        local_expert_indices_offset = self.ep_rank * self.num_local_experts
-
-        self.local_expert_indices = [local_expert_indices_offset + i for i in range(self.num_local_experts)]
+        self.num_local_experts = self._per_rank_expert_counts[self.ep_rank]
+        start_idx = self._per_rank_expert_starts[self.ep_rank]
+        self.local_expert_indices = [
+            start_idx + i for i in range(self.num_local_experts)
+        ]
         assert len(self.local_expert_indices) == self.num_local_experts, "Invalid local expert indices"
         for i in range(len(self.local_expert_indices) - 1):
             assert self.local_expert_indices[i] == self.local_expert_indices[i + 1] - 1, (
                 "local_expert_indices must be continuous"
             )
+
+        if self.num_local_experts > 1:
+            # Global expert -> local expert id within its owning rank.
+            expert_ids = torch.full(
+                (num_experts,), -1, dtype=torch.int32, device=torch.npu.current_device()
+            )
+            for r in range(ep_size):
+                cnt = self._per_rank_expert_counts[r]
+                s = self._per_rank_expert_starts[r]
+                expert_ids[s : s + cnt] = torch.arange(
+                    cnt, dtype=torch.int32, device=expert_ids.device
+                )
+            self.expert_ids_per_ep_rank = expert_ids
 
         # TODO: Try local_rank = ep_group.rank_in_group
         local_rank = torch.distributed.get_rank(group=self.ep_group)
@@ -598,12 +623,12 @@ class TokenDispatcherWithAll2AllV(MoETokenDispatcher[MoEAllToAllCombineMetadata]
         ep_size = self.ep_size
         num_out_tokens = topk_ids.numel()
 
-        input_splits = (
-            num_local_tokens_per_expert.reshape(ep_size, self.num_local_experts)
-            .sum(axis=1)
-            .to(torch.device("cpu"), non_blocking=True)
-            .numpy()
-        )
+        # Sum tokens per EP rank's actual (possibly uneven) expert range.
+        input_splits = np.zeros(ep_size, dtype=np.int64)
+        for r in range(ep_size):
+            s = self._per_rank_expert_starts[r]
+            cnt = self._per_rank_expert_counts[r]
+            input_splits[r] = num_local_tokens_per_expert[s : s + cnt].sum().item()
 
         num_global_tokens_per_expert = gather_from_sequence_parallel_region(
             num_local_tokens_per_expert, group=self.ep_group
