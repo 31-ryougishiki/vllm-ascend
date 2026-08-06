@@ -26,6 +26,9 @@ from vllm.distributed.parallel_state import (
     get_tensor_model_parallel_rank,
     get_tensor_model_parallel_world_size,
 )
+from vllm.logger import init_logger
+
+logger = init_logger(__name__)
 from vllm.forward_context import get_forward_context
 from vllm.model_executor.layers.fused_moe import FusedMoEConfig
 
@@ -269,10 +272,20 @@ class PrepareAndFinalizeWithMC2(PrepareAndFinalizeWithAll2All):
         self.replace_allreduce = replace_allreduce
         self.enable_shared_expert_dp = enable_shared_expert_dp
         mc2_mask = _EXTRA_CTX.mc2_mask
+        logger.info(
+            "PREPARE_DBG hidden=%s mc2_mask_before=%s tp_size=%d tp_rank=%d",
+            tuple(hidden_states.shape),
+            tuple(mc2_mask.shape) if mc2_mask is not None else None,
+            self.tp_size, self.tp_rank,
+        )
         if self.tp_size > 1:
             # Also slice mc2_mask
             split_mc2_mask = torch.tensor_split(mc2_mask, self.tp_size, dim=0)
             mc2_mask = split_mc2_mask[self.tp_rank]
+            logger.info(
+                "PREPARE_DBG mc2_mask_after=%s",
+                tuple(mc2_mask.shape),
+            )
 
         padded_hidden_states_shape = hidden_states.shape
         if not self.replace_allreduce:
