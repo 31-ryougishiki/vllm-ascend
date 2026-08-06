@@ -72,8 +72,12 @@ from vllm.transformers_utils.configs.deepseek_v4 import DeepseekV4Config
 from vllm.v1.attention.backends.mla.sparse_swa import DeepseekV4SWACache as VllmDeepseekV4SWACache
 from vllm.v1.kv_cache_interface import KVCacheSpec
 
+from vllm.logger import init_logger
+
 from vllm_ascend.ascend_config import get_ascend_config
 from vllm_ascend.core.kv_cache_interface import AscendSlidingWindowMLASpec
+
+logger = init_logger(__name__)
 from vllm_ascend.ops.dsa import AscendDeepseekSparseAttention, DSAModules
 from vllm_ascend.ops.rope_dsv4 import ComplexExpRotaryEmbedding
 from vllm_ascend.ops.triton.mul_add import muls_add_triton
