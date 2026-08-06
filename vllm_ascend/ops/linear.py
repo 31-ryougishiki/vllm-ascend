@@ -246,8 +246,9 @@ class AscendMergedColumnParallelLinear(MergedColumnParallelLinear):
         self.output_sizes = output_sizes
         from vllm.distributed.utils import get_current_tp_sharding_ratios
 
+        # NOTE: AscendColumnParallelLinear.__init__ re-derives and stores
+        # _tp_sharding_ratios; only use _ratios locally for the divisibility gate.
         _ratios = get_current_tp_sharding_ratios() if not disable_tp else None
-        self._tp_sharding_ratios = _ratios
         if _ratios is None:
             assert all(output_size % self.tp_size == 0 for output_size in output_sizes)
         AscendColumnParallelLinear.__init__(
@@ -313,7 +314,10 @@ class AscendRowParallelLinear(RowParallelLinear):
         # TODO(realliujiaxu): Replace the initialization code below with super().__init__ after
         # linear of vllm supports custom comm group
         # Divide the weight matrix along the first dimension.
-        from vllm.distributed.utils import get_current_tp_sharding_ratios, get_tp_partition_size
+        from vllm.distributed.utils import (
+            get_current_tp_sharding_ratios,
+            get_tp_partition_size,
+        )
 
         _ratios = get_current_tp_sharding_ratios() if not disable_tp else None
         self._tp_sharding_ratios = _ratios
@@ -403,12 +407,14 @@ class AscendColumnParallelLinear(ColumnParallelLinear):
         return_bias: bool = True,
         disable_tp: bool = False,
     ):
-        #
         self.custom_op, self.tp_rank, self.tp_size = get_parallel_op(disable_tp, prefix, self, "column")
         # TODO(realliujiaxu): Replace the initialization code below with super().__init__ after
         # linear of vllm supports custom comm group
         self.input_size_per_partition = input_size
-        from vllm.distributed.utils import get_current_tp_sharding_ratios, get_tp_partition_size
+        from vllm.distributed.utils import (
+            get_current_tp_sharding_ratios,
+            get_tp_partition_size,
+        )
 
         _ratios = get_current_tp_sharding_ratios() if not disable_tp else None
         self._tp_sharding_ratios = _ratios
@@ -469,7 +475,16 @@ class AscendColumnParallelLinear(ColumnParallelLinear):
         self.prefix = prefix
         if "wo_a" in prefix:
             hf_config = get_current_vllm_config().model_config.hf_text_config
-            self.n_local_groups = getattr(hf_config, "o_groups", 0) // self.tp_size
+            o_groups = getattr(hf_config, "o_groups", 0)
+            if getattr(self, "_tp_sharding_ratios", None) is not None:
+                from vllm.distributed.utils import get_tp_partition_size
+
+                self.n_local_groups = get_tp_partition_size(
+                    o_groups, self.tp_rank, self.tp_size,
+                    self._tp_sharding_ratios,
+                )
+            else:
+                self.n_local_groups = o_groups // self.tp_size
             self.o_lora_rank = getattr(hf_config, "o_lora_rank", 0)
 
     def forward(
