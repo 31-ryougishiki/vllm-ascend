@@ -3636,6 +3636,19 @@ class NPUModelRunner(GPUModelRunner):
         # TODO: after the vllm pcp function is launched, this logic needs to be brought up to the community
         if self.pcp_size > 1:
             self.max_num_tokens = math.ceil(self.max_num_tokens / (self.pcp_size * 2)) * 2
+        elif self.vllm_config.parallel_config.is_heterogeneous_tp:
+            # Under heterogeneous TP the DP-rank TP sizes differ (e.g. 3 and 4).
+            # _dummy_run pads tokens up to a multiple of tp_size, so align
+            # max_num_tokens down to a multiple of lcm(tp_sizes) to keep
+            # num_tokens_padded within max_num_tokens (10240 is not divisible
+            # by 3). Slightly fewer tokens is fine for profiling.
+            from math import lcm
+
+            pc = self.vllm_config.parallel_config
+            align = lcm(
+                *[pc.get_tp_size_for_dp(i) for i in range(pc.data_parallel_size)]
+            )
+            self.max_num_tokens = (self.max_num_tokens // align) * align
         super().profile_run()
         self.max_num_tokens = origin_max_num_tokens
 
