@@ -236,12 +236,6 @@ class TokenDispatcherWithMC2(MoETokenDispatcher[MoEMC2CombineMetadata]):
         self,
         token_dispatch_input: MoETokenDispatchInput,
     ):
-        print(
-            f"TOK_DBG x={tuple(token_dispatch_input.hidden_states.shape)} "
-            f"global_bs={self.global_bs} mask="
-            f"{tuple(token_dispatch_input.routing.mc2_mask.shape) if token_dispatch_input.routing.mc2_mask is not None else None}",
-            flush=True,
-        )
         kwargs_mc2 = self.get_dispatch_mc2_kwargs(token_dispatch_input)
         output = (
             torch_npu.npu_moe_distribute_dispatch_v2(**kwargs_mc2)

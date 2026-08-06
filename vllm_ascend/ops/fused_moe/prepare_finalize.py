@@ -245,9 +245,25 @@ class PrepareAndFinalizeWithMC2(PrepareAndFinalizeWithAll2All):
         Restore original TP configuration.
         vLLM flattens TP and DP into a single dimension; this method recovers
         the true TP world size and rank for correct tensor slicing.
+
+        Under heterogeneous TP the comm method may be constructed while the
+        draft model has temporarily patched the TP group to size-1, so
+        ``get_tensor_model_parallel_world_size()`` can return 1 instead of the
+        real per-DP-rank TP size. Read the true values from the config instead.
         """
-        self.tp_size = get_tensor_model_parallel_world_size()
-        self.tp_rank = get_tensor_model_parallel_rank()
+        from vllm.config import get_current_vllm_config_or_none
+        from vllm.distributed.parallel_state import get_world_group
+
+        cfg = get_current_vllm_config_or_none()
+        if cfg is not None and cfg.parallel_config.is_heterogeneous_tp:
+            pc = cfg.parallel_config
+            self.tp_size = pc.tensor_parallel_size
+            self.tp_rank = (
+                get_world_group().rank - pc.get_rank_offset_for_dp(pc.data_parallel_rank)
+            )
+        else:
+            self.tp_size = get_tensor_model_parallel_world_size()
+            self.tp_rank = get_tensor_model_parallel_rank()
 
     def prepare(
         self,
@@ -272,17 +288,10 @@ class PrepareAndFinalizeWithMC2(PrepareAndFinalizeWithAll2All):
         self.replace_allreduce = replace_allreduce
         self.enable_shared_expert_dp = enable_shared_expert_dp
         mc2_mask = _EXTRA_CTX.mc2_mask
-        print(
-            f"PREP_DBG hidden={tuple(hidden_states.shape)} "
-            f"mc2_mask={tuple(mc2_mask.shape) if mc2_mask is not None else None} "
-            f"tp_size={self.tp_size} tp_rank={self.tp_rank}",
-            flush=True,
-        )
         if self.tp_size > 1:
             # Also slice mc2_mask
             split_mc2_mask = torch.tensor_split(mc2_mask, self.tp_size, dim=0)
             mc2_mask = split_mc2_mask[self.tp_rank]
-            print(f"PREP_DBG mc2_mask_after={tuple(mc2_mask.shape)}", flush=True)
 
         padded_hidden_states_shape = hidden_states.shape
         if not self.replace_allreduce:
