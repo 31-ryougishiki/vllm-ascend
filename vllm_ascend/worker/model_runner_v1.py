@@ -3755,12 +3755,14 @@ class NPUModelRunner(GPUModelRunner):
         _layers = sorted({int(m.group(1)) for n, _ in _exp
                           if (m := _re.search(r"layers\.(\d+)", n))})
         logger.info("EXPERT_LAYERS=%s count=%d", _layers, len(_layers))
-        # List all expert param names (first 30)
-        for _i, (_n, _p) in enumerate(_exp[:30]):
-            logger.info(
-                "EXPERT_P%d %s shape=%s norm=%.3f",
-                _i, _n, tuple(_p.shape), _p.norm().item(),
-            )
+        # Sample the first w13_weight norm
+        for _n, _p in _exp:
+            if "w13_weight" in _n and ".weight" not in _n:
+                logger.info(
+                    "EXPERT_W13_SAMPLE %s shape=%s norm=%.3f",
+                    _n, tuple(_p.shape), _p.norm().item(),
+                )
+                break
         # Sample some weights
         for _name, _p in self.model.named_parameters():
             if "embed_tokens" in _name and "weight" in _name:
