@@ -281,6 +281,12 @@ def _select_a3_moe_comm_method(
     num_experts = vllm_config.model_config.get_num_experts()
     ep_world_size = get_ep_group().world_size
     expert_divisible = (num_experts % ep_world_size) == 0
+    print(
+        f"SELECT_A3 num_experts={num_experts} ep_world_size={ep_world_size} "
+        f"expert_divisible={expert_divisible} num_tokens={num_tokens} "
+        f"capacity={mc2_tokens_capacity}",
+        flush=True,
+    )
 
     if num_tokens <= mc2_tokens_capacity and expert_divisible:
         fused_decode_enable = enable_fused_mc2
