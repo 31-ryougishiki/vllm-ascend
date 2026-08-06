@@ -3751,11 +3751,15 @@ class NPUModelRunner(GPUModelRunner):
             "EXPERT_PARAMS_COUNT=%d total_numel=%d",
             len(_exp), sum(p.numel() for _, p in _exp),
         )
-        if _exp:
-            _n, _p = _exp[0]
+        import re as _re
+        _layers = sorted({int(m.group(1)) for n, _ in _exp
+                          if (m := _re.search(r"layers\.(\d+)", n))})
+        logger.info("EXPERT_LAYERS=%s count=%d", _layers, len(_layers))
+        # List all expert param names (first 30)
+        for _i, (_n, _p) in enumerate(_exp[:30]):
             logger.info(
-                "EXPERT_PARAM_0 %s shape=%s device=%s norm=%.3f",
-                _n, tuple(_p.shape), _p.device, _p.norm().item(),
+                "EXPERT_P%d %s shape=%s norm=%.3f",
+                _i, _n, tuple(_p.shape), _p.norm().item(),
             )
         # Sample some weights
         for _name, _p in self.model.named_parameters():
