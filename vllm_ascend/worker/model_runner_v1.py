@@ -3738,6 +3738,28 @@ class NPUModelRunner(GPUModelRunner):
         self.model_memory_usage = m.consumed_memory
         logger.info("Loading model weights took %.4f GB", m.consumed_memory / float(2**30))
 
+        # --- temporary weight-load diagnostics ---
+        total_params = sum(p.numel() for p in self.model.parameters())
+        logger.info(
+            "MODEL_PARAMS_TOTAL numel=%d (%.2fB)",
+            total_params, total_params / 1e9,
+        )
+        for _name, _p in self.model.named_parameters():
+            if ".experts.0.gate_up_proj.weight" in _name:
+                logger.info(
+                    "EXPERT_W0 %s shape=%s device=%s norm=%.3f",
+                    _name, tuple(_p.shape), _p.device, _p.norm().item(),
+                )
+                break
+        for _name, _p in self.model.named_parameters():
+            if "embed_tokens" in _name and "weight" in _name:
+                logger.info(
+                    "EMBED_W0 %s shape=%s device=%s norm=%.3f",
+                    _name, tuple(_p.shape), _p.device, _p.norm().item(),
+                )
+                break
+        # --- end temporary diagnostics ---
+
         from vllm.model_executor.offloader.base import get_offloader
         get_offloader().post_init()
 
