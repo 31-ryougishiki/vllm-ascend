@@ -2124,8 +2124,19 @@ class NPUModelRunner(GPUModelRunner):
 
         # Run forward pass
         clear_kv_metadata = self.speculative_config is None
-        # DIAG: torch.npu.synchronize() removed (was before model_forward) to
-        # repro the occasional layer_0 spike; restore to compare.
+        # DIAG: torch.npu.synchronize() removed to repro layer_0 spike.
+        # Temporarily restore with host timer to measure how much async work
+        # is pending before model_forward.
+        import time as _time_diag
+        _t_sync0 = _time_diag.perf_counter()
+        torch.npu.synchronize()
+        _t_sync1 = _time_diag.perf_counter()
+        _sync_ms = (_t_sync1 - _t_sync0) * 1000.0
+        if _sync_ms > 10.0:
+            logger.warning(
+                "DIAG sync_before_model_forward: %.1fms (step %d, num_tokens=%d)",
+                _sync_ms, self._cs_step_counter, num_tokens_padded,
+            )
         with (
             self._cs_span("model_forward"),
             record_function_or_nullcontext("forward"),
