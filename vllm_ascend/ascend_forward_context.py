@@ -187,15 +187,16 @@ def set_ascend_forward_context(
                         )
                     forward_context.per_dp_padded_lengths = per_dp
                     forward_context.per_dp_tp_sizes = tp_sizes
-                    # Each rank's tokens are padded to padded_length
-                    # (pad_size = padded_length - local_num_tokens).
-                    # tensor_model_parallel_reduce_scatter requires
-                    # shape[0] % tp_size == 0, so ensure
-                    # padded_length is a multiple of the LOCAL tp_size
-                    # as well as covering max(per_dp).
+                    # Align padded_length to the LCM of all per-DP TP
+                    # sizes so that: (a) tensor_model_parallel_reduce_scatter
+                    # passes its shape[0] % tp_size == 0 assertion on every
+                    # rank, and (b) all ranks share a uniform padded_length.
+                    from math import lcm
+
                     _pl = max(per_dp)
-                    if _pl % tp_world_size != 0:
-                        _pl += tp_world_size - (_pl % tp_world_size)
+                    _align = lcm(*tp_sizes)
+                    if _pl % _align != 0:
+                        _pl += _align - (_pl % _align)
                     forward_context.padded_length = _pl
                 else:
                     padded_length = (max_tokens_across_dp + tp_world_size - 1) // tp_world_size * tp_world_size
