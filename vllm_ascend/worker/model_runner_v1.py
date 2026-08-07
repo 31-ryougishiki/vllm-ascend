@@ -1856,7 +1856,18 @@ class NPUModelRunner(GPUModelRunner):
             )
 
         # DIAG: torch.npu.synchronize() removed (was before prepare_input) to
-        # repro the occasional layer_0 spike; restore to compare.
+        # repro the occasional layer_0 spike.
+        # Bisect: move sync earlier to before prepare_input. If spike still
+        # disappears, the trigger is even earlier.
+        _t_sync0 = time.perf_counter()
+        torch.npu.synchronize()
+        _t_sync1 = time.perf_counter()
+        _sync_ms = (_t_sync1 - _t_sync0) * 1000.0
+        if _sync_ms > 10.0:
+            logger.warning(
+                "DIAG sync_before_prepare_input: %.1fms (step %d, tokens=%d)",
+                _sync_ms, self._cs_step_counter, num_scheduled_tokens,
+            )
         with self._cs_span("prepare_input"), record_function_or_nullcontext("prepare input"):
             with self.synchronize_input_prep():
                 # Fix up prev_req_id_to_index for requests that were discarded
@@ -2127,16 +2138,6 @@ class NPUModelRunner(GPUModelRunner):
         # DIAG: torch.npu.synchronize() removed to repro layer_0 spike.
         # Temporarily restore with host timer to measure how much async work
         # is pending before model_forward.
-        import time as _time_diag
-        _t_sync0 = _time_diag.perf_counter()
-        torch.npu.synchronize()
-        _t_sync1 = _time_diag.perf_counter()
-        _sync_ms = (_t_sync1 - _t_sync0) * 1000.0
-        if _sync_ms > 10.0:
-            logger.warning(
-                "DIAG sync_before_model_forward: %.1fms (step %d, num_tokens=%d)",
-                _sync_ms, self._cs_step_counter, num_tokens_padded,
-            )
         with (
             self._cs_span("model_forward"),
             record_function_or_nullcontext("forward"),
