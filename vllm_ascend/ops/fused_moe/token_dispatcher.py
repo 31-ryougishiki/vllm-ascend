@@ -641,41 +641,37 @@ class TokenDispatcherWithAll2AllV(MoETokenDispatcher[MoEAllToAllCombineMetadata]
             num_local_tokens_per_expert, group=self.ep_group
         ).reshape(ep_size, self.num_experts)
 
-        # output_splits[r] = tokens routed to rank r's local experts. Use each
-        # rank's OWN expert range (do NOT slice with the current rank's
-        # local_expert_indices for every row, which is wrong when expert ranges
-        # are uneven across ranks).
+        # rank_local_tokens[r][j] = tokens that rank r routes to this rank's
+        # j-th local expert. The all_to_all output arrives grouped by sender
+        # rank, so per-row (sender) local-expert counts are the receive splits.
+        # NOTE: local_expert_indices is the CURRENT rank's local-expert global
+        # indices; it is used for every row because each row holds the sender's
+        # per-expert token counts and we only care about this rank's experts.
+        rank_local_tokens = num_global_tokens_per_expert[
+            :, self.local_expert_indices[0] : self.local_expert_indices[-1] + 1
+        ]
+        # Receive splits: for sender r, the number of tokens routed to this
+        # rank's local experts.
         output_splits = np.zeros(ep_size, dtype=np.int64)
         for r in range(ep_size):
-            s = self._per_rank_expert_starts[r]
-            cnt = self._per_rank_expert_counts[r]
-            output_splits[r] = num_global_tokens_per_expert[r, s : s + cnt].sum().item()
-
-        # Local expert token counts (current rank's own experts).
-        _s = self._per_rank_expert_starts[self.ep_rank]
-        _cnt = self._per_rank_expert_counts[self.ep_rank]
-        num_tokens_per_local_expert = num_global_tokens_per_expert[
-            self.ep_rank, _s : _s + _cnt
-        ]
+            output_splits[r] = rank_local_tokens[r].sum().item()
+        # Tokens per local expert (across all sender ranks).
+        num_tokens_per_local_expert = rank_local_tokens.sum(axis=0)
 
         global_input_tokens_local_experts_indices = None
         if self.num_local_experts > 1:
-            # repeats per global expert in expert order. Concatenate each rank's
-            # local-expert token counts (expert ranges may be uneven under
-            # heterogeneous TP), so repeats length matches expert_ids_per_ep_rank.
-            repeats = torch.cat(
-                [
-                    num_global_tokens_per_expert[
-                        r,
-                        self._per_rank_expert_starts[r] :
-                        self._per_rank_expert_starts[r] + self._per_rank_expert_counts[r],
-                    ]
-                    for r in range(ep_size)
-                ]
+            # Each token's local expert id, in the all_to_all receive order
+            # (grouped by sender rank, then by local expert id within rank).
+            local_ids = torch.arange(
+                self.num_local_experts,
+                dtype=torch.int32,
+                device=num_global_tokens_per_expert.device,
             )
-            global_input_tokens_local_experts_indices = torch.repeat_interleave(
-                self.expert_ids_per_ep_rank, repeats
-            )
+            indices_parts = [
+                torch.repeat_interleave(local_ids, rank_local_tokens[r])
+                for r in range(ep_size)
+            ]
+            global_input_tokens_local_experts_indices = torch.cat(indices_parts)
         else:
             torch.npu.synchronize()
 
