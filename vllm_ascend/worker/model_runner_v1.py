@@ -2081,6 +2081,17 @@ class NPUModelRunner(GPUModelRunner):
                     num_scheduled_tokens_compressed_list=num_scheduled_tokens_compressed_list,
                 )
 
+                # DIAG: sync probe before _preprocess, bisecting inside prepare_input.
+                _t_sync0 = time.perf_counter()
+                torch.npu.synchronize()
+                _t_sync1 = time.perf_counter()
+                _sync_ms = (_t_sync1 - _t_sync0) * 1000.0
+                if _sync_ms > 10.0:
+                    logger.warning(
+                        "DIAG sync_before_preprocess: %.1fms (step %d, tokens=%d)",
+                        _sync_ms, self._cs_step_counter, num_scheduled_tokens,
+                    )
+
             (
                 input_ids,
                 inputs_embeds,
