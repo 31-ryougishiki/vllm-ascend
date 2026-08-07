@@ -116,6 +116,14 @@ def _maybe_pad_and_reduce_impl(x: torch.Tensor, is_ep_comm: bool = False) -> tor
         pad_size = _EXTRA_CTX.pad_size
         if pad_size > 0:
             x = F.pad(x, (0, 0, 0, pad_size))
+        # Under heterogeneous TP, pad_size may have been aligned to a
+        # different DP rank's tp_size (via per_dp_padded_lengths).
+        # Ensure the result is divisible by the LOCAL tp_size before
+        # reduce_scatter, or the communicator will assert-fail.
+        tp_size = get_tensor_model_parallel_world_size()
+        if x.shape[0] % tp_size != 0:
+            extra = tp_size - (x.shape[0] % tp_size)
+            x = F.pad(x, (0, 0, 0, extra))
         return tensor_model_parallel_reduce_scatter(x, 0)
     else:
         if enable_sp_by_pass():
