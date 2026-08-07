@@ -640,16 +640,23 @@ class TokenDispatcherWithAll2AllV(MoETokenDispatcher[MoEAllToAllCombineMetadata]
         num_global_tokens_per_expert = gather_from_sequence_parallel_region(
             num_local_tokens_per_expert, group=self.ep_group
         ).reshape(ep_size, self.num_experts)
-        num_global_tokens_per_local_expert = num_global_tokens_per_expert[
-            :, self.local_expert_indices[0] : self.local_expert_indices[-1] + 1
-        ]
-        if num_global_tokens_per_local_expert is None:
-            raise ValueError("num_global_tokens_per_local_expert must be set before sum.")
 
-        output_splits = (
-            num_global_tokens_per_local_expert.sum(axis=-1).to(torch.device("cpu"), non_blocking=True).numpy()
-        )
-        num_tokens_per_local_expert = num_global_tokens_per_local_expert.sum(axis=0)
+        # output_splits[r] = tokens routed to rank r's local experts. Use each
+        # rank's OWN expert range (do NOT slice with the current rank's
+        # local_expert_indices for every row, which is wrong when expert ranges
+        # are uneven across ranks).
+        output_splits = np.zeros(ep_size, dtype=np.int64)
+        for r in range(ep_size):
+            s = self._per_rank_expert_starts[r]
+            cnt = self._per_rank_expert_counts[r]
+            output_splits[r] = num_global_tokens_per_expert[r, s : s + cnt].sum().item()
+
+        # Local expert token counts (current rank's own experts).
+        _s = self._per_rank_expert_starts[self.ep_rank]
+        _cnt = self._per_rank_expert_counts[self.ep_rank]
+        num_tokens_per_local_expert = num_global_tokens_per_expert[
+            self.ep_rank, _s : _s + _cnt
+        ]
 
         global_input_tokens_local_experts_indices = None
         if self.num_local_experts > 1:
@@ -697,14 +704,6 @@ class TokenDispatcherWithAll2AllV(MoETokenDispatcher[MoEAllToAllCombineMetadata]
 
         assert global_input_tokens_local_experts_indices is not None, (
             "global_input_tokens_local_experts_indices must be provided"
-        )
-        print(
-            f"DISPATCH_DBG ep_rank={self.ep_rank} num_local_experts={self.num_local_experts} "
-            f"token={tuple(global_input_tokens.shape)} "
-            f"indices={tuple(global_input_tokens_local_experts_indices.shape)} "
-            f"indices_numel={global_input_tokens_local_experts_indices.numel()} "
-            f"topk_tokens={global_input_tokens_local_experts_indices.numel() if global_input_tokens.numel() > 0 else 0}",
-            flush=True,
         )
 
         if with_quant:
