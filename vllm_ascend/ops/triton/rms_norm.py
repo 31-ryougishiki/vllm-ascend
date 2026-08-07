@@ -44,6 +44,10 @@ def triton_q_rms(
     if dim > 2048:
         raise NotImplementedError("dim > 2048 not supported")
 
+    # DIAG: measure host-side time to distinguish triton JIT+load vs device stall.
+    import time as _time
+    _t_host0 = _time.perf_counter()
+
     device_properties = triton.runtime.driver.active.utils.get_device_properties(q.device)
     num_vectorcore = device_properties.get("num_vectorcore", -1)
 
@@ -63,4 +67,12 @@ def triton_q_rms(
         dim,
         BLOCK_M,
     )
+    _t_host1 = _time.perf_counter()
+    _host_ms = (_t_host1 - _t_host0) * 1000.0
+    if _host_ms > 50.0:
+        from vllm.logger import init_logger as _init_logger
+        _init_logger(__name__).warning(
+            "DIAG triton_q_rms host=%.1fms total_batch=%d dim=%d BLOCK_M=%d",
+            _host_ms, total_batch, dim, BLOCK_M,
+        )
     return norm_output.view(bs, head_num, dim)
