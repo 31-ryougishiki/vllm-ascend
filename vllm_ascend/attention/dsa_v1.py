@@ -1718,7 +1718,7 @@ class AscendDSAImpl(DSAAttentionImpl):
 
         # Process for Flash Comm V1
         # [S032] FC1 AllGather: TP-sharded → full token set — [WARMUP] inside graph capture
-        log_shape(*T.ATTN_ALLGATHER_OUT, hidden_states)
+        log_shape(T.ATTN_ALLGATHER_OUT, hidden_states)
         hidden_states = torch.ops.vllm.maybe_all_gather_and_maybe_unpad(hidden_states, need_gather_q_kv)
         prefill_hidden_states = hidden_states[decode_tokens:actual_tokens]
         decode_hidden_states = hidden_states[:decode_tokens]
@@ -1759,10 +1759,10 @@ class AscendDSAImpl(DSAAttentionImpl):
         # o
         # [S033] O-proj input — [WARMUP] inside graph capture.
         #   shape: (num_tokens, n_local_heads, head_dim)
-        log_shape(*T.O_PROJ_IN, o_proj_input)
+        log_shape(T.O_PROJ_IN, o_proj_input)
         self._forward_o_proj(o_proj_input, output)
         # [S034] O-proj output — [WARMUP] inside graph capture
-        log_shape(*T.O_PROJ_OUT, output)
+        log_shape(T.O_PROJ_OUT, output)
 
         maybe_save_kv_layer_to_connector(layer_name, list(kv_cache))
 

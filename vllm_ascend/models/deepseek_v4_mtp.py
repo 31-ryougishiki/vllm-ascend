@@ -127,11 +127,11 @@ class DeepSeekMultiTokenPredictorLayer(nn.Module):
 
         hidden_states = self.e_proj(inputs_embeds).unsqueeze(-2) + self.h_proj(previous_hidden_states)
         # [S063] MTP fused hidden states — [EAGER] always fires
-        log_shape(*T.MTP_FUSED_HS, hidden_states)
+        log_shape(T.MTP_FUSED_HS, hidden_states)
 
         hidden_states, residual = self.mtp_block(positions=positions, hidden_states=hidden_states, residual=None)
         # [S064] MTP decoder block output — [EAGER] always fires
-        log_shape(*T.MTP_BLOCK_OUT, hidden_states)
+        log_shape(T.MTP_BLOCK_OUT, hidden_states)
 
         # hidden_states = self.hc_head(hidden_states, self.hc_head_fn,
         #                              self.hc_head_scale, self.hc_head_base)
@@ -251,12 +251,12 @@ class DeepSeekV4MTP(nn.Module, SupportsPP, DeepseekV2MixtureOfExperts):
         spec_step_idx: int = 0,
     ) -> torch.Tensor:
         # [S060] MTP entry — [EAGER] always fires
-        log_shape(*T.MTP_ENTRY, hidden_states)
+        log_shape(T.MTP_ENTRY, hidden_states)
         # [S061] MTP target hidden states from target model — [EAGER] always fires
-        log_shape(*T.MTP_TARGET_HS, hidden_states)
+        log_shape(T.MTP_TARGET_HS, hidden_states)
         hidden_states = self.model(input_ids, positions, hidden_states, inputs_embeds, spec_step_idx)
         # [S062] MTP exit — [EAGER] always fires
-        log_shape(*T.MTP_EXIT, hidden_states)
+        log_shape(T.MTP_EXIT, hidden_states)
         return hidden_states
 
     def compute_logits(

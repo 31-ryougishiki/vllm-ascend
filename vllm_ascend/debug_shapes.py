@@ -69,7 +69,15 @@ def log_shape(tag: str, x, layer_idx: int | None = None,
         x: tensor or nested structure
         layer_idx: layer index (None = model-level)
         effectiveness: one of [EAGER], [WARMUP], [DEAD], [GRAPH]
+
+    Note:
+        `tag` may also be a (tag, effectiveness) tuple from Tags.* — pass it
+        positionally as the first argument (no unpacking at the call site):
+            log_shape(T.EMBED_OUTPUT, hidden_states, layer_idx=None)
     """
+    if isinstance(tag, tuple):
+        # Unpack Tags.* entries: (tag, effectiveness)
+        tag, effectiveness = tag
     if not _active(layer_idx):
         return
     if _step_counter >= _MAX_STEPS:
