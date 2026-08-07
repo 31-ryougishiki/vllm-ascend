@@ -1195,7 +1195,7 @@ class AscendDSAMetadataBuilder(AttentionMetadataBuilder[AscendDSAMetadata]):
         **kwargs,
     ) -> AscendDSAPrefillMetadata:
         tp_size = get_tensor_model_parallel_world_size()
-        n_local_heads = self.model_config.hf_config.num_attention_heads // tp_size
+        n_local_heads = _get_dsa_local_heads(self.model_config.hf_config.num_attention_heads, tp_size)
 
         reqs_start = kwargs.get("reqs_start")
         tokens_start = kwargs.get("tokens_start")
@@ -1266,7 +1266,7 @@ class AscendDSAMetadataBuilder(AttentionMetadataBuilder[AscendDSAMetadata]):
         **kwargs,
     ) -> AscendDSADecodeMetadata:
         tp_size = get_tensor_model_parallel_world_size()
-        n_local_heads = self.model_config.hf_config.num_attention_heads // tp_size
+        n_local_heads = _get_dsa_local_heads(self.model_config.hf_config.num_attention_heads, tp_size)
 
         num_decodes = kwargs.get("num_decodes")
         num_decode_tokens = kwargs.get("num_decode_tokens")
