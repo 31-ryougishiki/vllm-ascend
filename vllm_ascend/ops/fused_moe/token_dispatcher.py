@@ -660,8 +660,6 @@ class TokenDispatcherWithAll2AllV(MoETokenDispatcher[MoEAllToAllCombineMetadata]
 
         global_input_tokens_local_experts_indices = None
         if self.num_local_experts > 1:
-            if num_global_tokens_per_local_expert is None:
-                raise ValueError("num_global_tokens_per_local_expert must be set before operations.")
             # repeats per global expert in expert order. Concatenate each rank's
             # local-expert token counts (expert ranges may be uneven under
             # heterogeneous TP), so repeats length matches expert_ids_per_ep_rank.
