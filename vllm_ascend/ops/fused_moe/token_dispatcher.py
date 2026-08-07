@@ -396,7 +396,14 @@ class TokenDispatcherWithAllGather(MoETokenDispatcher[MoEAllGatherCombineMetadat
             global_num_experts = len(expert_map) + global_redundant_expert_num
             mask = expert_map[topk_ids] != -1
             topk_weights = topk_weights * mask
-            first_expert_idx = get_ep_group().rank_in_group * self.num_experts_local
+            # First global expert index of this rank under linear placement.
+            # Do NOT use `rank * num_experts_local` -- that assumes uniform
+            # per-rank expert counts, which fails when num_experts is not
+            # divisible by ep_size (e.g. 256 experts over 15 ranks).
+            _ep_rank = get_ep_group().rank_in_group
+            _base = self.num_experts // self.ep_size
+            _rem = self.num_experts % self.ep_size
+            first_expert_idx = _ep_rank * _base + min(_ep_rank, _rem)
             last_expert_idx = first_expert_idx + self.num_experts_local
         else:
             first_expert_idx = 0
@@ -648,8 +655,21 @@ class TokenDispatcherWithAll2AllV(MoETokenDispatcher[MoEAllToAllCombineMetadata]
         if self.num_local_experts > 1:
             if num_global_tokens_per_local_expert is None:
                 raise ValueError("num_global_tokens_per_local_expert must be set before operations.")
+            # repeats per global expert in expert order. Concatenate each rank's
+            # local-expert token counts (expert ranges may be uneven under
+            # heterogeneous TP), so repeats length matches expert_ids_per_ep_rank.
+            repeats = torch.cat(
+                [
+                    num_global_tokens_per_expert[
+                        r,
+                        self._per_rank_expert_starts[r] :
+                        self._per_rank_expert_starts[r] + self._per_rank_expert_counts[r],
+                    ]
+                    for r in range(ep_size)
+                ]
+            )
             global_input_tokens_local_experts_indices = torch.repeat_interleave(
-                self.expert_ids_per_ep_rank, num_global_tokens_per_local_expert.ravel()
+                self.expert_ids_per_ep_rank, repeats
             )
         else:
             torch.npu.synchronize()
