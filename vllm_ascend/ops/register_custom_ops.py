@@ -52,6 +52,12 @@ def _maybe_all_gather_and_maybe_unpad_impl(x: torch.Tensor, label: bool, is_ep_c
             if pad_size > 0:
                 x = x[:-pad_size]
         else:
+            print(
+                f"A2A_DBG pre_gather_x={tuple(x.shape)} ep_ws={get_ep_group().world_size} "
+                f"dp_ws={get_dp_group().world_size} padded_length={_EXTRA_CTX.padded_length} "
+                f"pad_size={_EXTRA_CTX.pad_size}",
+                flush=True,
+            )
             x = get_ep_group().all_gather(x, 0)
             if enable_sp_by_pass():  # TODO: do unpad
                 return x
@@ -60,9 +66,8 @@ def _maybe_all_gather_and_maybe_unpad_impl(x: torch.Tensor, label: bool, is_ep_c
             result = torch.empty((num_tokens_across_dp_cpu.sum(), *x.shape[1:]), device=x.device, dtype=x.dtype)
             dp_size = get_dp_group().world_size
             print(
-                f"A2A_DBG ep_ws={get_ep_group().world_size} dp_ws={get_dp_group().world_size} "
-                f"x_gathered={tuple(x.shape)} padded_length={_EXTRA_CTX.padded_length} "
-                f"dp_tokens={num_tokens_across_dp_cpu.tolist() if hasattr(num_tokens_across_dp_cpu, 'tolist') else num_tokens_across_dp_cpu}",
+                f"A2A_DBG x_gathered={tuple(x.shape)} dp_tokens="
+                f"{num_tokens_across_dp_cpu.tolist() if hasattr(num_tokens_across_dp_cpu, 'tolist') else num_tokens_across_dp_cpu}",
                 flush=True,
             )
             x = x.view(dp_size, _EXTRA_CTX.padded_length, *x.shape[1:])
