@@ -186,14 +186,6 @@ def set_ascend_forward_context(
                     )
                 forward_context.per_dp_padded_lengths = per_dp
                 forward_context.per_dp_tp_sizes = tp_sizes
-                logger.info(
-                    "HETERO_CTX per_dp_padded_lengths=%s tp_sizes=%s "
-                    "flash_comm=%s pad_size_will_be_set=%s num_tokens=%s",
-                    per_dp, tp_sizes,
-                    forward_context.flash_comm_v1_enabled or forward_context.flashcomm_v2_enabled,
-                    forward_context.flash_comm_v1_enabled or forward_context.flashcomm_v2_enabled,
-                    num_tokens,
-                )
                 if forward_context.flash_comm_v1_enabled or forward_context.flashcomm_v2_enabled:
                     from math import lcm
 

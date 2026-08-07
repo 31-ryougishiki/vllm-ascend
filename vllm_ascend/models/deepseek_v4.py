@@ -753,14 +753,6 @@ class DeepseekV4Attention(nn.Module):
         else:
             self.n_local_heads = config.num_attention_heads // tp_size
             self.n_local_groups = self.n_groups // tp_size
-        logger.info(
-            "ATTN_INIT_DBG prefix=%s tp_size=%d tp_rank=%d is_het=%s ratios=%s "
-            "n_local_heads=%d",
-            prefix, tp_size, tp_rank,
-            _cfg.parallel_config.is_heterogeneous_tp if _cfg is not None else None,
-            _ratios if "_ratios" in dir() else None,
-            self.n_local_heads,
-        )
         self.q_lora_rank = config.q_lora_rank
         self.o_lora_rank = config.o_lora_rank
         self.head_dim = config.head_dim

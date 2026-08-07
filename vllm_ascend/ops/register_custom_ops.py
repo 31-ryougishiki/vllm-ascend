@@ -52,12 +52,6 @@ def _maybe_all_gather_and_maybe_unpad_impl(x: torch.Tensor, label: bool, is_ep_c
             if pad_size > 0:
                 x = x[:-pad_size]
         else:
-            print(
-                f"A2A_DBG pre_gather_x={tuple(x.shape)} ep_ws={get_ep_group().world_size} "
-                f"dp_ws={get_dp_group().world_size} padded_length={_EXTRA_CTX.padded_length} "
-                f"pad_size={_EXTRA_CTX.pad_size}",
-                flush=True,
-            )
             x = get_ep_group().all_gather(x, 0)
             if enable_sp_by_pass():  # TODO: do unpad
                 return x
@@ -67,12 +61,6 @@ def _maybe_all_gather_and_maybe_unpad_impl(x: torch.Tensor, label: bool, is_ep_c
             per_dp = getattr(_EXTRA_CTX, 'per_dp_padded_lengths', None)
             if per_dp is not None:
                 dp_size = len(num_tokens_across_dp_cpu)
-                print(
-                    f"A2A_DBG x_gathered={tuple(x.shape)} dp_tokens="
-                    f"{num_tokens_across_dp_cpu.tolist() if hasattr(num_tokens_across_dp_cpu, 'tolist') else num_tokens_across_dp_cpu} "
-                    f"per_dp_padded={per_dp}",
-                    flush=True,
-                )
                 x_offset = 0
                 result_offset = 0
                 for idx in range(dp_size):
@@ -82,11 +70,6 @@ def _maybe_all_gather_and_maybe_unpad_impl(x: torch.Tensor, label: bool, is_ep_c
                     x_offset += per_dp[idx]
             else:
                 dp_size = get_dp_group().world_size
-                print(
-                    f"A2A_DBG x_gathered={tuple(x.shape)} dp_tokens="
-                    f"{num_tokens_across_dp_cpu.tolist() if hasattr(num_tokens_across_dp_cpu, 'tolist') else num_tokens_across_dp_cpu}",
-                    flush=True,
-                )
                 x = x.view(dp_size, _EXTRA_CTX.padded_length, *x.shape[1:])
                 offset = 0
                 for idx in range(dp_size):
@@ -158,13 +141,6 @@ def _maybe_pad_and_reduce_impl(x: torch.Tensor, is_ep_comm: bool = False) -> tor
                 offset += num_tokens_dp
             padded_x = padded_x.view(-1, *x.shape[1:])
 
-        print(
-            f"PAD_REDUCE_DBG hetero_path={per_dp is not None} "
-            f"padded_x_shape={tuple(padded_x.shape)} "
-            f"ep_size={get_ep_group().world_size} "
-            f"per_dp={per_dp}",
-            flush=True,
-        )
         return get_ep_group().reduce_scatter(padded_x, 0)
 
 

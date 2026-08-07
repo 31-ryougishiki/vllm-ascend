@@ -8,7 +8,11 @@ import torch.nn.functional as F
 import torch_npu
 import vllm.envs as envs_vllm
 from vllm.config import VllmConfig, get_current_vllm_config
-from vllm.distributed import get_tensor_model_parallel_world_size
+from vllm.distributed import (
+    get_tensor_model_parallel_rank,
+    get_tensor_model_parallel_world_size,
+)
+from vllm.distributed.utils import get_current_tp_sharding_ratios, get_tp_partition_size
 from vllm.forward_context import get_forward_context
 from vllm.triton_utils import HAS_TRITON
 from vllm.v1.attention.backend import AttentionBackend, AttentionCGSupport, AttentionMetadataBuilder
@@ -57,6 +61,22 @@ BUILD_METADATA_STEP_PREFILL = 0
 BUILD_METADATA_STEP_DECODE = 1
 
 _DSV4_DSA_OVERLAP_STREAM = None
+
+
+def _get_dsa_local_heads(total_num_heads: int, tp_size: int) -> int:
+    """Return the number of local attention heads for DSA metadata.
+
+    Under heterogeneous TP with asymmetric sharding ratios, the uniform
+    ``total_num_heads // tp_size`` yields the wrong value (e.g. 21 instead
+    of 32/16/16 for tp=3 with ratios [2,1,1]).  Use get_tp_partition_size
+    when ratios are set.
+    """
+    ratios = get_current_tp_sharding_ratios()
+    if ratios is not None:
+        tp_rank = get_tensor_model_parallel_rank()
+        return get_tp_partition_size(total_num_heads, tp_rank, tp_size, ratios)
+    return total_num_heads // tp_size
+
 
 
 def dsv4_dsa_overlap_stream() -> torch.npu.Stream:
@@ -736,13 +756,7 @@ class AscendDSAMetadataBuilder(AttentionMetadataBuilder[AscendDSAMetadata]):
             prefill_slot_mapping = self.slot_mapping[tokens_start : tokens_start + self.num_prefill_tokens]
 
         tp_size = get_tensor_model_parallel_world_size()
-        n_local_heads = self.model_config.hf_config.num_attention_heads // tp_size
-        print(
-            f"DSA_DBG n_local_heads={n_local_heads} "
-            f"num_attention_heads={self.model_config.hf_config.num_attention_heads} "
-            f"tp_size={tp_size} compressor_ratio={self.compressor_ratio}",
-            flush=True,
-        )
+        n_local_heads = _get_dsa_local_heads(self.model_config.hf_config.num_attention_heads, tp_size)
         index_topk = self.model_config.hf_config.index_topk
 
         cu_c4_cmp_seqlen_list = None
@@ -963,13 +977,7 @@ class AscendDSAMetadataBuilder(AttentionMetadataBuilder[AscendDSAMetadata]):
             )
 
         tp_size = get_tensor_model_parallel_world_size()
-        n_local_heads = self.model_config.hf_config.num_attention_heads // tp_size
-        print(
-            f"DSA_DBG n_local_heads={n_local_heads} "
-            f"num_attention_heads={self.model_config.hf_config.num_attention_heads} "
-            f"tp_size={tp_size} compressor_ratio={self.compressor_ratio}",
-            flush=True,
-        )
+        n_local_heads = _get_dsa_local_heads(self.model_config.hf_config.num_attention_heads, tp_size)
         index_topk = self.model_config.hf_config.index_topk
 
         assert self.decode_sas_metadata is not None

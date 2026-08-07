@@ -21,7 +21,7 @@ import torch.nn.functional as F
 from vllm.distributed import get_tp_group
 from vllm.forward_context import get_forward_context
 
-from vllm_ascend.ascend_forward_context import _EXTRA_CTX, MoECommType
+from vllm_ascend.ascend_forward_context import MoECommType
 from vllm_ascend.device.device_op import DeviceOperator
 from vllm_ascend.distributed.utils import split_tensor_along_first_dim
 from vllm_ascend.utils import get_weight_prefetch_method
@@ -271,16 +271,6 @@ def _select_experts_with_fusion_ops(
         else:
             input_ids = None
             tid2eid_ones = None
-        print(
-            f"HETERO_DBG exp_sel_fusion: tid2eid_is_none={tid2eid is None} "
-            f"router_logits_shape={tuple(router_logits.shape)} "
-            f"input_ids_shape={input_ids.shape if input_ids is not None else None} "
-            f"input_ids_numel={input_ids.numel() if input_ids is not None else 'N/A'} "
-            f"scoring_func={scoring_func} "
-            f"moe_comm_type={forward_context.moe_comm_type if tid2eid is not None else 'N/A'} "
-            f"per_dp_tp_sizes={getattr(_EXTRA_CTX, 'per_dp_tp_sizes', 'N/A')}",
-            flush=True,
-        )
         topk_weights, topk_ids, _ = torch.ops._C_ascend.moe_gating_top_k_hash(
             x=router_logits,
             k=top_k,

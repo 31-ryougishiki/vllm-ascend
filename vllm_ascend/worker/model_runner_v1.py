@@ -3773,41 +3773,6 @@ class NPUModelRunner(GPUModelRunner):
         self.model_memory_usage = m.consumed_memory
         logger.info("Loading model weights took %.4f GB", m.consumed_memory / float(2**30))
 
-        # --- temporary weight-load diagnostics ---
-        total_params = sum(p.numel() for p in self.model.parameters())
-        logger.info(
-            "MODEL_PARAMS_TOTAL numel=%d (%.2fB)",
-            total_params, total_params / 1e9,
-        )
-        # All params whose name mentions experts
-        _exp = [(n, p) for n, p in self.model.named_parameters()
-                if ".experts." in n]
-        logger.info(
-            "EXPERT_PARAMS_COUNT=%d total_numel=%d",
-            len(_exp), sum(p.numel() for _, p in _exp),
-        )
-        import re as _re
-        _layers = sorted({int(m.group(1)) for n, _ in _exp
-                          if (m := _re.search(r"layers\.(\d+)", n))})
-        logger.info("EXPERT_LAYERS=%s count=%d", _layers, len(_layers))
-        # Sample the first w13_weight norm
-        for _n, _p in _exp:
-            if "w13_weight" in _n and ".weight" not in _n:
-                logger.info(
-                    "EXPERT_W13_SAMPLE %s shape=%s norm=%.3f",
-                    _n, tuple(_p.shape), _p.norm().item(),
-                )
-                break
-        # Sample some weights
-        for _name, _p in self.model.named_parameters():
-            if "embed_tokens" in _name and "weight" in _name:
-                logger.info(
-                    "EMBED_W0 %s shape=%s device=%s norm=%.3f",
-                    _name, tuple(_p.shape), _p.device, _p.norm().item(),
-                )
-                break
-        # --- end temporary diagnostics ---
-
         from vllm.model_executor.offloader.base import get_offloader
         get_offloader().post_init()
 

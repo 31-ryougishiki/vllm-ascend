@@ -314,11 +314,6 @@ class DeepSeekV4MTP(nn.Module, SupportsPP, DeepseekV2MixtureOfExperts):
         else:
             heads_per_rank = self.config.num_attention_heads // tp_size
             head_start = tp_rank * heads_per_rank
-        logger.info(
-            "MTP_LOAD_DBG tp_size=%d tp_rank=%d heads_per_rank=%d head_start=%d",
-            tp_size, tp_rank, heads_per_rank, head_start,
-        )
-
         params_dict = dict(self.named_parameters())
         loaded_params: set[str] = set()
         for name, loaded_weight in weights:
