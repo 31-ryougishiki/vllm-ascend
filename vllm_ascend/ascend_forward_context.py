@@ -202,6 +202,7 @@ def set_ascend_forward_context(
                     padded_length = (max_tokens_across_dp + tp_world_size - 1) // tp_world_size * tp_world_size
                     forward_context.padded_length = padded_length
                     forward_context.per_dp_padded_lengths = None
+                    forward_context.per_dp_tp_sizes = None
                 forward_context.pad_size = forward_context.padded_length - num_tokens
         else:
             max_tokens_across_dp = num_tokens
