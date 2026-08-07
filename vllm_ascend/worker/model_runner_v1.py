@@ -40,7 +40,7 @@ from vllm.config import CompilationMode, CUDAGraphMode, VllmConfig, get_layers_f
 from vllm.distributed import get_tensor_model_parallel_world_size, tensor_model_parallel_all_gather
 from vllm.distributed.ec_transfer import get_ec_transfer, has_ec_transfer
 from vllm.distributed.kv_transfer import get_kv_transfer_group, has_kv_transfer_group
-from vllm.distributed.parallel_state import get_dcp_group, get_dp_group, get_pcp_group, get_pp_group, get_tp_group
+from vllm.distributed.parallel_state import get_dcp_group, get_dp_group, get_ep_group, get_pcp_group, get_pp_group, get_tp_group
 from vllm.forward_context import BatchDescriptor, ForwardContext, get_forward_context
 from vllm.logger import logger
 from vllm.model_executor.layers.attention_layer_base import AttentionLayerBase
@@ -689,18 +689,40 @@ class NPUModelRunner(GPUModelRunner):
             num_tokens_after_padding = torch.tensor([num_tokens] * self.dp_size, device="cpu", dtype=torch.int32)
             return num_tokens, num_tokens_after_padding, cudagraph_mode
 
-        # On certain devices, CPU-side all_reduce may return dirty data. 
+        # On certain devices, CPU-side all_reduce may return dirty data.
         # When dp_allreduce_on_npu is True, route DP metadata
         # synchronization through the NPU device group to avoid data corruption.
-        device_str, group = (
-            ("npu", get_dp_group().device_group)
-            if self.ascend_config.dp_allreduce_on_npu
-            else ("cpu", get_dp_group().cpu_group)
-        )
+        #
+        # Under heterogeneous TP, a DP rank's TP size may exceed min_tp, so
+        # those "orphaned" TP ranks get singleton DP groups whose all_reduce
+        # is a no-op.  Use the EP group instead (all ranks participate) and
+        # divide each slot by the DP rank's tp_size to undo the multiple
+        # contributions.
+        is_hetero = self.vllm_config.parallel_config.is_heterogeneous_tp
+        if is_hetero:
+            device_str = "npu" if self.ascend_config.dp_allreduce_on_npu else "cpu"
+            group = (
+                get_ep_group().device_group if device_str == "npu"
+                else get_ep_group().cpu_group
+            )
+        else:
+            device_str, group = (
+                ("npu", get_dp_group().device_group)
+                if self.ascend_config.dp_allreduce_on_npu
+                else ("cpu", get_dp_group().cpu_group)
+            )
         packed_tensor = torch.zeros(2, self.dp_size, device=device_str, dtype=torch.int32)
         packed_tensor[0][self.dp_rank] = num_tokens
         packed_tensor[1][self.dp_rank] = cudagraph_mode.value
         dist.all_reduce(packed_tensor, group=group)
+        if is_hetero:
+            tp_sizes = [
+                self.vllm_config.parallel_config.get_tp_size_for_dp(i)
+                for i in range(self.dp_size)
+            ]
+            for i in range(self.dp_size):
+                packed_tensor[0, i] //= tp_sizes[i]
+                packed_tensor[1, i] //= tp_sizes[i]
         if device_str == "npu":
             packed_tensor = packed_tensor.cpu()
 

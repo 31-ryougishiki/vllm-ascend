@@ -161,15 +161,37 @@ def set_ascend_forward_context(
         if num_tokens is None and attn_metadata is not None:
             num_tokens = attn_metadata.num_actual_tokens
 
-        dp_world_size = get_dp_group().world_size
-        if dp_world_size > 1 and forward_context.dp_metadata is not None:
+        # Under heterogeneous TP the DP group of an orphaned TP rank is a
+        # singleton, so get_dp_group().world_size can be 1 even though the
+        # logical DP size is > 1.  Read the true DP size from the config.
+        is_hetero = vllm_config is not None and vllm_config.parallel_config.is_heterogeneous_tp
+        true_dp_size = (
+            vllm_config.parallel_config.data_parallel_size
+            if is_hetero
+            else get_dp_group().world_size
+        )
+        if true_dp_size > 1 and forward_context.dp_metadata is not None:
             dp_meta = forward_context.dp_metadata
             max_tokens_across_dp = dp_meta.num_tokens_across_dp_cpu.max().item()
             if forward_context.flash_comm_v1_enabled or forward_context.flashcomm_v2_enabled:
-                padded_length = (max_tokens_across_dp + tp_world_size - 1) // tp_world_size * tp_world_size
-                pad_size = padded_length - num_tokens
-                forward_context.padded_length = padded_length
-                forward_context.pad_size = pad_size
+                if is_hetero:
+                    tp_sizes = [
+                        vllm_config.parallel_config.get_tp_size_for_dp(i)
+                        for i in range(true_dp_size)
+                    ]
+                    per_dp = []
+                    for i in range(true_dp_size):
+                        n = int(dp_meta.num_tokens_across_dp_cpu[i].item())
+                        per_dp.append(
+                            ((n + tp_sizes[i] - 1) // tp_sizes[i]) * tp_sizes[i]
+                        )
+                    forward_context.per_dp_padded_lengths = per_dp
+                    forward_context.padded_length = max(per_dp)
+                else:
+                    padded_length = (max_tokens_across_dp + tp_world_size - 1) // tp_world_size * tp_world_size
+                    forward_context.padded_length = padded_length
+                    forward_context.per_dp_padded_lengths = None
+                forward_context.pad_size = forward_context.padded_length - num_tokens
         else:
             max_tokens_across_dp = num_tokens
 
@@ -182,7 +204,18 @@ def set_ascend_forward_context(
             if num_actual_tokens is None:
                 num_actual_tokens = num_tokens
             # NOTE: token num which need to pad to when mc2
-            forward_context.padded_num_tokens = math.ceil(max_tokens_across_dp / tp_world_size) * tp_world_size
+            if is_hetero:
+                from math import lcm
+
+                align = lcm(
+                    *[
+                        vllm_config.parallel_config.get_tp_size_for_dp(i)
+                        for i in range(true_dp_size)
+                    ]
+                )
+            else:
+                align = tp_world_size
+            forward_context.padded_num_tokens = math.ceil(max_tokens_across_dp / align) * align
             reserved_mc2_mask = get_mc2_mask()
             if reserved_mc2_mask is not None:
                 mc2_mask = reserved_mc2_mask[: forward_context.padded_num_tokens]
@@ -405,6 +438,7 @@ class _ExtraForwardContextProxy:
         "flashcomm_v2_enabled",
         "pad_size",
         "padded_length",
+        "per_dp_padded_lengths",
         "num_tokens_across_dp",
         "mc2_mask",
         "is_draft_model",

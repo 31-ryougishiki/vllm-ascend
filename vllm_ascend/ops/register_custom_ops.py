@@ -64,18 +64,35 @@ def _maybe_all_gather_and_maybe_unpad_impl(x: torch.Tensor, label: bool, is_ep_c
             # unpad
             num_tokens_across_dp_cpu = dp_metadata.num_tokens_across_dp_cpu
             result = torch.empty((num_tokens_across_dp_cpu.sum(), *x.shape[1:]), device=x.device, dtype=x.dtype)
-            dp_size = get_dp_group().world_size
-            print(
-                f"A2A_DBG x_gathered={tuple(x.shape)} dp_tokens="
-                f"{num_tokens_across_dp_cpu.tolist() if hasattr(num_tokens_across_dp_cpu, 'tolist') else num_tokens_across_dp_cpu}",
-                flush=True,
-            )
-            x = x.view(dp_size, _EXTRA_CTX.padded_length, *x.shape[1:])
-            offset = 0
-            for idx in range(dp_size):
-                num_tokens_dp = num_tokens_across_dp_cpu[idx]
-                result[offset : offset + num_tokens_dp] = x[idx, :num_tokens_dp]
-                offset += num_tokens_dp
+            per_dp = getattr(_EXTRA_CTX, 'per_dp_padded_lengths', None)
+            if per_dp is not None:
+                dp_size = len(num_tokens_across_dp_cpu)
+                print(
+                    f"A2A_DBG x_gathered={tuple(x.shape)} dp_tokens="
+                    f"{num_tokens_across_dp_cpu.tolist() if hasattr(num_tokens_across_dp_cpu, 'tolist') else num_tokens_across_dp_cpu} "
+                    f"per_dp_padded={per_dp}",
+                    flush=True,
+                )
+                x_offset = 0
+                result_offset = 0
+                for idx in range(dp_size):
+                    n = int(num_tokens_across_dp_cpu[idx].item())
+                    result[result_offset : result_offset + n] = x[x_offset : x_offset + n]
+                    result_offset += n
+                    x_offset += per_dp[idx]
+            else:
+                dp_size = get_dp_group().world_size
+                print(
+                    f"A2A_DBG x_gathered={tuple(x.shape)} dp_tokens="
+                    f"{num_tokens_across_dp_cpu.tolist() if hasattr(num_tokens_across_dp_cpu, 'tolist') else num_tokens_across_dp_cpu}",
+                    flush=True,
+                )
+                x = x.view(dp_size, _EXTRA_CTX.padded_length, *x.shape[1:])
+                offset = 0
+                for idx in range(dp_size):
+                    num_tokens_dp = num_tokens_across_dp_cpu[idx]
+                    result[offset : offset + num_tokens_dp] = x[idx, :num_tokens_dp]
+                    offset += num_tokens_dp
             x = result
 
     return x
@@ -104,16 +121,30 @@ def _maybe_pad_and_reduce_impl(x: torch.Tensor, is_ep_comm: bool = False) -> tor
         if enable_sp_by_pass():
             return get_ep_group().reduce_scatter(x.view(-1, *x.shape[1:]), 0)
         # padding
-        dp_size = get_dp_group().world_size
         num_tokens_across_dp_cpu = get_forward_context().dp_metadata.num_tokens_across_dp_cpu
-        padded_x = torch.empty((dp_size, _EXTRA_CTX.padded_length, *x.shape[1:]), device=x.device, dtype=x.dtype)
-        offset = 0
-        for idx in range(dp_size):
-            num_tokens_dp = num_tokens_across_dp_cpu[idx]
-            padded_x[idx, :num_tokens_dp] = x[offset : offset + num_tokens_dp]
-            offset += num_tokens_dp
+        per_dp = getattr(_EXTRA_CTX, 'per_dp_padded_lengths', None)
+        if per_dp is not None:
+            dp_size = len(num_tokens_across_dp_cpu)
+            total_padded = sum(per_dp)
+            padded_x = torch.empty((total_padded, *x.shape[1:]), device=x.device, dtype=x.dtype)
+            x_offset = 0
+            padded_offset = 0
+            for idx in range(dp_size):
+                n = int(num_tokens_across_dp_cpu[idx].item())
+                padded_x[padded_offset : padded_offset + n] = x[x_offset : x_offset + n]
+                x_offset += n
+                padded_offset += per_dp[idx]
+        else:
+            dp_size = get_dp_group().world_size
+            padded_x = torch.empty((dp_size, _EXTRA_CTX.padded_length, *x.shape[1:]), device=x.device, dtype=x.dtype)
+            offset = 0
+            for idx in range(dp_size):
+                num_tokens_dp = num_tokens_across_dp_cpu[idx]
+                padded_x[idx, :num_tokens_dp] = x[offset : offset + num_tokens_dp]
+                offset += num_tokens_dp
+            padded_x = padded_x.view(-1, *x.shape[1:])
 
-        return get_ep_group().reduce_scatter(padded_x.view(-1, *x.shape[1:]), 0)
+        return get_ep_group().reduce_scatter(padded_x, 0)
 
 
 def _maybe_all_gather_and_maybe_unpad_fake(x: torch.Tensor, label: bool, is_ep_comm: bool = False) -> torch.Tensor:
