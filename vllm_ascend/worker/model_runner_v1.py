@@ -591,6 +591,12 @@ class NPUModelRunner(GPUModelRunner):
                 _cs_use_npu_timing = _cs_cfg.get(
                     "use_npu_timing", _cs_enable_timing
                 )  # default: True when timing enabled
+                # Full per-step tree is printed only when layer_0 exceeds
+                # this threshold (ms). 0 = always print (old behaviour).
+                # Keeps the log small; the compact one-liner always prints.
+                self._cs_tree_threshold_ms = float(
+                    _cs_cfg.get("tree_threshold_ms", 200.0)
+                )
 
                 self._cs_tracer = _get_cs_tracer(
                     enabled=True,
@@ -2265,11 +2271,31 @@ class NPUModelRunner(GPUModelRunner):
             return
         tracer.step_end()
 
-        # Print per-span timing for this step (rank 0 only).
+        # Compact one-line per-step summary (rank 0 only).  Keeps the log
+        # small even when every step is recorded.
         _root = tracer._root
-        if _root is not None and _root.duration_us > 0:
-            _rank0 = not dist.is_initialized() or dist.get_rank() == 0
-            if _rank0:
+        _rank0 = not dist.is_initialized() or dist.get_rank() == 0
+        if _rank0:
+            _spans = tracer.flatten_spans()
+            _g = lambda p: _spans.get(p, 0.0) / 1000.0  # noqa: E731
+            _phase = ("prefill" if _spans.get("model/layer_0/attn/prefill")
+                      else ("decode" if _spans.get("model/layer_0/attn/decode")
+                            else "-"))
+            _layer0_ms = _g("model/layer_0")
+            logger.info(
+                "CallStack step %d: tok=%d total=%.1fms fwd=%.1fms "
+                "prep=%.1fms layer0=%.1fms attn=%.1fms %s=%.1fms "
+                "q_rms_rope=%.1fms",
+                self._cs_step_counter, num_tokens,
+                _g("model_forward") + _g("prepare_input") + _g("post_process"),
+                _g("model_forward"), _g("prepare_input"),
+                _layer0_ms, _g("model/layer_0/attn"),
+                _phase, _g(f"model/layer_0/attn/{_phase}"),
+                _g(f"model/layer_0/attn/{_phase}/mla_prolog/standard/q_rms_rope"),
+            )
+            # Full tree only when layer_0 exceeds the configured threshold.
+            if (_root is not None and _root.duration_us > 0
+                    and _layer0_ms > self._cs_tree_threshold_ms):
                 _summary = _format_span_summary(_root)
                 logger.info("CallStack span timings (step %d):\n%s",
                             self._cs_step_counter, _summary)
