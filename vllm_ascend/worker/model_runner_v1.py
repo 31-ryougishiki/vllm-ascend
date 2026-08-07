@@ -2277,11 +2277,20 @@ class NPUModelRunner(GPUModelRunner):
         _rank0 = not dist.is_initialized() or dist.get_rank() == 0
         if _rank0:
             _spans = tracer.flatten_spans()
-            _g = lambda p: _spans.get(p, 0.0) / 1000.0  # noqa: E731
-            _phase = ("prefill" if _spans.get("model/layer_0/attn/prefill")
-                      else ("decode" if _spans.get("model/layer_0/attn/decode")
+            # Span paths are hierarchical (e.g.
+            # "model_forward/model/model_body/model/layer_0/model/attn/..."),
+            # so search by suffix rather than hard-coding the full prefix.
+            def _g(suffix: str) -> float:
+                for k, v in _spans.items():
+                    if k.endswith(suffix):
+                        return v / 1000.0
+                return 0.0
+            _layer0_ms = _g("/layer_0")
+            _attn_ms = _g("/layer_0/model/attn")
+            _phase = ("prefill" if _g("/layer_0/model/attn/prefill") > 0
+                      else ("decode" if _g("/layer_0/model/attn/decode") > 0
                             else "-"))
-            _layer0_ms = _g("model/layer_0")
+            _q_rms_rope_ms = _g(f"/layer_0/model/attn/{_phase}/mla_prolog/standard/q_rms_rope") if _phase != "-" else 0.0
             logger.info(
                 "CallStack step %d: tok=%d total=%.1fms fwd=%.1fms "
                 "prep=%.1fms layer0=%.1fms attn=%.1fms %s=%.1fms "
@@ -2289,9 +2298,9 @@ class NPUModelRunner(GPUModelRunner):
                 self._cs_step_counter, num_tokens,
                 _g("model_forward") + _g("prepare_input") + _g("post_process"),
                 _g("model_forward"), _g("prepare_input"),
-                _layer0_ms, _g("model/layer_0/attn"),
-                _phase, _g(f"model/layer_0/attn/{_phase}"),
-                _g(f"model/layer_0/attn/{_phase}/mla_prolog/standard/q_rms_rope"),
+                _layer0_ms, _attn_ms,
+                _phase, _g(f"/layer_0/model/attn/{_phase}") if _phase != "-" else 0.0,
+                _q_rms_rope_ms,
             )
             # Full tree only when layer_0 exceeds the configured threshold.
             if (_root is not None and _root.duration_us > 0
