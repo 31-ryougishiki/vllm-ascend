@@ -186,6 +186,7 @@ def set_ascend_forward_context(
                             ((n + tp_sizes[i] - 1) // tp_sizes[i]) * tp_sizes[i]
                         )
                     forward_context.per_dp_padded_lengths = per_dp
+                    forward_context.per_dp_tp_sizes = tp_sizes
                     forward_context.padded_length = max(per_dp)
                 else:
                     padded_length = (max_tokens_across_dp + tp_world_size - 1) // tp_world_size * tp_world_size
@@ -439,6 +440,7 @@ class _ExtraForwardContextProxy:
         "pad_size",
         "padded_length",
         "per_dp_padded_lengths",
+        "per_dp_tp_sizes",
         "num_tokens_across_dp",
         "mc2_mask",
         "is_draft_model",

@@ -503,18 +503,13 @@ class PrepareAndFinalizeWithAllGather(PrepareAndFinalize):
         )
 
     def all_gather_input_id_with_dp_group(self, input_ids: torch.Tensor) -> torch.Tensor:
-        from vllm.config import get_current_vllm_config_or_none
-
-        cfg = get_current_vllm_config_or_none()
-        is_hetero = cfg is not None and cfg.parallel_config.is_heterogeneous_tp
-        if is_hetero:
-            true_dp_size = cfg.parallel_config.data_parallel_size
-            tp_sizes = [
-                cfg.parallel_config.get_tp_size_for_dp(i)
-                for i in range(true_dp_size)
-            ]
-        else:
-            true_dp_size = self.moe_config.dp_size
+        # Detect heterogeneous TP from _EXTRA_CTX (set by
+        # ascend_forward_context), NOT from
+        # get_current_vllm_config_or_none() — the module-level global may
+        # be None in the MoE execution path.
+        tp_sizes = getattr(_EXTRA_CTX, 'per_dp_tp_sizes', None)
+        is_hetero = tp_sizes is not None
+        true_dp_size = len(tp_sizes) if is_hetero else self.moe_config.dp_size
         if true_dp_size > 1:
             max_tokens_across_dp = _EXTRA_CTX.max_tokens_across_dp
             pad_size = max_tokens_across_dp - self.num_tokens
@@ -522,14 +517,16 @@ class PrepareAndFinalizeWithAllGather(PrepareAndFinalize):
                 input_ids = nn.functional.pad(input_ids, (0, pad_size))
 
             if is_hetero:
-                # Use EP group: all TP ranks see the same input_ids within
-                # a DP rank, so each DP rank contributes tp_size copies.
-                # Take the first copy per DP rank and concatenate.
+                # All TP ranks within a DP rank hold identical input_ids.
+                # EP all_gather produces tp_size copies per DP rank.
+                # Take the first copy per DP rank.
                 all_gathered = get_ep_group().all_gather(input_ids, 0)
                 parts = []
                 offset = 0
                 for tp_i in tp_sizes:
-                    parts.append(all_gathered[offset : offset + max_tokens_across_dp])
+                    parts.append(
+                        all_gathered[offset : offset + max_tokens_across_dp]
+                    )
                     offset += tp_i * max_tokens_across_dp
                 input_ids = torch.cat(parts, dim=0)
             else:
