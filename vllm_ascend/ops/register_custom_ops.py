@@ -134,6 +134,12 @@ def _maybe_pad_and_reduce_impl(x: torch.Tensor, is_ep_comm: bool = False) -> tor
         if per_dp is not None:
             dp_size = len(num_tokens_across_dp_cpu)
             total_padded = sum(per_dp)
+            # reduce_scatter requires shape[0] % ep_size == 0.
+            # per_dp sums may not divide ep_size evenly (e.g. 18
+            # tokens across 15 EP ranks).  Round up.
+            ep_world_size = get_ep_group().world_size
+            if total_padded % ep_world_size != 0:
+                total_padded += ep_world_size - (total_padded % ep_world_size)
             padded_x = torch.empty((total_padded, *x.shape[1:]), device=x.device, dtype=x.dtype)
             x_offset = 0
             padded_offset = 0
