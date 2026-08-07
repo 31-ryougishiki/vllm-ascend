@@ -22,6 +22,7 @@ import torch.nn as nn
 import torch_npu
 from vllm.distributed.parallel_state import (
     get_dp_group,
+    get_ep_group,
     get_pcp_group,
     get_tensor_model_parallel_rank,
     get_tensor_model_parallel_world_size,
@@ -502,13 +503,37 @@ class PrepareAndFinalizeWithAllGather(PrepareAndFinalize):
         )
 
     def all_gather_input_id_with_dp_group(self, input_ids: torch.Tensor) -> torch.Tensor:
-        if self.moe_config.dp_size > 1:
+        from vllm.config import get_current_vllm_config_or_none
+
+        cfg = get_current_vllm_config_or_none()
+        is_hetero = cfg is not None and cfg.parallel_config.is_heterogeneous_tp
+        if is_hetero:
+            true_dp_size = cfg.parallel_config.data_parallel_size
+            tp_sizes = [
+                cfg.parallel_config.get_tp_size_for_dp(i)
+                for i in range(true_dp_size)
+            ]
+        else:
+            true_dp_size = self.moe_config.dp_size
+        if true_dp_size > 1:
             max_tokens_across_dp = _EXTRA_CTX.max_tokens_across_dp
             pad_size = max_tokens_across_dp - self.num_tokens
             if pad_size > 0:
                 input_ids = nn.functional.pad(input_ids, (0, pad_size))
 
-            input_ids = self.moe_config.dp_group.all_gather(input_ids, 0)
+            if is_hetero:
+                # Use EP group: all TP ranks see the same input_ids within
+                # a DP rank, so each DP rank contributes tp_size copies.
+                # Take the first copy per DP rank and concatenate.
+                all_gathered = get_ep_group().all_gather(input_ids, 0)
+                parts = []
+                offset = 0
+                for tp_i in tp_sizes:
+                    parts.append(all_gathered[offset : offset + max_tokens_across_dp])
+                    offset += tp_i * max_tokens_across_dp
+                input_ids = torch.cat(parts, dim=0)
+            else:
+                input_ids = self.moe_config.dp_group.all_gather(input_ids, 0)
         return input_ids
 
     def finalize(
