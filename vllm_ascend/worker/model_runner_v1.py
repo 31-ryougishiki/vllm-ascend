@@ -1941,6 +1941,18 @@ class NPUModelRunner(GPUModelRunner):
                 )
 
                 num_tokens_unpadded = scheduler_output.total_num_scheduled_tokens
+
+                # DIAG: sync probe after _prepare_inputs, bisecting inside prepare_input.
+                _t_sync0 = time.perf_counter()
+                torch.npu.synchronize()
+                _t_sync1 = time.perf_counter()
+                _sync_ms = (_t_sync1 - _t_sync0) * 1000.0
+                if _sync_ms > 10.0:
+                    logger.warning(
+                        "DIAG sync_after_prepare_inputs: %.1fms (step %d, tokens=%d)",
+                        _sync_ms, self._cs_step_counter, num_scheduled_tokens,
+                    )
+
                 if self.pcp_size > 1:
                     num_tokens_unpadded = self.pcp_manager.total_num_sampled_tokens_pcp
                 cascade_attn_prefix_lens = None
@@ -2099,17 +2111,6 @@ class NPUModelRunner(GPUModelRunner):
             # update global cos, sin
             update_cos_sin(positions)
 
-        # DIAG: sync probe right after prepare_input span exits.
-        # Tests whether the 2s trigger fires inside prepare_input or after it.
-        _t_sync0 = time.perf_counter()
-        torch.npu.synchronize()
-        _t_sync1 = time.perf_counter()
-        _sync_ms = (_t_sync1 - _t_sync0) * 1000.0
-        if _sync_ms > 10.0:
-            logger.warning(
-                "DIAG sync_after_prepare_input: %.1fms (step %d, tokens=%d)",
-                _sync_ms, self._cs_step_counter, num_scheduled_tokens,
-            )
         if self.dynamic_eplb:
             with record_function_or_nullcontext("EPLB weight D2D"):
                 self.eplb_updator.forward_before()
