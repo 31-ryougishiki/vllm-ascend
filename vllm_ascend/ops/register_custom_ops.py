@@ -59,6 +59,12 @@ def _maybe_all_gather_and_maybe_unpad_impl(x: torch.Tensor, label: bool, is_ep_c
             num_tokens_across_dp_cpu = dp_metadata.num_tokens_across_dp_cpu
             result = torch.empty((num_tokens_across_dp_cpu.sum(), *x.shape[1:]), device=x.device, dtype=x.dtype)
             dp_size = get_dp_group().world_size
+            print(
+                f"A2A_DBG ep_ws={get_ep_group().world_size} dp_ws={get_dp_group().world_size} "
+                f"x_gathered={tuple(x.shape)} padded_length={_EXTRA_CTX.padded_length} "
+                f"dp_tokens={num_tokens_across_dp_cpu.tolist() if hasattr(num_tokens_across_dp_cpu, 'tolist') else num_tokens_across_dp_cpu}",
+                flush=True,
+            )
             x = x.view(dp_size, _EXTRA_CTX.padded_length, *x.shape[1:])
             offset = 0
             for idx in range(dp_size):
