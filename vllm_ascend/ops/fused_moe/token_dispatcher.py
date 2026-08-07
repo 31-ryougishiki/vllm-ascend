@@ -698,6 +698,14 @@ class TokenDispatcherWithAll2AllV(MoETokenDispatcher[MoEAllToAllCombineMetadata]
         assert global_input_tokens_local_experts_indices is not None, (
             "global_input_tokens_local_experts_indices must be provided"
         )
+        print(
+            f"DISPATCH_DBG ep_rank={self.ep_rank} num_local_experts={self.num_local_experts} "
+            f"token={tuple(global_input_tokens.shape)} "
+            f"indices={tuple(global_input_tokens_local_experts_indices.shape)} "
+            f"indices_numel={global_input_tokens_local_experts_indices.numel()} "
+            f"topk_tokens={global_input_tokens_local_experts_indices.numel() if global_input_tokens.numel() > 0 else 0}",
+            flush=True,
+        )
 
         if with_quant:
             if scale_type == torch.float8_e8m0fnu:
