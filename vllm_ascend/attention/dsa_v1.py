@@ -47,6 +47,10 @@ from vllm_ascend.utils import (
 )
 from vllm_ascend.worker.npu_input_batch import NPUInputBatch
 
+from vllm.logger import init_logger
+logger = init_logger("vllm_ascend.attention.dsa_v1")
+from vllm_ascend.debug_shapes import log_shape, Tags as T
+
 if TYPE_CHECKING:
     from vllm.v1.core.sched.output import SchedulerOutput
 
@@ -1713,6 +1717,8 @@ class AscendDSAImpl(DSAAttentionImpl):
         actual_tokens = attn_metadata[0].num_actual_tokens
 
         # Process for Flash Comm V1
+        # [S032] FC1 AllGather: TP-sharded → full token set — [WARMUP] inside graph capture
+        log_shape(*T.ATTN_ALLGATHER_OUT, hidden_states)
         hidden_states = torch.ops.vllm.maybe_all_gather_and_maybe_unpad(hidden_states, need_gather_q_kv)
         prefill_hidden_states = hidden_states[decode_tokens:actual_tokens]
         decode_hidden_states = hidden_states[:decode_tokens]
@@ -1751,7 +1757,12 @@ class AscendDSAImpl(DSAAttentionImpl):
         )
 
         # o
+        # [S033] O-proj input — [WARMUP] inside graph capture.
+        #   shape: (num_tokens, n_local_heads, head_dim)
+        log_shape(*T.O_PROJ_IN, o_proj_input)
         self._forward_o_proj(o_proj_input, output)
+        # [S034] O-proj output — [WARMUP] inside graph capture
+        log_shape(*T.O_PROJ_OUT, output)
 
         maybe_save_kv_layer_to_connector(layer_name, list(kv_cache))
 
@@ -1861,6 +1872,8 @@ class AscendDSAImpl(DSAAttentionImpl):
         kv_cache: tuple[torch.Tensor, ...],
         attn_metadata: DSAMetadataList,
     ):
+        # [S036] Prefill DSA entry — [WARMUP] inside graph capture
+        log_shape("dsa_prefill_entry", hidden_states, effectiveness="[WARMUP]")
         compress_common_attn_metadata = None
         (compress_kv_cache, swa_kv_cache, state_cache, indexer_k_cache, indexer_scale_cache, indexer_full_cache) = (
             DeviceOperator.unpack_dsa_forward_kv_cache(kv_cache, self.compress_ratio)
@@ -2167,6 +2180,9 @@ class AscendDSAImpl(DSAAttentionImpl):
         kv_cache: tuple[torch.Tensor, ...],
         attn_metadata: DSAMetadataList,
     ):
+        # [S035] Decode DSA entry — [WARMUP] inside graph capture.
+        #   NOTE: internal Q/KV shapes are inside multistream prolog and custom ops.
+        log_shape("dsa_decode_entry", hidden_states, effectiveness="[WARMUP]")
         assert attn_metadata[0].decode is not None
         compress_common_attn_metadata = None
 

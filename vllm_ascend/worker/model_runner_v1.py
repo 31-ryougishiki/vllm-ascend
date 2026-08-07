@@ -103,6 +103,7 @@ from vllm.v1.worker.utils import AttentionGroup, select_common_block_size
 
 # yapf: enable
 from vllm_ascend.ascend_config import get_ascend_config
+from vllm_ascend.debug_shapes import step_begin
 from vllm_ascend.attention.attention_v1 import AscendAttentionBackend, AscendAttentionState
 from vllm_ascend.attention.context_parallel.dsa_cp import AscendDSACPMetadataBuilder
 from vllm_ascend.attention.context_parallel.sfa_cp import AscendSFADCPMetadataBuilder
@@ -1921,6 +1922,8 @@ class NPUModelRunner(GPUModelRunner):
         scheduler_output: "SchedulerOutput",
         intermediate_tensors: IntermediateTensors | None = None,
     ) -> ModelRunnerOutput | IntermediateTensors | None:
+        # [S000] Step counter + boundary — [EAGER] always fires
+        step_begin()
         if self.vllm_config.model_config.enable_return_routed_experts:
             if self.routed_experts_initialized:
                 self.routed_experts_capturer.clear_buffer()

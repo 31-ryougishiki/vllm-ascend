@@ -27,6 +27,7 @@ from vllm_ascend.ascend_config import get_ascend_config
 from vllm_ascend.utils import enable_dsa_cp, vllm_version_is
 
 logger = init_logger(__name__)
+from vllm_ascend.debug_shapes import log_shape, log_weight, Tags as T
 
 if not vllm_version_is("0.23.0"):
     from vllm.model_executor.layers.fused_moe import fused_moe_make_expert_params_mapping
@@ -125,8 +126,12 @@ class DeepSeekMultiTokenPredictorLayer(nn.Module):
         previous_hidden_states = self.hnorm(previous_hidden_states)
 
         hidden_states = self.e_proj(inputs_embeds).unsqueeze(-2) + self.h_proj(previous_hidden_states)
+        # [S063] MTP fused hidden states — [EAGER] always fires
+        log_shape(*T.MTP_FUSED_HS, hidden_states)
 
         hidden_states, residual = self.mtp_block(positions=positions, hidden_states=hidden_states, residual=None)
+        # [S064] MTP decoder block output — [EAGER] always fires
+        log_shape(*T.MTP_BLOCK_OUT, hidden_states)
 
         # hidden_states = self.hc_head(hidden_states, self.hc_head_fn,
         #                              self.hc_head_scale, self.hc_head_base)
@@ -245,7 +250,13 @@ class DeepSeekV4MTP(nn.Module, SupportsPP, DeepseekV2MixtureOfExperts):
         inputs_embeds: torch.Tensor | None = None,
         spec_step_idx: int = 0,
     ) -> torch.Tensor:
+        # [S060] MTP entry — [EAGER] always fires
+        log_shape(*T.MTP_ENTRY, hidden_states)
+        # [S061] MTP target hidden states from target model — [EAGER] always fires
+        log_shape(*T.MTP_TARGET_HS, hidden_states)
         hidden_states = self.model(input_ids, positions, hidden_states, inputs_embeds, spec_step_idx)
+        # [S062] MTP exit — [EAGER] always fires
+        log_shape(*T.MTP_EXIT, hidden_states)
         return hidden_states
 
     def compute_logits(
@@ -317,6 +328,8 @@ class DeepSeekV4MTP(nn.Module, SupportsPP, DeepseekV2MixtureOfExperts):
         params_dict = dict(self.named_parameters())
         loaded_params: set[str] = set()
         for name, loaded_weight in weights:
+            # [W050] MTP weight shape — always fires during model loading
+            log_weight(name, loaded_weight)
             if "rotary_emb.inv_freq" in name:
                 continue
 

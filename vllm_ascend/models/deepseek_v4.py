@@ -78,6 +78,7 @@ from vllm_ascend.ascend_config import get_ascend_config
 from vllm_ascend.core.kv_cache_interface import AscendSlidingWindowMLASpec
 
 logger = init_logger(__name__)
+from vllm_ascend.debug_shapes import log_shape, log_weight, log_weights_summary, step_begin, step_end, Tags as T
 from vllm_ascend.ops.dsa import AscendDeepseekSparseAttention, DSAModules
 from vllm_ascend.ops.rope_dsv4 import ComplexExpRotaryEmbedding
 from vllm_ascend.ops.triton.mul_add import muls_add_triton
@@ -462,23 +463,28 @@ class DeepseekV4MoE(nn.Module):
         )
 
     def forward(self, hidden_states: torch.Tensor, input_ids=None) -> torch.Tensor:
+        # [S040] MoE entry — [EAGER] always fires
+        log_shape(*T.MOE_ENTRY, hidden_states, layer_idx=self.layer_idx)
         num_tokens, hidden_dim = hidden_states.shape
         hidden_states = hidden_states.view(-1, hidden_dim)
 
         # Chunk the hidden states so they aren't replicated across TP ranks.
-        # This avoids duplicate computation in self.experts.
-        # TODO: We can replace the all_reduce at the end of attn with a
-        # reduce_scatter instead of chunking here.
         if self.is_sequence_parallel:
             hidden_states = sequence_parallel_chunk(hidden_states)
 
         if self.experts.is_internal_router:
             # In this case, the gate/router runs inside the FusedMoE class
+            # [S041] Router is internal — [DEAD] inside FusedMoE, cannot see router_logits
             fused_moe_out = self.experts(hidden_states=hidden_states, router_logits=hidden_states)
         else:
             # router_logits: (num_tokens, n_experts)
             router_logits = F.linear(hidden_states.float(), self.gate.weight)
+            # [S042] Router logits — [EAGER] always fires
+            log_shape(*T.ROUTER_LOGITS, router_logits, layer_idx=self.layer_idx)
             fused_moe_out = self.experts(hidden_states=hidden_states, router_logits=router_logits)
+            # NOTE: [S043]-[S048] Dispatch, GMM1, SwiGLU, GMM2, Combine are inside
+            #   FusedMoE → torch.ops._C_ascend.* → [DEAD] in Python.
+            #   Use torch.npu.profiler for internal shapes.
 
         fused_moe_out_is_tuple = isinstance(fused_moe_out, tuple)
         if fused_moe_out_is_tuple:
@@ -504,12 +510,15 @@ class DeepseekV4MoE(nn.Module):
             final_hidden_states = fused_moe_out
 
         if self.is_sequence_parallel:
+            # [S049] MoE TP AllGather — [EAGER] always fires
             final_hidden_states = tensor_model_parallel_all_gather(final_hidden_states, 0)
             final_hidden_states = final_hidden_states[:num_tokens]
+            log_shape(*T.MOE_ALLGATHER_OUT, final_hidden_states, layer_idx=self.layer_idx)
         elif self.tp_size > 1 and fused_moe_out_is_tuple:
-            # Legacy tuple outputs are reduced here. Tensor outputs from the
-            # upstream MoERunner have already gone through its final reduction.
+            # Legacy tuple outputs are reduced here.
             final_hidden_states = self.experts.maybe_all_reduce_tensor_model_parallel(final_hidden_states)
+        # [S050] MoE exit — [EAGER] always fires
+        log_shape(*T.MOE_EXIT, final_hidden_states, layer_idx=self.layer_idx)
 
         return final_hidden_states.view(-1, hidden_dim)
 
@@ -931,7 +940,13 @@ class DeepseekV4Attention(nn.Module):
         hidden_states: torch.Tensor,
         llama_4_scaling: torch.Tensor | None,
     ) -> torch.Tensor:
-        return self.dsa_attn(positions, hidden_states, llama_4_scaling)
+        # [S030] Attention entry — [EAGER] always fires.
+        #   NOTE: internal Q/KV/O shapes are logged in dsa_v1.py
+        log_shape(*T.ATTN_ENTRY, hidden_states)
+        result = self.dsa_attn(positions, hidden_states, llama_4_scaling)
+        # [S031] Attention exit — [EAGER] always fires
+        log_shape(*T.ATTN_EXIT, result)
+        return result
 
 
 class DeepseekV2DecoderLayer(nn.Module):
@@ -1012,17 +1027,45 @@ class DeepseekV2DecoderLayer(nn.Module):
         residual: torch.Tensor | None,
         llama_4_scaling: torch.Tensor | None = None,
     ) -> torch.Tensor:
+        # ── Attention sub-layer ──
         residual = hidden_states.clone()
+        # [S010] hc_pre input (attn) — [EAGER] always fires
+        log_shape(*T.HC_PRE_CUSTOM_IN, hidden_states, layer_idx=self.layer_idx)
         hidden_states, post, comb = self.hc_pre(hidden_states, self.hc_attn_fn, self.hc_attn_scale, self.hc_attn_base)
+        # [S011] After hc_pre (attn), before layernorm — [EAGER] always fires.
+        #   npu_hc_pre_v2 inside fuses hc_mult copies → (N, 4096)
+        log_shape(*T.HC_PRE_ATTN_OUT, hidden_states, layer_idx=self.layer_idx)
         hidden_states = self.input_layernorm(hidden_states)
+        # [S012] After input_layernorm — [EAGER] always fires
+        log_shape(*T.INPUT_LAYERNORM_OUT, hidden_states, layer_idx=self.layer_idx)
         attn_kwargs = {"positions": positions, "hidden_states": hidden_states, "llama_4_scaling": llama_4_scaling}
         hidden_states = self.self_attn(**attn_kwargs)
+        # [S013] After self_attn (DSA) — [EAGER] always fires
+        log_shape(*T.ATTN_OUT, hidden_states, layer_idx=self.layer_idx)
+        # [S014] hc_post input (attn) — [EAGER] always fires
+        log_shape(*T.HC_POST_CUSTOM_IN, hidden_states, layer_idx=self.layer_idx)
         hidden_states = self.hc_post(hidden_states, residual, post, comb)
+        # [S015] After hc_post (attn), back to hc_mult — [EAGER] always fires
+        log_shape(*T.HC_POST_ATTN_OUT, hidden_states, layer_idx=self.layer_idx)
+
+        # ── FFN / MoE sub-layer ──
         residual = hidden_states.clone()
+        # [S016] hc_pre input (ffn) — [EAGER] always fires
+        log_shape(*T.HC_PRE_CUSTOM_IN, hidden_states, layer_idx=self.layer_idx)
         hidden_states, post, comb = self.hc_pre(hidden_states, self.hc_ffn_fn, self.hc_ffn_scale, self.hc_ffn_base)
+        # [S017] After hc_pre (ffn) — [EAGER] always fires
+        log_shape(*T.HC_PRE_FFN_OUT, hidden_states, layer_idx=self.layer_idx)
         hidden_states = self.post_attention_layernorm(hidden_states)
+        # [S018] After post_attention_layernorm — [EAGER] always fires
+        log_shape(*T.POST_ATTN_LAYERNORM_OUT, hidden_states, layer_idx=self.layer_idx)
         hidden_states = self.mlp(hidden_states)
+        # [S019] After mlp (MoE) — [EAGER] always fires
+        log_shape(*T.MLP_OUT, hidden_states, layer_idx=self.layer_idx)
+        # [S020] hc_post input (ffn) — [EAGER] always fires
+        log_shape(*T.HC_POST_CUSTOM_IN, hidden_states, layer_idx=self.layer_idx)
         hidden_states = self.hc_post(hidden_states, residual, post, comb)
+        # [S021] After hc_post (ffn), final layer output — [EAGER] always fires
+        log_shape(*T.HC_POST_FFN_OUT, hidden_states, layer_idx=self.layer_idx)
 
         return hidden_states, residual
 
@@ -1136,6 +1179,8 @@ class DeepseekV4Model(nn.Module):
                 hidden_states = inputs_embeds
             else:
                 hidden_states = self.embed_input_ids(input_ids)
+            # [S001] Embedding output — [EAGER] always fires
+            log_shape(*T.EMBED_OUTPUT, hidden_states)
             residual = None
         else:
             assert intermediate_tensors is not None
@@ -1156,8 +1201,15 @@ class DeepseekV4Model(nn.Module):
 
         if get_pp_group().is_first_rank:
             hidden_states = hidden_states.unsqueeze(1).repeat(1, self.hc_mult, 1)  # (b, s, h) -> (b, s, c, h)
+            # [S002] After HC expand — [EAGER] always fires
+            log_shape(*T.HC_EXPAND, hidden_states)
         for layer in islice(self.layers, self.start_layer, self.end_layer):
+            layer_idx = layer.layer_idx
+            # [S003] Per-layer input — [EAGER] always fires
+            log_shape(*T.LAYER_IN, hidden_states, layer_idx=layer_idx)
             hidden_states, residual = layer(positions, hidden_states, residual, llama_4_scaling)
+            # [S004] Per-layer output — [EAGER] always fires
+            log_shape(*T.LAYER_OUT, hidden_states, layer_idx=layer_idx)
 
         # Stash pre-hc_head residual for the MTP draft (captured copy_).
         # When FlashComm1 (sequence parallelism) is enabled, tokens are
@@ -1187,9 +1239,15 @@ class DeepseekV4Model(nn.Module):
                 }
             )
 
+        # [S005] Before HC head — [EAGER] always fires
+        log_shape(*T.HC_HEAD_IN, hidden_states)
         hidden_states = self.hc_head(hidden_states, self.hc_head_fn, self.hc_head_scale, self.hc_head_base)
+        # [S006] After HC head — [EAGER] always fires
+        log_shape(*T.HC_HEAD_OUT, hidden_states)
 
         hidden_states = self.norm(hidden_states)
+        # [S007] After final norm — [EAGER] always fires
+        log_shape(*T.FINAL_NORM_OUT, hidden_states)
         return hidden_states
 
 
@@ -1398,6 +1456,8 @@ class AscendDeepseekV4ForCausalLM(nn.Module, SupportsPP, DeepseekV2MixtureOfExpe
             head_start = tp_rank * heads_per_rank
 
         for name, loaded_weight in weights:
+            # [W001] Weight shape — always fires during model loading
+            log_weight(name, loaded_weight)
             spec_layer = get_spec_layer_idx_from_weight_name(self.config, name)
             if spec_layer is not None:
                 continue  # skip spec decode layers for main model
