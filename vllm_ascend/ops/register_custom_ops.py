@@ -152,6 +152,13 @@ def _maybe_pad_and_reduce_impl(x: torch.Tensor, is_ep_comm: bool = False) -> tor
                 offset += num_tokens_dp
             padded_x = padded_x.view(-1, *x.shape[1:])
 
+        print(
+            f"PAD_REDUCE_DBG hetero_path={per_dp is not None} "
+            f"padded_x_shape={tuple(padded_x.shape)} "
+            f"ep_size={get_ep_group().world_size} "
+            f"per_dp={per_dp}",
+            flush=True,
+        )
         return get_ep_group().reduce_scatter(padded_x, 0)
 
 

@@ -173,24 +173,28 @@ def set_ascend_forward_context(
         if true_dp_size > 1 and forward_context.dp_metadata is not None:
             dp_meta = forward_context.dp_metadata
             max_tokens_across_dp = dp_meta.num_tokens_across_dp_cpu.max().item()
-            if forward_context.flash_comm_v1_enabled or forward_context.flashcomm_v2_enabled:
-                if is_hetero:
-                    tp_sizes = [
-                        vllm_config.parallel_config.get_tp_size_for_dp(i)
-                        for i in range(true_dp_size)
-                    ]
-                    per_dp = []
-                    for i in range(true_dp_size):
-                        n = int(dp_meta.num_tokens_across_dp_cpu[i].item())
-                        per_dp.append(
-                            ((n + tp_sizes[i] - 1) // tp_sizes[i]) * tp_sizes[i]
-                        )
-                    forward_context.per_dp_padded_lengths = per_dp
-                    forward_context.per_dp_tp_sizes = tp_sizes
-                    # Align padded_length to the LCM of all per-DP TP
-                    # sizes so that: (a) tensor_model_parallel_reduce_scatter
-                    # passes its shape[0] % tp_size == 0 assertion on every
-                    # rank, and (b) all ranks share a uniform padded_length.
+            if is_hetero:
+                tp_sizes = [
+                    vllm_config.parallel_config.get_tp_size_for_dp(i)
+                    for i in range(true_dp_size)
+                ]
+                per_dp = []
+                for i in range(true_dp_size):
+                    n = int(dp_meta.num_tokens_across_dp_cpu[i].item())
+                    per_dp.append(
+                        ((n + tp_sizes[i] - 1) // tp_sizes[i]) * tp_sizes[i]
+                    )
+                forward_context.per_dp_padded_lengths = per_dp
+                forward_context.per_dp_tp_sizes = tp_sizes
+                logger.info(
+                    "HETERO_CTX per_dp_padded_lengths=%s tp_sizes=%s "
+                    "flash_comm=%s pad_size_will_be_set=%s num_tokens=%s",
+                    per_dp, tp_sizes,
+                    forward_context.flash_comm_v1_enabled or forward_context.flashcomm_v2_enabled,
+                    forward_context.flash_comm_v1_enabled or forward_context.flashcomm_v2_enabled,
+                    num_tokens,
+                )
+                if forward_context.flash_comm_v1_enabled or forward_context.flashcomm_v2_enabled:
                     from math import lcm
 
                     _pl = max(per_dp)
@@ -198,12 +202,14 @@ def set_ascend_forward_context(
                     if _pl % _align != 0:
                         _pl += _align - (_pl % _align)
                     forward_context.padded_length = _pl
-                else:
+                    forward_context.pad_size = forward_context.padded_length - num_tokens
+            else:
+                forward_context.per_dp_padded_lengths = None
+                forward_context.per_dp_tp_sizes = None
+                if forward_context.flash_comm_v1_enabled or forward_context.flashcomm_v2_enabled:
                     padded_length = (max_tokens_across_dp + tp_world_size - 1) // tp_world_size * tp_world_size
                     forward_context.padded_length = padded_length
-                    forward_context.per_dp_padded_lengths = None
-                    forward_context.per_dp_tp_sizes = None
-                forward_context.pad_size = forward_context.padded_length - num_tokens
+                    forward_context.pad_size = forward_context.padded_length - num_tokens
         else:
             max_tokens_across_dp = num_tokens
 

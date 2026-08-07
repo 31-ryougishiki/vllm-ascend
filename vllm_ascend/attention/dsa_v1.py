@@ -737,6 +737,12 @@ class AscendDSAMetadataBuilder(AttentionMetadataBuilder[AscendDSAMetadata]):
 
         tp_size = get_tensor_model_parallel_world_size()
         n_local_heads = self.model_config.hf_config.num_attention_heads // tp_size
+        print(
+            f"DSA_DBG n_local_heads={n_local_heads} "
+            f"num_attention_heads={self.model_config.hf_config.num_attention_heads} "
+            f"tp_size={tp_size} compressor_ratio={self.compressor_ratio}",
+            flush=True,
+        )
         index_topk = self.model_config.hf_config.index_topk
 
         cu_c4_cmp_seqlen_list = None
@@ -958,6 +964,12 @@ class AscendDSAMetadataBuilder(AttentionMetadataBuilder[AscendDSAMetadata]):
 
         tp_size = get_tensor_model_parallel_world_size()
         n_local_heads = self.model_config.hf_config.num_attention_heads // tp_size
+        print(
+            f"DSA_DBG n_local_heads={n_local_heads} "
+            f"num_attention_heads={self.model_config.hf_config.num_attention_heads} "
+            f"tp_size={tp_size} compressor_ratio={self.compressor_ratio}",
+            flush=True,
+        )
         index_topk = self.model_config.hf_config.index_topk
 
         assert self.decode_sas_metadata is not None
