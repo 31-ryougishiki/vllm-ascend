@@ -67,7 +67,10 @@ def _maybe_all_gather_and_maybe_unpad_impl(x: torch.Tensor, label: bool, is_ep_c
                     for i in range(len(tp_sizes))
                 )
                 if x.shape[0] < uniform_rank:
-                    x = F.pad(x, (0, 0, 0, uniform_rank - x.shape[0]))
+                    # Pad only dim 0 (token dim); tensors here may be 1-D
+                    # (e.g. pertoken_scale) or 2-D+ (hidden states).
+                    pad = uniform_rank - x.shape[0]
+                    x = F.pad(x, (0, 0) * (x.dim() - 1) + (0, pad))
                 x = get_ep_group().all_gather(x, 0)
                 if enable_sp_by_pass():  # TODO: do unpad
                     return x
