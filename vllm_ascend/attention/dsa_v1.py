@@ -1971,6 +1971,11 @@ class AscendDSAImpl(DSAAttentionImpl):
 
             _hd_dir = get_hetero_dump_dir()
             _hd_dumped = getattr(self, "_op_input_dumped", False)
+            if _hd_dir and not _hd_dumped:
+                import os as _hdos
+
+                # The all-gathered, prefill-sliced hidden states (input to wq_a).
+                torch.save(hidden_states.detach().cpu(), _hdos.path.join(_hd_dir, "attn_hidden_in.pt"))
             notify_kv_cache_written(layer_name)
             record_attention_compute_start()
             _op_out = attn_op(
