@@ -21,7 +21,7 @@ import torch.nn.functional as F
 from vllm.distributed import get_tp_group
 from vllm.forward_context import get_forward_context
 
-from vllm_ascend.ascend_forward_context import MoECommType
+from vllm_ascend.ascend_forward_context import MoECommType, _EXTRA_CTX
 from vllm_ascend.device.device_op import DeviceOperator
 from vllm_ascend.distributed.utils import split_tensor_along_first_dim
 from vllm_ascend.utils import get_weight_prefetch_method
@@ -265,11 +265,15 @@ def _select_experts_with_fusion_ops(
                 # Process for Flash Comm V1
                 tp_size = get_tp_group().world_size
                 tp_rank = get_tp_group().rank_in_group
-                # Under heterogeneous TP, num_tokens may not be divisible by
-                # tp_size. Pad to a multiple first, then split evenly -- the
-                # same convention as sequence_parallel_chunk, so the per-rank
-                # input_ids stay aligned with the per-rank router_logits.
-                if input_ids.shape[0] % tp_size != 0:
+                # The per-rank router_logits are aligned to padded_num_tokens
+                # (LCM of all DP-rank TP sizes), which can exceed the raw
+                # input_ids length under heterogeneous TP (e.g. 1425 -> 1428,
+                # giving 476 rows/rank at tp=3). Pad input_ids to that same
+                # target so the split stays aligned, then split evenly.
+                target = getattr(_EXTRA_CTX, "padded_num_tokens", None)
+                if target is not None and input_ids.shape[0] < target:
+                    input_ids = F.pad(input_ids, (0, target - input_ids.shape[0]))
+                elif input_ids.shape[0] % tp_size != 0:
                     pad_len = tp_size - (input_ids.shape[0] % tp_size)
                     input_ids = F.pad(input_ids, (0, pad_len))
                 chunk = input_ids.shape[0] // tp_size
