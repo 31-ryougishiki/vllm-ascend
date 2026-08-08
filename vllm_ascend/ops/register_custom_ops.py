@@ -52,30 +52,56 @@ def _maybe_all_gather_and_maybe_unpad_impl(x: torch.Tensor, label: bool, is_ep_c
             if pad_size > 0:
                 x = x[:-pad_size]
         else:
+            num_tokens_across_dp_cpu = dp_metadata.num_tokens_across_dp_cpu
+            per_dp = getattr(_EXTRA_CTX, 'per_dp_padded_lengths', None)
+            tp_sizes = getattr(_EXTRA_CTX, 'per_dp_tp_sizes', None)
+            if per_dp is not None and tp_sizes is not None:
+                # Heterogeneous TP: after sequence_parallel_chunk each DP rank
+                # holds ceil(N_dp / tp_dp) tokens, which differs across DP
+                # groups. The EP all_gather requires every rank to contribute
+                # the SAME number of rows, so pad each rank to a uniform
+                # per-rank size first, then unpad rank-by-rank (the homogeneous
+                # code walks per-DP strides over a uniform layout).
+                uniform_rank = max(
+                    (per_dp[i] + tp_sizes[i] - 1) // tp_sizes[i]
+                    for i in range(len(tp_sizes))
+                )
+                if x.shape[0] < uniform_rank:
+                    x = F.pad(x, (0, 0, 0, uniform_rank - x.shape[0]))
+                x = get_ep_group().all_gather(x, 0)
+                if enable_sp_by_pass():  # TODO: do unpad
+                    return x
+                result = torch.empty(
+                    (num_tokens_across_dp_cpu.sum(), *x.shape[1:]),
+                    device=x.device,
+                    dtype=x.dtype,
+                )
+                result_offset = 0
+                x_offset = 0
+                for i in range(len(tp_sizes)):
+                    actual_i = int(num_tokens_across_dp_cpu[i].item())
+                    chunk = per_dp[i] // tp_sizes[i]
+                    for r in range(tp_sizes[i]):
+                        start = r * chunk
+                        if start >= actual_i:
+                            break
+                        n = min(chunk, actual_i - start)
+                        result[result_offset : result_offset + n] = x[x_offset : x_offset + n]
+                        result_offset += n
+                        x_offset += uniform_rank
+                return result
             x = get_ep_group().all_gather(x, 0)
             if enable_sp_by_pass():  # TODO: do unpad
                 return x
             # unpad
-            num_tokens_across_dp_cpu = dp_metadata.num_tokens_across_dp_cpu
             result = torch.empty((num_tokens_across_dp_cpu.sum(), *x.shape[1:]), device=x.device, dtype=x.dtype)
-            per_dp = getattr(_EXTRA_CTX, 'per_dp_padded_lengths', None)
-            if per_dp is not None:
-                dp_size = len(num_tokens_across_dp_cpu)
-                x_offset = 0
-                result_offset = 0
-                for idx in range(dp_size):
-                    n = int(num_tokens_across_dp_cpu[idx].item())
-                    result[result_offset : result_offset + n] = x[x_offset : x_offset + n]
-                    result_offset += n
-                    x_offset += per_dp[idx]
-            else:
-                dp_size = get_dp_group().world_size
-                x = x.view(dp_size, _EXTRA_CTX.padded_length, *x.shape[1:])
-                offset = 0
-                for idx in range(dp_size):
-                    num_tokens_dp = num_tokens_across_dp_cpu[idx]
-                    result[offset : offset + num_tokens_dp] = x[idx, :num_tokens_dp]
-                    offset += num_tokens_dp
+            dp_size = get_dp_group().world_size
+            x = x.view(dp_size, _EXTRA_CTX.padded_length, *x.shape[1:])
+            offset = 0
+            for idx in range(dp_size):
+                num_tokens_dp = num_tokens_across_dp_cpu[idx]
+                result[offset : offset + num_tokens_dp] = x[idx, :num_tokens_dp]
+                offset += num_tokens_dp
             x = result
 
     return x
@@ -109,37 +135,63 @@ def _maybe_pad_and_reduce_impl(x: torch.Tensor, is_ep_comm: bool = False) -> tor
             x = F.pad(x, (0, 0, 0, extra))
         return tensor_model_parallel_reduce_scatter(x, 0)
     else:
+        num_tokens_across_dp_cpu = get_forward_context().dp_metadata.num_tokens_across_dp_cpu
+        per_dp = getattr(_EXTRA_CTX, 'per_dp_padded_lengths', None)
+        tp_sizes = getattr(_EXTRA_CTX, 'per_dp_tp_sizes', None)
+        if per_dp is not None and tp_sizes is not None:
+            if enable_sp_by_pass():
+                return get_ep_group().reduce_scatter(x.view(-1, *x.shape[1:]), 0)
+            # Heterogeneous TP: reduce_scatter hands every rank the SAME
+            # number of rows, but each DP rank must receive its own
+            # ceil(N_dp / tp_dp) share. Pack each rank's real share into a
+            # uniform per-rank slot, reduce_scatter, then slice the local
+            # share.
+            uniform_rank = max(
+                (per_dp[i] + tp_sizes[i] - 1) // tp_sizes[i]
+                for i in range(len(tp_sizes))
+            )
+            ep_world_size = get_ep_group().world_size
+            padded_x = torch.empty(
+                (ep_world_size * uniform_rank, *x.shape[1:]),
+                device=x.device,
+                dtype=x.dtype,
+            )
+            x_offset = 0
+            padded_offset = 0
+            for i in range(len(tp_sizes)):
+                actual_i = int(num_tokens_across_dp_cpu[i].item())
+                chunk = per_dp[i] // tp_sizes[i]
+                for r in range(tp_sizes[i]):
+                    start = r * chunk
+                    if start >= actual_i:
+                        break
+                    n = min(chunk, actual_i - start)
+                    padded_x[padded_offset : padded_offset + n] = x[x_offset : x_offset + n]
+                    x_offset += n
+                    padded_offset += uniform_rank
+            x = get_ep_group().reduce_scatter(padded_x, 0)
+            # Slice this rank's real share from its uniform slot.
+            ep_rank = get_ep_group().rank_in_group
+            i = 0
+            while ep_rank >= tp_sizes[i]:
+                ep_rank -= tp_sizes[i]
+                i += 1
+            local_dp, local_tp = i, ep_rank
+            chunk_local = per_dp[local_dp] // tp_sizes[local_dp]
+            actual_local = int(num_tokens_across_dp_cpu[local_dp].item())
+            n_local = min(chunk_local, actual_local - local_tp * chunk_local)
+            return x[: max(n_local, 0)]
         if enable_sp_by_pass():
             return get_ep_group().reduce_scatter(x.view(-1, *x.shape[1:]), 0)
         # padding
-        num_tokens_across_dp_cpu = get_forward_context().dp_metadata.num_tokens_across_dp_cpu
-        per_dp = getattr(_EXTRA_CTX, 'per_dp_padded_lengths', None)
-        if per_dp is not None:
-            dp_size = len(num_tokens_across_dp_cpu)
-            total_padded = sum(per_dp)
-            # reduce_scatter requires shape[0] % ep_size == 0.
-            # per_dp sums may not divide ep_size evenly (e.g. 18
-            # tokens across 15 EP ranks).  Round up.
-            ep_world_size = get_ep_group().world_size
-            if total_padded % ep_world_size != 0:
-                total_padded += ep_world_size - (total_padded % ep_world_size)
-            padded_x = torch.empty((total_padded, *x.shape[1:]), device=x.device, dtype=x.dtype)
-            x_offset = 0
-            padded_offset = 0
-            for idx in range(dp_size):
-                n = int(num_tokens_across_dp_cpu[idx].item())
-                padded_x[padded_offset : padded_offset + n] = x[x_offset : x_offset + n]
-                x_offset += n
-                padded_offset += per_dp[idx]
-        else:
-            dp_size = get_dp_group().world_size
-            padded_x = torch.empty((dp_size, _EXTRA_CTX.padded_length, *x.shape[1:]), device=x.device, dtype=x.dtype)
-            offset = 0
-            for idx in range(dp_size):
-                num_tokens_dp = num_tokens_across_dp_cpu[idx]
-                padded_x[idx, :num_tokens_dp] = x[offset : offset + num_tokens_dp]
-                offset += num_tokens_dp
-            padded_x = padded_x.view(-1, *x.shape[1:])
+        dp_size = get_dp_group().world_size
+        padded_x = torch.empty((dp_size, _EXTRA_CTX.padded_length, *x.shape[1:]), device=x.device, dtype=x.dtype)
+        offset = 0
+        for idx in range(dp_size):
+            num_tokens_dp = num_tokens_across_dp_cpu[idx]
+            padded_x[idx, :num_tokens_dp] = x[offset : offset + num_tokens_dp]
+            offset += num_tokens_dp
+        padded_x = padded_x.view(-1, *x.shape[1:])
 
         return get_ep_group().reduce_scatter(padded_x, 0)
 
