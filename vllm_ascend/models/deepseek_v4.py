@@ -1168,6 +1168,8 @@ class DeepseekV4Model(nn.Module):
         _dout = ""
         _max_layer = 0
         if _os.environ.get("VLLM_HETERO_DEBUG"):
+            from vllm_ascend.ascend_forward_context import _EXTRA_CTX
+
             _n = int(input_ids.numel()) if input_ids is not None else 0
             _ic = int(getattr(self, "_inner_call", 0))
             if _ic < 30:
