@@ -1156,8 +1156,41 @@ class DeepseekV4Model(nn.Module):
 
         if get_pp_group().is_first_rank:
             hidden_states = hidden_states.unsqueeze(1).repeat(1, self.hc_mult, 1)  # (b, s, h) -> (b, s, c, h)
+
+        # --- Heterogeneous debug hook (VLLM_HETERO_DEBUG): dump per-layer
+        # hidden states for the first real prefill so DP ranks can be compared.
+        import os as _os
+
+        _do_dump = False
+        _dout = ""
+        _max_layer = 0
+        if _os.environ.get("VLLM_HETERO_DEBUG") and not getattr(self, "_hetero_dumped", False):
+            _n = int(input_ids.numel()) if input_ids is not None else 0
+            _nlow = int(_os.environ.get("VLLM_HETERO_DEBUG_MIN_TOKENS", "1000"))
+            _nhigh = int(_os.environ.get("VLLM_HETERO_DEBUG_MAX_TOKENS", "9000"))
+            _max_layer = int(_os.environ.get("VLLM_HETERO_DEBUG_LAYERS", "5"))
+            if _nlow <= _n <= _nhigh:
+                try:
+                    from vllm.config import get_current_vllm_config
+                    from vllm.distributed.parallel_state import get_tensor_model_parallel_rank
+
+                    _pc = get_current_vllm_config().parallel_config
+                    _dp = int(getattr(_pc, "data_parallel_rank", 0))
+                    _tr = int(get_tensor_model_parallel_rank())
+                    _dout = _os.path.join("hetero_debug", f"dp{_dp}_tp{_tr}")
+                    _os.makedirs(_dout, exist_ok=True)
+                    torch.save(input_ids.detach().cpu(), _os.path.join(_dout, "input_ids.pt"))
+                    torch.save(hidden_states.detach().cpu(), _os.path.join(_dout, "input_hidden.pt"))
+                    self._hetero_dumped = True
+                    _do_dump = True
+                except Exception:
+                    _do_dump = False
+        _layer_idx = 0
         for layer in islice(self.layers, self.start_layer, self.end_layer):
             hidden_states, residual = layer(positions, hidden_states, residual, llama_4_scaling)
+            if _do_dump and _layer_idx < _max_layer:
+                torch.save(hidden_states.detach().cpu(), _os.path.join(_dout, f"layer{_layer_idx}.pt"))
+            _layer_idx += 1
 
         # Stash pre-hc_head residual for the MTP draft (captured copy_).
         # When FlashComm1 (sequence parallelism) is enabled, tokens are
