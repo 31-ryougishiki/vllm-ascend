@@ -1158,25 +1158,25 @@ class DeepseekV4Model(nn.Module):
             hidden_states = hidden_states.unsqueeze(1).repeat(1, self.hc_mult, 1)  # (b, s, h) -> (b, s, c, h)
 
         # --- Heterogeneous debug hook (VLLM_HETERO_DEBUG): dump per-layer
-        # hidden states for the first qualifying forward so DP ranks can be
-        # compared. Writes to an absolute dir (VLLM_HETERO_DEBUG_DIR) and logs
-        # its own behavior to the worker log.
+        # hidden states for the first few qualifying forwards so DP ranks can
+        # be compared. Each dump lands in <dir>/dp{dp}_tp{tp}/fwd{n}/ and every
+        # decision is logged, so warmup batches simply take an early fwd slot
+        # and the first real request is captured as the next one.
         import os as _os
 
         _do_dump = False
         _dout = ""
         _max_layer = 0
-        if _os.environ.get("VLLM_HETERO_DEBUG") and not getattr(self, "_hetero_dumped", False):
-            from vllm_ascend.ascend_forward_context import _EXTRA_CTX
-
+        if _os.environ.get("VLLM_HETERO_DEBUG"):
             _n = int(input_ids.numel()) if input_ids is not None else 0
             _nlow = int(_os.environ.get("VLLM_HETERO_DEBUG_MIN_TOKENS", "1000"))
             _nhigh = int(_os.environ.get("VLLM_HETERO_DEBUG_MAX_TOKENS", "9000"))
             _max_layer = int(_os.environ.get("VLLM_HETERO_DEBUG_LAYERS", "5"))
+            _max_dumps = int(_os.environ.get("VLLM_HETERO_DEBUG_N", "3"))
             _base = _os.path.abspath(_os.environ.get("VLLM_HETERO_DEBUG_DIR", "hetero_debug"))
-            if _EXTRA_CTX.in_profile_run:
-                # Skip the warmup/dummy batch; only dump a real request.
-                print(f"[hetero_debug] skip dump: profile run (num_tokens={_n})")
+            _count = int(getattr(self, "_hetero_dump_count", 0))
+            if _count >= _max_dumps:
+                print(f"[hetero_debug] skip dump: already dumped {_count} batches (num_tokens={_n})")
             elif not (_nlow <= _n <= _nhigh):
                 print(f"[hetero_debug] skip dump: num_tokens={_n} not in [{_nlow},{_nhigh}]")
             else:
@@ -1187,12 +1187,12 @@ class DeepseekV4Model(nn.Module):
                     _pc = get_current_vllm_config().parallel_config
                     _dp = int(getattr(_pc, "data_parallel_rank", 0))
                     _tr = int(get_tensor_model_parallel_rank())
-                    _dout = _os.path.join(_base, f"dp{_dp}_tp{_tr}")
+                    _dout = _os.path.join(_base, f"dp{_dp}_tp{_tr}", f"fwd{_count}")
                     _os.makedirs(_dout, exist_ok=True)
                     torch.save(input_ids.detach().cpu(), _os.path.join(_dout, "input_ids.pt"))
                     torch.save(hidden_states.detach().cpu(), _os.path.join(_dout, "input_hidden.pt"))
                     print(f"[hetero_debug] dumping to {_dout} (num_tokens={_n})")
-                    self._hetero_dumped = True
+                    self._hetero_dump_count = _count + 1
                     _do_dump = True
                 except Exception as _e:
                     print(f"[hetero_debug] dump failed: {_e!r}")
