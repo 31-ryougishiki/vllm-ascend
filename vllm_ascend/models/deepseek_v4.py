@@ -1169,6 +1169,10 @@ class DeepseekV4Model(nn.Module):
         _max_layer = 0
         if _os.environ.get("VLLM_HETERO_DEBUG"):
             _n = int(input_ids.numel()) if input_ids is not None else 0
+            _ic = int(getattr(self, "_inner_call", 0))
+            if _ic < 30:
+                print(f"[hetero_debug] INNER forward call={_ic} num_tokens={_n}")
+            self._inner_call = _ic + 1
             _nlow = int(_os.environ.get("VLLM_HETERO_DEBUG_MIN_TOKENS", "1000"))
             _nhigh = int(_os.environ.get("VLLM_HETERO_DEBUG_MAX_TOKENS", "9000"))
             _max_layer = int(_os.environ.get("VLLM_HETERO_DEBUG_LAYERS", "5"))
@@ -1338,6 +1342,21 @@ class AscendDeepseekV4ForCausalLM(nn.Module, SupportsPP, DeepseekV2MixtureOfExpe
         intermediate_tensors: IntermediateTensors | None = None,
         inputs_embeds: torch.Tensor | None = None,
     ) -> torch.Tensor | IntermediateTensors:
+        import os as _os
+
+        if _os.environ.get("VLLM_HETERO_DEBUG"):
+            _c = int(getattr(self, "_outer_call", 0))
+            if _c < 30:
+                _n = (
+                    int(input_ids.numel())
+                    if input_ids is not None
+                    else (int(inputs_embeds.shape[0]) if inputs_embeds is not None else -1)
+                )
+                print(
+                    f"[hetero_debug] OUTER forward call={_c} num_tokens={_n} "
+                    f"input_ids_shape={None if input_ids is None else tuple(input_ids.shape)}"
+                )
+            self._outer_call = _c + 1
         hidden_states = self.model(input_ids, positions, intermediate_tensors, inputs_embeds)
         return hidden_states
 
@@ -1345,6 +1364,13 @@ class AscendDeepseekV4ForCausalLM(nn.Module, SupportsPP, DeepseekV2MixtureOfExpe
         self,
         hidden_states: torch.Tensor,
     ) -> torch.Tensor | None:
+        import os as _os
+
+        if _os.environ.get("VLLM_HETERO_DEBUG"):
+            _c = int(getattr(self, "_logits_call", 0))
+            if _c < 30:
+                print(f"[hetero_debug] compute_logits call={_c} hidden_shape={tuple(hidden_states.shape)}")
+            self._logits_call = _c + 1
         logits = self.logits_processor(self.lm_head, hidden_states)
         return logits
 
