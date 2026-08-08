@@ -1185,12 +1185,25 @@ class DeepseekV4Model(nn.Module):
                 print(f"[hetero_debug] skip dump: num_tokens={_n} not in [{_nlow},{_nhigh}]")
             else:
                 try:
-                    from vllm.config import get_current_vllm_config
-                    from vllm.distributed.parallel_state import get_tensor_model_parallel_rank
+                    from vllm.distributed.parallel_state import (
+                        get_tensor_model_parallel_rank,
+                        get_tensor_model_parallel_world_size,
+                        get_world_group,
+                    )
 
-                    _pc = get_current_vllm_config().parallel_config
-                    _dp = int(getattr(_pc, "data_parallel_rank", 0))
-                    _tr = int(get_tensor_model_parallel_rank())
+                    # get_current_vllm_config() is unavailable inside the model
+                    # forward at runtime; derive dp/tp from the process groups.
+                    _grank = int(get_world_group().rank)
+                    _tp_sizes = getattr(_EXTRA_CTX, "per_dp_tp_sizes", None)
+                    if _tp_sizes:
+                        _dp, _tr = 0, _grank
+                        while _tr >= _tp_sizes[_dp]:
+                            _tr -= _tp_sizes[_dp]
+                            _dp += 1
+                    else:
+                        _tp_world = int(get_tensor_model_parallel_world_size())
+                        _tr = int(get_tensor_model_parallel_rank())
+                        _dp = _grank // _tp_world
                     _dout = _os.path.join(_base, f"dp{_dp}_tp{_tr}", f"fwd{_count}")
                     _os.makedirs(_dout, exist_ok=True)
                     torch.save(input_ids.detach().cpu(), _os.path.join(_dout, "input_ids.pt"))
