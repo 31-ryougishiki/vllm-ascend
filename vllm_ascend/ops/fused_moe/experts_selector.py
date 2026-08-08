@@ -265,8 +265,15 @@ def _select_experts_with_fusion_ops(
                 # Process for Flash Comm V1
                 tp_size = get_tp_group().world_size
                 tp_rank = get_tp_group().rank_in_group
-                splitted_input = split_tensor_along_first_dim(input_ids, num_partitions=tp_size)
-                input_ids = splitted_input[tp_rank].contiguous()
+                # Under heterogeneous TP, num_tokens may not be divisible by
+                # tp_size. Pad to a multiple first, then split evenly -- the
+                # same convention as sequence_parallel_chunk, so the per-rank
+                # input_ids stay aligned with the per-rank router_logits.
+                if input_ids.shape[0] % tp_size != 0:
+                    pad_len = tp_size - (input_ids.shape[0] % tp_size)
+                    input_ids = F.pad(input_ids, (0, pad_len))
+                chunk = input_ids.shape[0] // tp_size
+                input_ids = input_ids[tp_rank * chunk : (tp_rank + 1) * chunk].contiguous()
             input_ids = torch.where(input_ids == -1, 0, input_ids)
         else:
             input_ids = None
