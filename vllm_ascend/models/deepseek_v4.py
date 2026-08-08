@@ -1167,12 +1167,17 @@ class DeepseekV4Model(nn.Module):
         _dout = ""
         _max_layer = 0
         if _os.environ.get("VLLM_HETERO_DEBUG") and not getattr(self, "_hetero_dumped", False):
+            from vllm_ascend.ascend_forward_context import _EXTRA_CTX
+
             _n = int(input_ids.numel()) if input_ids is not None else 0
             _nlow = int(_os.environ.get("VLLM_HETERO_DEBUG_MIN_TOKENS", "1000"))
             _nhigh = int(_os.environ.get("VLLM_HETERO_DEBUG_MAX_TOKENS", "9000"))
             _max_layer = int(_os.environ.get("VLLM_HETERO_DEBUG_LAYERS", "5"))
             _base = _os.path.abspath(_os.environ.get("VLLM_HETERO_DEBUG_DIR", "hetero_debug"))
-            if not (_nlow <= _n <= _nhigh):
+            if _EXTRA_CTX.in_profile_run:
+                # Skip the warmup/dummy batch; only dump a real request.
+                print(f"[hetero_debug] skip dump: profile run (num_tokens={_n})")
+            elif not (_nlow <= _n <= _nhigh):
                 print(f"[hetero_debug] skip dump: num_tokens={_n} not in [{_nlow},{_nhigh}]")
             else:
                 try:
