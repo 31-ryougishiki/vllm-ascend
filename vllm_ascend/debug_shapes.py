@@ -20,16 +20,33 @@ import os
 
 import torch
 
-from vllm.logger import init_logger
-
-logger = init_logger("vllm_ascend.debug_shapes")
+# Use the same shared vllm logger as every other vllm_ascend module
+# (platform.py, model_runner_v1.py), which is guaranteed to emit INFO in the
+# worker logs. Avoids init_logger(name) semantics differences in this fork.
+from vllm.logger import logger
 
 # ── env-controlled switches ──────────────────────────────────────────
-_DEBUG_SHAPES: bool = os.environ.get("VLLM_DEBUG_SHAPES", "0") == "1"
-_DEBUG_WEIGHTS: bool = os.environ.get("VLLM_DEBUG_SHAPES_WEIGHTS", "0") == "1"
+# Accept 1/true/yes/on (case-insensitive) so a wrong casing/value never
+# silently disables logging.
+
+
+def _env_flag(name: str) -> bool:
+    return os.environ.get(name, "").strip().lower() in ("1", "true", "yes", "on")
+
+
+_DEBUG_SHAPES: bool = _env_flag("VLLM_DEBUG_SHAPES")
+_DEBUG_WEIGHTS: bool = _env_flag("VLLM_DEBUG_SHAPES_WEIGHTS")
 _MAX_STEPS: int = int(os.environ.get("VLLM_DEBUG_SHAPES_STEPS", "3"))
 _MAX_LAYERS: int = int(os.environ.get("VLLM_DEBUG_SHAPES_LAYERS", "-1"))  # -1 = all
 _MAX_WEIGHT_PRINTS: int = int(os.environ.get("VLLM_DEBUG_SHAPES_MAX_WEIGHTS", "500"))
+
+# Always report the effective config at import time. If this line is missing
+# from the worker log, the module was never imported (code not deployed); if
+# active=False, the env var did not reach the worker process.
+logger.info("[DEBUG_SHAPES] loaded: VLLM_DEBUG_SHAPES=%r -> active=%s, "
+            "steps=%d, layers=%d, weights=%r",
+            os.environ.get("VLLM_DEBUG_SHAPES"), _DEBUG_SHAPES,
+            _MAX_STEPS, _MAX_LAYERS, os.environ.get("VLLM_DEBUG_SHAPES_WEIGHTS"))
 
 _step_counter: int = 0
 
@@ -81,7 +98,6 @@ def log_shape(tag: str, x, layer_idx: int | None = None,
     if not _active(layer_idx):
         return
     if _step_counter >= _MAX_STEPS:
-        _active.__dict__["_logged_exceeded"] = True
         return
 
     layer_str = f" L{layer_idx}" if layer_idx is not None else ""
