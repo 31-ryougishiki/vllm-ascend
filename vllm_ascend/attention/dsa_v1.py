@@ -1967,9 +1967,13 @@ class AscendDSAImpl(DSAAttentionImpl):
         DeviceOperator.add_dsa_sparse_attn_extra_kwargs(extra_attn_kwargs, cu_seqlens_ori_kv=actual_seq_lengths_query)
 
         if self.compress_ratio <= 1:
+            from vllm_ascend.ascend_forward_context import get_hetero_dump_dir
+
+            _hd_dir = get_hetero_dump_dir()
+            _hd_dumped = getattr(self, "_op_input_dumped", False)
             notify_kv_cache_written(layer_name)
             record_attention_compute_start()
-            return attn_op(
+            _op_out = attn_op(
                 q,
                 ori_kv=swa_kv_cache,
                 ori_block_table=swa_prefill_metadata.block_table,
@@ -1986,6 +1990,21 @@ class AscendDSAImpl(DSAAttentionImpl):
                 layout_kv="PA_ND",
                 **extra_attn_kwargs,
             )[0]
+            if _hd_dir and not _hd_dumped:
+                self._op_input_dumped = True
+                import os as _hdos
+
+                torch.save(q.detach().cpu(), _hdos.path.join(_hd_dir, "attn_op_q.pt"))
+                torch.save(self.attn_sink.detach().cpu(), _hdos.path.join(_hd_dir, "attn_op_sink.pt"))
+                torch.save(
+                    torch.tensor([self.n_local_heads]), _hdos.path.join(_hd_dir, "attn_op_nheads.pt")
+                )
+                try:
+                    torch.save(kv.detach().cpu(), _hdos.path.join(_hd_dir, "attn_op_kv.pt"))
+                except Exception:
+                    pass
+                torch.save(_op_out.detach().cpu(), _hdos.path.join(_hd_dir, "attn_op_out.pt"))
+            return _op_out
 
         if self.compress_ratio > 1:
             compressor_prefill_metadata = _require_prefill_metadata(compressor_attn_metadata)

@@ -934,9 +934,9 @@ class DeepseekV4Attention(nn.Module):
         return self.dsa_attn(positions, hidden_states, llama_4_scaling)
 
 
-# Debug hook: the model forward sets this to the active dump dir; the first
-# decoder layer that runs dumps its attention/MoE internals there.
-_HETERO_DUMP_DIR: str | None = None
+# Debug hook: the model forward sets the active dump dir (via
+# set_hetero_dump_dir in ascend_forward_context); the first decoder layer that
+# runs dumps its attention/MoE internals there.
 _HETERO_LAYER_DUMPED = False
 
 
@@ -1019,6 +1019,9 @@ class DeepseekV2DecoderLayer(nn.Module):
         llama_4_scaling: torch.Tensor | None = None,
     ) -> torch.Tensor:
         global _HETERO_LAYER_DUMPED
+        from vllm_ascend.ascend_forward_context import get_hetero_dump_dir
+
+        _hd_dir = get_hetero_dump_dir()
         residual = hidden_states.clone()
         hidden_states, post, comb = self.hc_pre(hidden_states, self.hc_attn_fn, self.hc_attn_scale, self.hc_attn_base)
         hidden_states = self.input_layernorm(hidden_states)
@@ -1026,12 +1029,12 @@ class DeepseekV2DecoderLayer(nn.Module):
         attn_kwargs = {"positions": positions, "hidden_states": hidden_states, "llama_4_scaling": llama_4_scaling}
         hidden_states = self.self_attn(**attn_kwargs)
         attn_out = hidden_states
-        if _HETERO_DUMP_DIR and not _HETERO_LAYER_DUMPED:
+        if _hd_dir and not _HETERO_LAYER_DUMPED:
             _HETERO_LAYER_DUMPED = True
             import os as _hdos
 
-            torch.save(attn_in.detach().cpu(), _hdos.path.join(_HETERO_DUMP_DIR, "layer_attn_in.pt"))
-            torch.save(attn_out.detach().cpu(), _hdos.path.join(_HETERO_DUMP_DIR, "layer_attn_out.pt"))
+            torch.save(attn_in.detach().cpu(), _hdos.path.join(_hd_dir, "layer_attn_in.pt"))
+            torch.save(attn_out.detach().cpu(), _hdos.path.join(_hd_dir, "layer_attn_out.pt"))
         hidden_states = self.hc_post(hidden_states, residual, post, comb)
         residual = hidden_states.clone()
         hidden_states, post, comb = self.hc_pre(hidden_states, self.hc_ffn_fn, self.hc_ffn_scale, self.hc_ffn_base)
@@ -1039,12 +1042,12 @@ class DeepseekV2DecoderLayer(nn.Module):
         mlp_in = hidden_states
         hidden_states = self.mlp(hidden_states)
         mlp_out = hidden_states
-        if _HETERO_DUMP_DIR and getattr(self, "_dumped_mlp", None) is None:
+        if _hd_dir and getattr(self, "_dumped_mlp", None) is None:
             self._dumped_mlp = True
             import os as _hdos
 
-            torch.save(mlp_in.detach().cpu(), _hdos.path.join(_HETERO_DUMP_DIR, "layer_mlp_in.pt"))
-            torch.save(mlp_out.detach().cpu(), _hdos.path.join(_HETERO_DUMP_DIR, "layer_mlp_out.pt"))
+            torch.save(mlp_in.detach().cpu(), _hdos.path.join(_hd_dir, "layer_mlp_in.pt"))
+            torch.save(mlp_out.detach().cpu(), _hdos.path.join(_hd_dir, "layer_mlp_out.pt"))
         hidden_states = self.hc_post(hidden_states, residual, post, comb)
 
         return hidden_states, residual
@@ -1154,7 +1157,6 @@ class DeepseekV4Model(nn.Module):
         intermediate_tensors: IntermediateTensors | None,
         inputs_embeds: torch.Tensor | None = None,
     ) -> torch.Tensor | IntermediateTensors:
-        global _HETERO_DUMP_DIR
         if get_pp_group().is_first_rank:
             if inputs_embeds is not None:
                 hidden_states = inputs_embeds
@@ -1232,8 +1234,9 @@ class DeepseekV4Model(nn.Module):
                         _dp = _grank // _tp_world
                     _dout = _os.path.join(_base, f"dp{_dp}_tp{_tr}", f"fwd{_count}")
                     _os.makedirs(_dout, exist_ok=True)
-                    global _HETERO_DUMP_DIR
-                    _HETERO_DUMP_DIR = _dout
+                    from vllm_ascend.ascend_forward_context import set_hetero_dump_dir
+
+                    set_hetero_dump_dir(_dout)
                     torch.save(input_ids.detach().cpu(), _os.path.join(_dout, "input_ids.pt"))
                     torch.save(hidden_states.detach().cpu(), _os.path.join(_dout, "input_hidden.pt"))
                     print(f"[hetero_debug] dumping to {_dout} (num_tokens={_n})")

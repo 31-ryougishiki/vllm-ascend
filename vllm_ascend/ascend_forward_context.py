@@ -33,6 +33,19 @@ class MoECommType(Enum):
 
 _MRV2_IN_PROFILE_RUN: ContextVar[bool] = ContextVar("_MRV2_IN_PROFILE_RUN", default=False)
 
+# Debug hook: the model forward sets the active dump dir; the DSA attention
+# impl reads it to dump the raw op inputs/outputs for heterogeneous-TP analysis.
+_HETERO_DUMP_DIR: str | None = None
+
+
+def set_hetero_dump_dir(d: str | None) -> None:
+    global _HETERO_DUMP_DIR
+    _HETERO_DUMP_DIR = d
+
+
+def get_hetero_dump_dir() -> str | None:
+    return _HETERO_DUMP_DIR
+
 
 @contextmanager
 def override_mrv2_in_profile_run(enabled: bool):
