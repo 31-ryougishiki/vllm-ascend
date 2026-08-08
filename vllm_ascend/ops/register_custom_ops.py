@@ -57,6 +57,12 @@ def _maybe_all_gather_and_maybe_unpad_impl(x: torch.Tensor, label: bool, is_ep_c
                 torch.save(x.detach().cpu(), _hdos.path.join(_hdd, "tp_gather_in.pt"))
                 torch.save(torch.tensor([x.shape[0], _EXTRA_CTX.pad_size]),
                            _hdos.path.join(_hdd, "tp_gather_meta.pt"))
+                from vllm.distributed.parallel_state import get_tp_group, get_world_group
+
+                torch.save(torch.tensor(list(get_tp_group().ranks)),
+                           _hdos.path.join(_hdd, "tp_group_ranks.pt"))
+                torch.save(torch.tensor([int(get_world_group().rank)]),
+                           _hdos.path.join(_hdd, "tp_group_world_rank.pt"))
             x = tensor_model_parallel_all_gather(x, 0)
             pad_size = _EXTRA_CTX.pad_size
             if pad_size > 0:
