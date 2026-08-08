@@ -2004,6 +2004,20 @@ class AscendDSAImpl(DSAAttentionImpl):
                 except Exception:
                     pass
                 torch.save(_op_out.detach().cpu(), _hdos.path.join(_hd_dir, "attn_op_out.pt"))
+                # Isolate the Q projection: qr (wq_b input, replicated weight)
+                # and the wq_b weights themselves (head-aligned comparison).
+                try:
+                    torch.save(qr.detach().cpu(), _hdos.path.join(_hd_dir, "attn_qr.pt"))
+                except Exception:
+                    pass
+                try:
+                    torch.save(self.wq_b.weight.detach().cpu(),
+                               _hdos.path.join(_hd_dir, "attn_wq_b_weight.pt"))
+                    if hasattr(self.wq_b, "weight_scale"):
+                        torch.save(self.wq_b.weight_scale.detach().cpu(),
+                                   _hdos.path.join(_hd_dir, "attn_wq_b_scale.pt"))
+                except Exception:
+                    pass
             return _op_out
 
         if self.compress_ratio > 1:
