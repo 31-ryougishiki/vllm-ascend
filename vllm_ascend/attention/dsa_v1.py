@@ -1682,13 +1682,11 @@ class AscendDSAImpl(DSAAttentionImpl):
             try:
                 from vllm_ascend.ascend_forward_context import get_hetero_dump_dir
                 _hd = get_hetero_dump_dir()
-                if _hd and not globals().get("_OPROJ_META_DUMPED"):
+                if _hd and not globals().get("_OPROJ_WB_DUMPED"):
                     import os as _hdos
-                    globals()["_OPROJ_META_DUMPED"] = True
+                    globals()["_OPROJ_WB_DUMPED"] = True
                     _wb_out = self.wo_b(o_proj_input)
                     torch.save(_wb_out.detach().cpu(), _hdos.path.join(_hd, "attn_wo_b_out.pt"))
-                    torch.save({"wo_a_out": tuple(o_proj_input.shape), "wo_b_out": tuple(_wb_out.shape),
-                                "output": tuple(output.shape)}, _hdos.path.join(_hd, "oproj_meta.pt"))
                     output[...] = _wb_out
                 else:
                     output[...] = self.wo_b(o_proj_input)
