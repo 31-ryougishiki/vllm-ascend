@@ -1742,7 +1742,30 @@ class AscendDSAImpl(DSAAttentionImpl):
             pass
 
         # 1) gather head-sharded attention output -> full n_heads.
+        # NOTE: tensor_model_parallel_all_gather requires EVERY rank to send the
+        # SAME tensor shape, but heterogeneous TP gives each rank a different
+        # n_local_heads (DP0: 32/16/16). Pad each rank's heads to the group max
+        # (zeros at the tail), gather the uniform tensors, then slice the valid
+        # [0:n_heads] — rank order preserved (rank0 heads, rank1 heads, ...).
+        from vllm.distributed.utils import get_current_tp_sharding_ratios, get_tp_partition_size
+
+        n_heads = self.num_heads
+        head_dim = self.head_dim
+        ratios = get_current_tp_sharding_ratios()
+        local_sizes = [get_tp_partition_size(n_heads, r, tp_size, ratios) for r in range(tp_size)]
+        max_local = max(local_sizes)
+        if o_proj_input.shape[1] < max_local:
+            _op = torch.zeros(
+                (num_tokens, max_local, head_dim), dtype=o_proj_input.dtype, device=o_proj_input.device
+            )
+            _op[:, : o_proj_input.shape[1]] = o_proj_input
+            o_proj_input = _op
         o_full = tensor_model_parallel_all_gather(o_proj_input, 1)
+        # Compress the per-rank valid heads (each rank's valid heads are the
+        # first `local_sizes[r]` of its padded block; the rest are zero pad).
+        o_full = o_full.view(num_tokens, tp_size, max_local, head_dim)
+        _valid = [o_full[:, r, : local_sizes[r]] for r in range(tp_size)]
+        o_full = torch.cat(_valid, dim=1)  # (N, n_heads, head_dim)
         # 2) reshape to (N, n_groups, group_hidden_dim).
         n_groups = self.n_group
         gh = o_full.shape[1] * o_full.shape[2] // n_groups
