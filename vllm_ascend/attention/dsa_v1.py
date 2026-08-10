@@ -1679,7 +1679,19 @@ class AscendDSAImpl(DSAAttentionImpl):
                 batch_split_factor=1,
             )
             o_proj_input = o_proj_input.reshape(num_tokens, -1)
-            output[...] = self.wo_b(o_proj_input)
+            try:
+                import os as _sdos
+                if _sdos.environ.get("VLLM_HETERO_DEBUG"):
+                    _wb_out = self.wo_b(o_proj_input)
+                    print(f"[hetero_oproj] num_tokens={num_tokens} n_local_groups={self.n_local_groups} "
+                          f"wo_a_out={tuple(o_proj_input.shape)} wo_b_out={tuple(_wb_out.shape)} "
+                          f"output={tuple(output.shape)}")
+                    output[...] = _wb_out
+                else:
+                    output[...] = self.wo_b(o_proj_input)
+            except Exception as _e:
+                print(f"[hetero_oproj] EXC {_e!r}")
+                output[...] = self.wo_b(o_proj_input)
         return output
 
     def forward(  # type: ignore[override]
@@ -1780,6 +1792,14 @@ class AscendDSAImpl(DSAAttentionImpl):
         )
 
         # o
+        try:
+            import os as _sdos
+            if _sdos.environ.get("VLLM_HETERO_DEBUG"):
+                print(f"[hetero_oproj] n_local_heads={self.n_local_heads} n_local_groups={self.n_local_groups} "
+                      f"num_tokens={getattr(get_forward_context(), 'num_tokens', -1)} "
+                      f"o_proj_input={tuple(o_proj_input.shape)} output={tuple(output.shape)}")
+        except Exception:
+            pass
         self._forward_o_proj(o_proj_input, output)
 
         maybe_save_kv_layer_to_connector(layer_name, list(kv_cache))
