@@ -1744,7 +1744,7 @@ class AscendDSAImpl(DSAAttentionImpl):
         # 1) gather head-sharded attention output -> full n_heads.
         o_full = tensor_model_parallel_all_gather(o_proj_input, 1)
         # 2) reshape to (N, n_groups, group_hidden_dim).
-        n_groups = self.n_groups
+        n_groups = self.n_group
         gh = o_full.shape[1] * o_full.shape[2] // n_groups
         o_full = o_full.reshape(num_tokens, n_groups, gh)
         # 3) wo_a (replicated, full groups) batch matmul.
