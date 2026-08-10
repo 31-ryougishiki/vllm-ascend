@@ -1916,14 +1916,16 @@ class AscendDSAImpl(DSAAttentionImpl):
                     q = self.wq_b(qr).unflatten(-1, (self.n_local_heads, self.head_dim))
 
                 with _cs_t.span("model/attn/prefill/mla_prolog/standard/q_rms_rope"):
-                    q = triton_q_rms(q, self.eps)
-                    torch.ops._C_ascend.inplace_partial_rotary_mul(
-                        q.unsqueeze(1),
-                        cos,
-                        sin,
-                        rotary_mode="interleave",
-                        partial_slice=[self.nope_head_dim, self.head_dim],
-                    )
+                    with _cs_t.span("model/attn/prefill/mla_prolog/standard/q_rms_rope/triton"):
+                        q = triton_q_rms(q, self.eps)
+                    with _cs_t.span("model/attn/prefill/mla_prolog/standard/q_rms_rope/rotary"):
+                        torch.ops._C_ascend.inplace_partial_rotary_mul(
+                            q.unsqueeze(1),
+                            cos,
+                            sin,
+                            rotary_mode="interleave",
+                            partial_slice=[self.nope_head_dim, self.head_dim],
+                        )
 
                 with _cs_t.span("model/attn/prefill/mla_prolog/standard/kv_proj"):
                     kv = self.wkv(hidden_states)
@@ -2211,14 +2213,16 @@ class AscendDSAImpl(DSAAttentionImpl):
                         qr_pertoken_scale = None
 
                 with _cs_t.span("model/attn/decode/mla_prolog/standard/q_rms_rope"):
-                    q = triton_q_rms(q, self.eps)
-                    torch.ops._C_ascend.inplace_partial_rotary_mul(
-                        q.unsqueeze(1),
-                        cos,
-                        sin,
-                        rotary_mode="interleave",
-                        partial_slice=[self.nope_head_dim, self.head_dim],
-                    )
+                    with _cs_t.span("model/attn/decode/mla_prolog/standard/q_rms_rope/triton"):
+                        q = triton_q_rms(q, self.eps)
+                    with _cs_t.span("model/attn/decode/mla_prolog/standard/q_rms_rope/rotary"):
+                        torch.ops._C_ascend.inplace_partial_rotary_mul(
+                            q.unsqueeze(1),
+                            cos,
+                            sin,
+                            rotary_mode="interleave",
+                            partial_slice=[self.nope_head_dim, self.head_dim],
+                        )
 
                 with npu_stream_switch(attention_calculation_stream(), enabled=self.multistream_dsa_preprocess):
                     if wait_hidden_state_cal_event:
