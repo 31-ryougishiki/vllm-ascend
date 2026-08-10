@@ -136,14 +136,27 @@ def update_cos_sin(positions):
         return
 
     num_tokens = positions.size(0)
+    # DIAG: measure host-side time of the gather+slice pipeline in update_cos_sin.
+    import time as _time_diag
+    _t0 = _time_diag.perf_counter()
     _cos[:, :num_tokens] = (
         _cos_sin_cache.index_select(0, positions).view(num_tokens, 2, -1).repeat(1, 1, 2).chunk(2, dim=-2)[0]
     )
+    _t1 = _time_diag.perf_counter()
     _sin[:, :num_tokens] = (
         _cos_sin_cache.index_select(0, positions).view(num_tokens, 2, -1).repeat(1, 1, 2).chunk(2, dim=-2)[1]
     )
+    _t2 = _time_diag.perf_counter()
     _cos_slice = _cos[:, :num_tokens]
     _sin_slice = _sin[:, :num_tokens]
+    _t3 = _time_diag.perf_counter()
+    if (_t3 - _t0) * 1000.0 > 10.0:
+        from vllm.logger import init_logger as _init_logger_diag
+        _init_logger_diag(__name__).warning(
+            "DIAG update_cos_sin: cos=%.1fms sin=%.1fms slice=%.1fms host_total=%.1fms num_tokens=%d",
+            (_t1 - _t0) * 1000, (_t2 - _t1) * 1000, (_t3 - _t2) * 1000,
+            (_t3 - _t0) * 1000, num_tokens,
+        )
 
 
 def get_cos_and_sin_slice():
