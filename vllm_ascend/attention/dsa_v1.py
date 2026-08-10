@@ -1813,7 +1813,7 @@ class AscendDSAImpl(DSAAttentionImpl):
         if _sdos.environ.get("VLLM_HETERO_DEBUG"):
             print(f"[hetero_oproj_det] o_full={tuple(o_full.shape)} n_groups={n_groups} "
                   f"o_wa={tuple(o_wa.shape)} o_wb={tuple(o_wb.shape)} padded={_padded} "
-                  f"chunk={_chunk} output={tuple(output.shape)}")
+                  f"chunk={_chunk} output={tuple(output.shape)}", flush=True)
         return output
 
     def forward(  # type: ignore[override]
@@ -1926,6 +1926,12 @@ class AscendDSAImpl(DSAAttentionImpl):
                     "num_tokens_ctx": int(getattr(get_forward_context(), "num_tokens", -1)),
                     "o_proj_input": tuple(o_proj_input.shape),
                     "output": tuple(output.shape),
+                    # Diagnostics: does the det path actually activate in this
+                    # worker, and are wo_a/wo_b really replicated (full size)?
+                    "det_env": _hdos.environ.get("VLLM_HETERO_OPROJ_DET"),
+                    "det_active": _hetero_oproj_det(),
+                    "wo_a_weight": tuple(self.wo_a.weight.shape),
+                    "wo_b_weight": tuple(self.wo_b.weight.shape),
                 }, _hdos.path.join(_hd, "oproj_meta.pt"))
         except Exception:
             pass
