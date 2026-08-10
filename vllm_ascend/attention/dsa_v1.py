@@ -1712,6 +1712,35 @@ class AscendDSAImpl(DSAAttentionImpl):
         decode_tokens = attn_metadata[0].num_decode_tokens
         actual_tokens = attn_metadata[0].num_actual_tokens
 
+        # Heterogeneous debug: dump the batch/decode/prefill metadata that
+        # decides the [decode_tokens:actual_tokens] slice. The all-gather
+        # output (tp_gather_out) is identical across DPs but attn_hidden_in
+        # (= all_gather output sliced by these values) diverges, so these
+        # values must be compared per DP.
+        try:
+            from vllm_ascend.ascend_forward_context import _EXTRA_CTX, get_hetero_dump_dir
+            _hd = get_hetero_dump_dir()
+            if _hd and not getattr(self, "_meta_dumped", False):
+                import os as _hdos
+                self._meta_dumped = True
+                _m = attn_metadata[0]
+                _qsl = None
+                if getattr(_m, "prefill", None) is not None:
+                    _qsl = _m.prefill.query_start_loc
+                torch.save({
+                    "num_actual_tokens": int(actual_tokens),
+                    "num_decode_tokens": int(decode_tokens),
+                    "num_input_tokens": int(getattr(_m, "num_input_tokens", -1)),
+                    "num_decodes": int(getattr(_m, "num_decodes", -1)),
+                    "num_prefills": int(getattr(_m, "num_prefills", -1)),
+                    "num_tokens_ctx": int(getattr(_EXTRA_CTX, "num_tokens", -1)),
+                    "padded_num_tokens": int(getattr(_EXTRA_CTX, "padded_num_tokens", -1)),
+                    "pad_size": int(getattr(_EXTRA_CTX, "pad_size", -1)),
+                    "query_start_loc": None if _qsl is None else _qsl.detach().cpu(),
+                }, _hdos.path.join(_hd, "attn_meta.pt"))
+        except Exception:
+            pass
+
         # Process for Flash Comm V1
         hidden_states = torch.ops.vllm.maybe_all_gather_and_maybe_unpad(hidden_states, need_gather_q_kv)
         prefill_hidden_states = hidden_states[decode_tokens:actual_tokens]
