@@ -2099,18 +2099,6 @@ class NPUModelRunner(GPUModelRunner):
             # update global cos, sin
             update_cos_sin(positions)
 
-            # DIAG: sync right after update_cos_sin, inside prepare_input.
-            # Tests whether cos/sin slicing with new num_tokens is the trigger.
-            _t_sync0 = time.perf_counter()
-            torch.npu.synchronize()
-            _t_sync1 = time.perf_counter()
-            _sync_ms = (_t_sync1 - _t_sync0) * 1000.0
-            if _sync_ms > 10.0:
-                logger.warning(
-                    "DIAG sync_after_cos_sin: %.1fms (step %d, tokens=%d)",
-                    _sync_ms, self._cs_step_counter, num_scheduled_tokens,
-                )
-
         if self.dynamic_eplb:
             with record_function_or_nullcontext("EPLB weight D2D"):
                 self.eplb_updator.forward_before()
