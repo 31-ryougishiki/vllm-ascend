@@ -1680,18 +1680,23 @@ class AscendDSAImpl(DSAAttentionImpl):
             )
             o_proj_input = o_proj_input.reshape(num_tokens, -1)
             try:
-                import os as _sdos
-                if _sdos.environ.get("VLLM_HETERO_DEBUG"):
+                from vllm_ascend.ascend_forward_context import get_hetero_dump_dir
+                _hd = get_hetero_dump_dir()
+                if _hd and not globals().get("_OPROJ_META_DUMPED"):
+                    import os as _hdos
+                    globals()["_OPROJ_META_DUMPED"] = True
                     _wb_out = self.wo_b(o_proj_input)
-                    print(f"[hetero_oproj] num_tokens={num_tokens} n_local_groups={self.n_local_groups} "
-                          f"wo_a_out={tuple(o_proj_input.shape)} wo_b_out={tuple(_wb_out.shape)} "
-                          f"output={tuple(output.shape)}")
+                    torch.save(_wb_out.detach().cpu(), _hdos.path.join(_hd, "attn_wo_b_out.pt"))
+                    torch.save({"wo_a_out": tuple(o_proj_input.shape), "wo_b_out": tuple(_wb_out.shape),
+                                "output": tuple(output.shape)}, _hdos.path.join(_hd, "oproj_meta.pt"))
                     output[...] = _wb_out
                 else:
                     output[...] = self.wo_b(o_proj_input)
             except Exception as _e:
-                print(f"[hetero_oproj] EXC {_e!r}")
-                output[...] = self.wo_b(o_proj_input)
+                try:
+                    output[...] = self.wo_b(o_proj_input)
+                except Exception as _e2:
+                    print(f"[hetero_oproj] EXC2 {_e!r} / {_e2!r}")
         return output
 
     def forward(  # type: ignore[override]
@@ -1793,11 +1798,18 @@ class AscendDSAImpl(DSAAttentionImpl):
 
         # o
         try:
-            import os as _sdos
-            if _sdos.environ.get("VLLM_HETERO_DEBUG"):
-                print(f"[hetero_oproj] n_local_heads={self.n_local_heads} n_local_groups={self.n_local_groups} "
-                      f"num_tokens={getattr(get_forward_context(), 'num_tokens', -1)} "
-                      f"o_proj_input={tuple(o_proj_input.shape)} output={tuple(output.shape)}")
+            from vllm_ascend.ascend_forward_context import get_hetero_dump_dir
+            _hd = get_hetero_dump_dir()
+            if _hd and not globals().get("_OPROJ_META_DUMPED"):
+                globals()["_OPROJ_META_DUMPED"] = True
+                import os as _hdos
+                torch.save({
+                    "n_local_heads": self.n_local_heads,
+                    "n_local_groups": self.n_local_groups,
+                    "num_tokens_ctx": int(getattr(get_forward_context(), "num_tokens", -1)),
+                    "o_proj_input": tuple(o_proj_input.shape),
+                    "output": tuple(output.shape),
+                }, _hdos.path.join(_hd, "oproj_meta.pt"))
         except Exception:
             pass
         self._forward_o_proj(o_proj_input, output)
