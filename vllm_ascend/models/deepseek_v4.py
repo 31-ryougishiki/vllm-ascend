@@ -1050,7 +1050,14 @@ class DeepseekV2DecoderLayer(nn.Module):
 
             torch.save(attn_in.detach().cpu(), _hdos.path.join(_hd_dir, "layer_attn_in.pt"))
             torch.save(attn_out.detach().cpu(), _hdos.path.join(_hd_dir, "layer_attn_out.pt"))
+            torch.save(post.detach().cpu(), _hdos.path.join(_hd_dir, "attn_hc_pre_post.pt"))
+            torch.save(comb.detach().cpu(), _hdos.path.join(_hd_dir, "attn_hc_pre_comb.pt"))
         hidden_states = self.hc_post(hidden_states, residual, post, comb)
+        if _hd_dir and getattr(self, "_dumped_hc_post", None) is None:
+            self._dumped_hc_post = True
+            import os as _hdos
+
+            torch.save(hidden_states.detach().cpu(), _hdos.path.join(_hd_dir, "attn_hc_post_out.pt"))
         residual = hidden_states.clone()
         hidden_states, post, comb = self.hc_pre(hidden_states, self.hc_ffn_fn, self.hc_ffn_scale, self.hc_ffn_base)
         hidden_states = self.post_attention_layernorm(hidden_states)
