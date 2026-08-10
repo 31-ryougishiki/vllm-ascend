@@ -1999,7 +1999,12 @@ class AscendDSAImpl(DSAAttentionImpl):
             from vllm_ascend.ascend_forward_context import get_hetero_dump_dir
 
             _hd_dir = get_hetero_dump_dir()
-            _hd_dumped = getattr(self, "_op_input_dumped", False)
+            # NOTE: must be a module-global, NOT per-instance: multiple layers
+            # (e.g. DeepSeek-V4 compress_ratios[0]=0 and [1]=0) have
+            # compress_ratio <= 1, and per-instance flags let layer1 OVERWRITE
+            # layer0's dump files with its own data (silently redirecting every
+            # attn_op_*/attn_hidden_in comparison to the wrong layer).
+            _hd_dumped = globals().get("_HETERO_OP_DUMPED")
             if _hd_dir and not _hd_dumped:
                 import os as _hdos
 
@@ -2025,7 +2030,7 @@ class AscendDSAImpl(DSAAttentionImpl):
                 **extra_attn_kwargs,
             )[0]
             if _hd_dir and not _hd_dumped:
-                self._op_input_dumped = True
+                globals()["_HETERO_OP_DUMPED"] = True
                 import os as _hdos
 
                 torch.save(q.detach().cpu(), _hdos.path.join(_hd_dir, "attn_op_q.pt"))
