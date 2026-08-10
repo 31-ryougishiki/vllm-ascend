@@ -1803,6 +1803,30 @@ class AscendDSAImpl(DSAAttentionImpl):
         ).reshape(num_tokens, -1)
         # 4) wo_b (replicated) -> full (N, dim); no cross-rank reduce (tp_size=1).
         o_wb = self.wo_b(o_wa)
+        # 4b) det-path internals dump (VLLM_HETERO_DEBUG, one-time per impl).
+        # o_full/o_wa/o_wb are FULL-token/full-head on every rank, so rank0 of
+        # each DP is directly comparable. Localizes the o_proj divergence to
+        # head-gather (o_full) vs wo_a/wo_b compute vs weights.
+        if _sdos.environ.get("VLLM_HETERO_DEBUG"):
+            if not getattr(self, "_det_internal_dumped", False):
+                self._det_internal_dumped = True
+                try:
+                    from vllm_ascend.ascend_forward_context import get_hetero_dump_dir
+                    _dh = get_hetero_dump_dir()
+                    if _dh:
+                        torch.save(o_full.detach().cpu(), _sdos.path.join(_dh, "det_o_full.pt"))
+                        torch.save(o_wa.detach().cpu(), _sdos.path.join(_dh, "det_o_wa.pt"))
+                        torch.save(o_wb.detach().cpu(), _sdos.path.join(_dh, "det_o_wb.pt"))
+                        torch.save(self.wo_a.weight.detach().cpu(), _sdos.path.join(_dh, "det_wo_a_weight.pt"))
+                        torch.save(self.wo_b.weight.detach().cpu(), _sdos.path.join(_dh, "det_wo_b_weight.pt"))
+                        if getattr(self.wo_a, "weight_scale", None) is not None:
+                            torch.save(self.wo_a.weight_scale.detach().cpu(),
+                                       _sdos.path.join(_dh, "det_wo_a_weight_scale.pt"))
+                        if getattr(self.wo_b, "weight_scale", None) is not None:
+                            torch.save(self.wo_b.weight_scale.detach().cpu(),
+                                       _sdos.path.join(_dh, "det_wo_b_weight_scale.pt"))
+                except Exception as _de:
+                    print(f"[hetero_oproj_det] internals dump failed: {_de!r}", flush=True)
         # 5) pad to padded_num_tokens, slice per-rank token chunk.
         _padded = int(getattr(_EXTRA_CTX, "padded_num_tokens", num_tokens) or num_tokens)
         if _padded > num_tokens:
