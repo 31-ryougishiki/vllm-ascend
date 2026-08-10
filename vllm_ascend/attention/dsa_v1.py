@@ -1955,6 +1955,21 @@ class AscendDSAImpl(DSAAttentionImpl):
                 qr = self.q_norm(q_a)
                 q = self.wq_b(qr).unflatten(-1, (self.n_local_heads, self.head_dim))
                 qr_pertoken_scale = None
+
+            # Heterogeneous debug: isolate the first divergence. All wq_b
+            # inputs already match (qr / weight / weight_scale), so save the
+            # RAW wq_b output (before q_rms + rotary) and the per-token scale.
+            try:
+                from vllm_ascend.ascend_forward_context import get_hetero_dump_dir
+                _hd = get_hetero_dump_dir()
+                if _hd and not globals().get("_HETERO_OP_DUMPED"):
+                    import os as _hdos
+                    torch.save(q.detach().cpu(), _hdos.path.join(_hd, "attn_wq_b_out.pt"))
+                    if qr_pertoken_scale is not None:
+                        torch.save(qr_pertoken_scale.detach().cpu(), _hdos.path.join(_hd, "attn_qr_scale.pt"))
+            except Exception:
+                pass
+
             q = DeviceOperator.apply_dsa_q_rms(q, self.eps, self.q_norm_without_weight)
 
             torch.ops._C_ascend.inplace_partial_rotary_mul(
