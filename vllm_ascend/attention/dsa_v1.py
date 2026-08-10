@@ -11,7 +11,15 @@ from vllm.config import VllmConfig, get_current_vllm_config
 from vllm.distributed import (
     get_tensor_model_parallel_rank,
     get_tensor_model_parallel_world_size,
+    tensor_model_parallel_all_gather,
 )
+
+
+def _hetero_oproj_det() -> bool:
+    """Experimental deterministic o_proj gate (VLLM_HETERO_OPROJ_DET=1)."""
+    import os
+
+    return os.environ.get("VLLM_HETERO_OPROJ_DET") == "1"
 from vllm.distributed.utils import get_current_tp_sharding_ratios, get_tp_partition_size
 from vllm.forward_context import get_forward_context
 from vllm.triton_utils import HAS_TRITON
@@ -1574,6 +1582,8 @@ class AscendDSAImpl(DSAAttentionImpl):
         return x
 
     def _forward_o_proj(self, o_proj_input: torch.Tensor, output: torch.Tensor) -> torch.Tensor:
+        if _hetero_oproj_det():
+            return self._forward_o_proj_det(o_proj_input, output)
         num_tokens = o_proj_input.shape[0]
         group_hidden_dim = o_proj_input.shape[1] * o_proj_input.shape[2] // self.n_local_groups
         o_proj_input = o_proj_input.view(num_tokens, self.n_local_groups, group_hidden_dim)
@@ -1695,6 +1705,72 @@ class AscendDSAImpl(DSAAttentionImpl):
                     output[...] = self.wo_b(o_proj_input)
                 except Exception as _e2:
                     print(f"[hetero_oproj] EXC2 {_e!r} / {_e2!r}")
+        return output
+    def _forward_o_proj_det(self, o_proj_input: torch.Tensor, output: torch.Tensor) -> torch.Tensor:
+        """Deterministic o_proj (experimental, VLLM_HETERO_OPROJ_DET=1).
+
+        The default path is a row-parallel o_proj whose reduce_scatter sums the
+        per-rank group contributions in a rank-grouping-dependent order; under
+        heterogeneous TP (different tp_size per DP) DP0 sums 4+2+2 groups and
+        DP1 sums 2+2+2+2, so the float rounding differs per token (~1e-2) and
+        the MoE router amplifies it into garbage.  Here we instead gather the
+        head-sharded attention output to the full 64 heads, run wo_a/wo_b on the
+        FULL group set (weights loaded with disable_tp=True), and slice the
+        per-rank token chunk — every rank computes the bit-identical output.
+        """
+        import os as _sdos
+        from vllm.distributed import (
+            get_tensor_model_parallel_rank,
+            get_tensor_model_parallel_world_size,
+            tensor_model_parallel_all_gather,
+        )
+        from vllm_ascend.ascend_forward_context import _EXTRA_CTX
+
+        num_tokens = o_proj_input.shape[0]
+        tp_rank = get_tensor_model_parallel_rank()
+        tp_size = get_tensor_model_parallel_world_size()
+
+        # Zero the uninitialized tail rows (num_actual .. num_tokens) so the
+        # padding positions don't introduce NaN / garbage.
+        try:
+            _fc = get_forward_context()
+            _actual = int(_fc.attn_metadata[0].num_actual_tokens)
+            if _actual < num_tokens:
+                o_proj_input = o_proj_input.clone()
+                o_proj_input[_actual:] = 0
+        except Exception:
+            pass
+
+        # 1) gather head-sharded attention output -> full n_heads.
+        o_full = tensor_model_parallel_all_gather(o_proj_input, 1)
+        # 2) reshape to (N, n_groups, group_hidden_dim).
+        n_groups = self.n_groups
+        gh = o_full.shape[1] * o_full.shape[2] // n_groups
+        o_full = o_full.reshape(num_tokens, n_groups, gh)
+        # 3) wo_a (replicated, full groups) batch matmul.
+        o_wa = torch_npu.npu_transpose_batchmatmul(
+            o_full,
+            self.wo_a.weight,
+            bias=None,
+            scale=None,
+            perm_x1=(1, 0, 2),
+            perm_x2=(0, 1, 2),
+            perm_y=(1, 0, 2),
+            batch_split_factor=1,
+        ).reshape(num_tokens, -1)
+        # 4) wo_b (replicated) -> full (N, dim); no cross-rank reduce (tp_size=1).
+        o_wb = self.wo_b(o_wa)
+        # 5) pad to padded_num_tokens, slice per-rank token chunk.
+        _padded = int(getattr(_EXTRA_CTX, "padded_num_tokens", num_tokens) or num_tokens)
+        if _padded > num_tokens:
+            o_wb = torch.nn.functional.pad(o_wb, (0, 0, 0, _padded - num_tokens))
+        _chunk = o_wb.shape[0] // tp_size
+        _start = tp_rank * _chunk
+        output[...] = o_wb[_start:_start + _chunk].contiguous()
+        if _sdos.environ.get("VLLM_HETERO_DEBUG"):
+            print(f"[hetero_oproj_det] o_full={tuple(o_full.shape)} n_groups={n_groups} "
+                  f"o_wa={tuple(o_wa.shape)} o_wb={tuple(o_wb.shape)} padded={_padded} "
+                  f"chunk={_chunk} output={tuple(output.shape)}")
         return output
 
     def forward(  # type: ignore[override]

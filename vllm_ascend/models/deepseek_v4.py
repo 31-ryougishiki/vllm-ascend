@@ -52,6 +52,19 @@ from vllm.model_executor.layers.linear import (
     ReplicatedLinear,
     RowParallelLinear,
 )
+def _hetero_oproj_det() -> bool:
+    """Experimental (gated by VLLM_HETERO_OPROJ_DET=1): load wo_a/wo_b fully
+    replicated so the o_proj does NOT do a cross-rank reduce_scatter. The
+    heterogeneous row-parallel reduction sums the per-rank group contributions
+    in a rank-grouping-dependent order (3-way vs 4-way), which introduces
+    float-rounding differences (~1e-2) that the hypersensitive MoE router
+    amplifies into garbage. Replicating the o_proj makes every rank compute the
+    identical full output (bit-identical across DP groups)."""
+    import os
+
+    return os.environ.get("VLLM_HETERO_OPROJ_DET") == "1"
+
+
 from vllm.model_executor.layers.logits_processor import LogitsProcessor
 from vllm.model_executor.layers.quantization import QuantizationConfig
 from vllm.model_executor.layers.vocab_parallel_embedding import ParallelLMHead, VocabParallelEmbedding
@@ -802,6 +815,7 @@ class DeepseekV4Attention(nn.Module):
             quant_config=quant_config,
             prefix=f"{prefix}.wo_a",
             return_bias=False,
+            disable_tp=_hetero_oproj_det(),
         )
         self.wo_b = RowParallelLinear(
             self.n_groups * config.o_lora_rank,
@@ -810,6 +824,7 @@ class DeepseekV4Attention(nn.Module):
             quant_config=quant_config,
             prefix=f"{prefix}.wo_b",
             return_bias=False,
+            disable_tp=_hetero_oproj_det(),
         )
         self.compress_ratio = get_dsv4_compress_ratio(config, config_layer_idx)
 
