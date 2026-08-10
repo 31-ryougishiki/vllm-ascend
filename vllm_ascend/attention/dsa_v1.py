@@ -1448,6 +1448,25 @@ class AscendDSAImpl(DSAAttentionImpl):
         self.multistream_dsv4_dsa_overlap = ascend_config.multistream_dsv4_dsa_overlap
         self.vllm_config = get_current_vllm_config()
 
+        # Per-rank n_local_heads, cached at construction (the current vllm
+        # config is NOT available inside the model forward at runtime, so we
+        # cannot call get_current_tp_sharding_ratios() there).  Used by the
+        # deterministic o_proj path (_forward_o_proj_det).
+        self._hetero_local_sizes: list[int] | None = None
+        if _hetero_oproj_det() and self.vllm_config is not None and getattr(
+            self.vllm_config.parallel_config, "is_heterogeneous_tp", False
+        ):
+            try:
+                _ratios = self.vllm_config.parallel_config.get_sharding_ratios_for_dp(
+                    self.vllm_config.parallel_config.data_parallel_rank
+                )
+                _tp = get_tensor_model_parallel_world_size()
+                self._hetero_local_sizes = [
+                    get_tp_partition_size(self.num_heads, r, _tp, _ratios) for r in range(_tp)
+                ]
+            except Exception:
+                self._hetero_local_sizes = None
+
         # indexer param
         if self.indexer is not None:
             self.indexer_heads: int = self.indexer.n_heads
@@ -1747,12 +1766,13 @@ class AscendDSAImpl(DSAAttentionImpl):
         # n_local_heads (DP0: 32/16/16). Pad each rank's heads to the group max
         # (zeros at the tail), gather the uniform tensors, then slice the valid
         # [0:n_heads] — rank order preserved (rank0 heads, rank1 heads, ...).
-        from vllm.distributed.utils import get_current_tp_sharding_ratios, get_tp_partition_size
-
-        n_heads = self.num_heads
         head_dim = self.head_dim
-        ratios = get_current_tp_sharding_ratios()
-        local_sizes = [get_tp_partition_size(n_heads, r, tp_size, ratios) for r in range(tp_size)]
+        local_sizes = self._hetero_local_sizes
+        if not local_sizes:
+            raise RuntimeError(
+                "VLLM_HETERO_OPROJ_DET requires heterogeneous TP + _hetero_local_sizes "
+                "(computed in AscendDSAImpl.__init__)."
+            )
         max_local = max(local_sizes)
         if o_proj_input.shape[1] < max_local:
             _op = torch.zeros(
@@ -1765,7 +1785,7 @@ class AscendDSAImpl(DSAAttentionImpl):
         # first `local_sizes[r]` of its padded block; the rest are zero pad).
         o_full = o_full.view(num_tokens, tp_size, max_local, head_dim)
         _valid = [o_full[:, r, : local_sizes[r]] for r in range(tp_size)]
-        o_full = torch.cat(_valid, dim=1)  # (N, n_heads, head_dim)
+        o_full = torch.cat(_valid, dim=1)  # (N, sum(local_sizes), head_dim)
         # 2) reshape to (N, n_groups, group_hidden_dim).
         n_groups = self.n_group
         gh = o_full.shape[1] * o_full.shape[2] // n_groups
