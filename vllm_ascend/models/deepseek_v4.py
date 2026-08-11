@@ -65,6 +65,21 @@ def _hetero_oproj_det() -> bool:
     return os.environ.get("VLLM_HETERO_OPROJ_DET") == "1"
 
 
+def _hetero_shared_exp_det() -> bool:
+    """Experimental (gated by VLLM_HETERO_SHARED_EXP_DET=1): replicate the
+    shared expert (disable_tp) so every rank computes the FULL shared-expert
+    contribution instead of a TP shard.  Under the ALLGATHER + FlashComm1 SP
+    path the sharded shared output is never cross-rank reduced, so DP0
+    (sharded [2,1,1]) and DP1 (sharded 4-way) get different shared partials for
+    the same token — an O(1) divergence the MoE router amplifies into garbage.
+    WARNING: replication also changes the decode path (no-SP TP all-reduce of
+    the combined output would sum a replicated shared tp_size times); verify
+    prefill bit-identity AND coherent decode before formalizing."""
+    import os
+
+    return os.environ.get("VLLM_HETERO_SHARED_EXP_DET") == "1"
+
+
 from vllm.model_executor.layers.logits_processor import LogitsProcessor
 from vllm.model_executor.layers.quantization import QuantizationConfig
 from vllm.model_executor.layers.vocab_parallel_embedding import ParallelLMHead, VocabParallelEmbedding
@@ -419,13 +434,30 @@ class DeepseekV4MoE(nn.Module):
         else:
             intermediate_size = config.moe_intermediate_size * config.n_shared_experts
 
+            # A single shared expert is applied to EVERY token, so its weights
+            # must be replicated across TP ranks (disable_tp) — a TP shard of a
+            # shared expert only produces a partial contribution that nothing
+            # ever cross-rank reduces under the ALLGATHER + FlashComm1 SP path.
+            # shared_expert_dp_enabled() (True whenever enable_sp) is exactly
+            # the condition under which the MoE runner/combine skips the shared
+            # output all-reduce, so the construction must agree with it or the
+            # same token gets a DIFFERENT shared partial on DP0 (sharded
+            # [2,1,1]) vs DP1 (sharded 4-way) under heterogeneous TP — an
+            # O(1) divergence the MoE router amplifies into garbage.
+            #
+            # Gated by VLLM_HETERO_SHARED_EXP_DET=1 because replication changes
+            # the decode path too: without SP (flash_comm_v1 off) the combined
+            # MoE output is TP all-reduced, so a replicated (full) shared expert
+            # would be summed tp_size times.  Verify prefill layer_mlp_out == 0
+            # AND that generation (decode) is coherent before formalizing.
+            _repl_shared = _hetero_shared_exp_det()
             self.shared_experts = DeepseekV2MLP(
                 hidden_size=config.hidden_size,
                 intermediate_size=intermediate_size,
                 hidden_act=config.hidden_act,
                 swiglu_limit=self.swiglu_limit,
                 quant_config=quant_config,
-                is_sequence_parallel=self.is_sequence_parallel,
+                is_sequence_parallel=self.is_sequence_parallel or _repl_shared,
                 reduce_results=False,
                 prefix=f"{prefix}.shared_experts",
             )

@@ -1827,7 +1827,19 @@ class AscendDSAImpl(DSAAttentionImpl):
                                        _sdos.path.join(_dh, "det_wo_b_weight_scale.pt"))
                 except Exception as _de:
                     print(f"[hetero_oproj_det] internals dump failed: {_de!r}", flush=True)
-        # 5) pad to padded_num_tokens, slice per-rank token chunk.
+        # 5) Write the per-rank share.  Under FlashComm1 SP the attention
+        # output is per-rank token-chunked (padded_num_tokens // tp_size rows)
+        # and o_wb is padded to padded_num_tokens then sliced contiguously.
+        # WITHOUT SP (e.g. decode, num_tokens <= 1000) every rank holds the
+        # FULL token set, so the output buffer holds num_tokens rows and o_wb
+        # must be written in full — slicing padded_num_tokens // tp would
+        # misalign (and shape-mismatch for DP1-3, e.g. output 4 rows vs a
+        # 3-row slice).
+        _fc = get_forward_context()
+        _sp_on = bool(getattr(_fc, "flash_comm_v1_enabled", False))
+        if not _sp_on:
+            output[...] = o_wb[: output.shape[0]].contiguous()
+            return output
         _padded = int(getattr(_EXTRA_CTX, "padded_num_tokens", num_tokens) or num_tokens)
         if _padded > num_tokens:
             o_wb = torch.nn.functional.pad(o_wb, (0, 0, 0, _padded - num_tokens))
