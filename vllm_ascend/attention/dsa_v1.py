@@ -1969,12 +1969,13 @@ class AscendDSAImpl(DSAAttentionImpl):
         cos = attn_metadata[0].cos[layer_name]
         sin = attn_metadata[0].sin[layer_name]
 
-        # FIX (hetero): zero the padding rows BEFORE the in-place rope.  The
-        # rows [actual_tokens:num_tokens] come from torch.empty() and hold
-        # uninitialized (often NaN) memory; feeding NaN into the rope kernel
-        # makes its vectorized output diverge per-rank (bit-identical input +
-        # cos -> different output across DP groups with different n_local_heads).
-        # The old det-path zeroing ran AFTER the rope, too late to protect it.
+        # FIX (hetero): the padding rows [actual_tokens:num_tokens] come from
+        # torch.empty() and hold uninitialized (often NaN) memory.  Feeding NaN
+        # into the rope kernel makes its vectorized output diverge per-rank
+        # (bit-identical input + cos -> different output across DP groups with
+        # different n_local_heads).  Zero them BEFORE the rope, and rope ONLY
+        # the real rows [0:actual_tokens] — exactly the shape the (clean) q-rope
+        # uses — so the o_proj rope never sees a padding row or a NaN.
         if actual_tokens < o_proj_input.shape[0]:
             o_proj_input[actual_tokens:] = 0
 
@@ -1993,9 +1994,9 @@ class AscendDSAImpl(DSAAttentionImpl):
             pass
 
         torch.ops._C_ascend.inplace_partial_rotary_mul(
-            o_proj_input.unsqueeze(1),
-            cos,
-            -sin,
+            o_proj_input[:actual_tokens].unsqueeze(1),
+            cos[:actual_tokens],
+            -sin[:actual_tokens],
             rotary_mode="interleave",
             partial_slice=[self.nope_head_dim, self.head_dim],
         )
