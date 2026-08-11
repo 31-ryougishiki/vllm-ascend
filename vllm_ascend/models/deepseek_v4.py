@@ -1075,8 +1075,8 @@ class DeepseekV2DecoderLayer(nn.Module):
         import os as _ldos
         if _ldos.environ.get("VLLM_HETERO_DEBUG"):
             try:
-                from vllm_ascend.ascend_forward_context import _EXTRA_CTX, get_hetero_dump_dir
-                if getattr(_EXTRA_CTX, "hetero_capture", False):
+                from vllm_ascend.ascend_forward_context import get_hetero_capture, get_hetero_dump_dir
+                if get_hetero_capture():
                     _ld = get_hetero_dump_dir()
                     if _ld:
                         torch.save(residual.detach().cpu(), _ldos.path.join(_ld, "hc_residual.pt"))
@@ -1237,18 +1237,33 @@ class DeepseekV4Model(nn.Module):
 
         if _os.environ.get("VLLM_HETERO_DEBUG"):
             try:
-                from vllm_ascend.ascend_forward_context import _EXTRA_CTX, set_hetero_dump_dir
+                from vllm_ascend.ascend_forward_context import (
+                    _EXTRA_CTX,
+                    get_hetero_capture,
+                    set_hetero_capture,
+                    set_hetero_dump_dir,
+                )
                 # Single per-forward capture gate: ALL probes (embedding, layer,
-                # attention, o_proj) check _EXTRA_CTX.hetero_capture, so every
-                # dump lands in the SAME qualifying forward.  The previous
-                # per-name one-time flags scattered probes across different
-                # forwards (a 12-token warmup captured model_embed while the
-                # real 1428-token prefill captured hc_residual), making every
-                # cross-probe comparison invalid.
-                _EXTRA_CTX.hetero_capture = False
+                # attention, o_proj) check get_hetero_capture(), so every dump
+                # lands in the SAME qualifying forward.  The previous per-name
+                # one-time flags scattered probes across different forwards (a
+                # 12-token warmup captured model_embed while the real prefill
+                # captured hc_residual), making every cross-probe comparison
+                # invalid.  Kept off _EXTRA_CTX because its proxy only allows
+                # the whitelisted extra_attrs.
+                set_hetero_capture(False)
                 _n = int(input_ids.numel()) if input_ids is not None else 0
                 _nlow = int(_os.environ.get("VLLM_HETERO_DEBUG_MIN_TOKENS", "1000"))
                 _nhigh = int(_os.environ.get("VLLM_HETERO_DEBUG_MAX_TOKENS", "9000"))
+                _print_count = int(getattr(self, "_hetero_debug_print", 0))
+                if _print_count < 20:
+                    self._hetero_debug_print = _print_count + 1
+                    import sys as _sys
+                    print(
+                        f"[hetero] n={_n} qualify={_nlow <= _n <= _nhigh} "
+                        f"range=[{_nlow},{_nhigh}]",
+                        file=_sys.stderr, flush=True,
+                    )
                 if _nlow <= _n <= _nhigh:
                     from vllm.distributed.parallel_state import (
                         get_tensor_model_parallel_rank,
@@ -1275,7 +1290,7 @@ class DeepseekV4Model(nn.Module):
                     _os.makedirs(_dout, exist_ok=True)
                     set_hetero_dump_dir(_dout)
                     self._hetero_fwd_count = _count + 1
-                    _EXTRA_CTX.hetero_capture = True
+                    set_hetero_capture(True)
                     # raw embedding vs repeated layer input, same capture forward
                     try:
                         if "model_embed" in locals():

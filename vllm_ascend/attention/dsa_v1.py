@@ -27,8 +27,8 @@ def _maybe_dump_oproj(name: str, t: torch.Tensor) -> None:
     forward (VLLM_HETERO_DEBUG + VLLM_HETERO_OPROJ_DET), so DP groups can be
     compared at each stage: input -> head-gather -> wo_a -> wo_b -> output.
 
-    ALL probes share the single _EXTRA_CTX.hetero_capture gate (set by the
-    model forward for one qualifying forward), so every dump lands in the SAME
+    ALL probes share the single get_hetero_capture() gate (set by the model
+    forward for one qualifying forward), so every dump lands in the SAME
     forward -- the previous per-name one-time flags scattered probes across
     different forwards and made cross-probe comparisons invalid."""
     import os as _hdos
@@ -36,8 +36,8 @@ def _maybe_dump_oproj(name: str, t: torch.Tensor) -> None:
     if not _hdos.environ.get("VLLM_HETERO_DEBUG"):
         return
     try:
-        from vllm_ascend.ascend_forward_context import _EXTRA_CTX, get_hetero_dump_dir
-        if not getattr(_EXTRA_CTX, "hetero_capture", False):
+        from vllm_ascend.ascend_forward_context import get_hetero_capture, get_hetero_dump_dir
+        if not get_hetero_capture():
             return
         _hd = get_hetero_dump_dir()
         if not _hd:

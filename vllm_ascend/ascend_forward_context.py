@@ -47,6 +47,22 @@ def get_hetero_dump_dir() -> str | None:
     return _HETERO_DUMP_DIR
 
 
+# Per-forward capture flag shared by ALL hetero debug probes (embedding, layer,
+# attention, o_proj).  Set True by the model forward for ONE qualifying forward
+# so every dump lands in the SAME forward.  Kept as a module global (not on
+# _EXTRA_CTX) because _ExtraForwardContextProxy only allows its extra_attrs.
+_HETERO_CAPTURE = False
+
+
+def set_hetero_capture(v: bool) -> None:
+    global _HETERO_CAPTURE
+    _HETERO_CAPTURE = v
+
+
+def get_hetero_capture() -> bool:
+    return _HETERO_CAPTURE
+
+
 @contextmanager
 def override_mrv2_in_profile_run(enabled: bool):
     """Override MRv2's extra profile-run marker for one forward path.
