@@ -981,11 +981,6 @@ class DeepseekV4Attention(nn.Module):
         return self.dsa_attn(positions, hidden_states, llama_4_scaling)
 
 
-# Debug hook: the model forward sets the active dump dir (via
-# set_hetero_dump_dir in ascend_forward_context); the first decoder layer that
-# runs dumps its attention/MoE internals there.
-_HETERO_LAYER_DUMPED = False
-
 
 class DeepseekV2DecoderLayer(nn.Module):
     def __init__(
@@ -1065,42 +1060,16 @@ class DeepseekV2DecoderLayer(nn.Module):
         residual: torch.Tensor | None,
         llama_4_scaling: torch.Tensor | None = None,
     ) -> torch.Tensor:
-        global _HETERO_LAYER_DUMPED
-        from vllm_ascend.ascend_forward_context import get_hetero_dump_dir
-
-        _hd_dir = get_hetero_dump_dir()
         residual = hidden_states.clone()
         hidden_states, post, comb = self.hc_pre(hidden_states, self.hc_attn_fn, self.hc_attn_scale, self.hc_attn_base)
         hidden_states = self.input_layernorm(hidden_states)
-        attn_in = hidden_states
         attn_kwargs = {"positions": positions, "hidden_states": hidden_states, "llama_4_scaling": llama_4_scaling}
         hidden_states = self.self_attn(**attn_kwargs)
-        attn_out = hidden_states
-        attn_hc_post_out = self.hc_post(hidden_states, residual, post, comb)
-        if _hd_dir and not _HETERO_LAYER_DUMPED:
-            _HETERO_LAYER_DUMPED = True
-            import os as _hdos
-
-            torch.save(attn_in.detach().cpu(), _hdos.path.join(_hd_dir, "layer_attn_in.pt"))
-            torch.save(attn_out.detach().cpu(), _hdos.path.join(_hd_dir, "layer_attn_out.pt"))
-            # hc_pre post/comb + hc_post output (isolate the o_proj -> hc_post ->
-            # layernorm -> mlp_in gap when layer_attn_out is clean).
-            torch.save(post.detach().cpu(), _hdos.path.join(_hd_dir, "attn_hc_pre_post.pt"))
-            torch.save(comb.detach().cpu(), _hdos.path.join(_hd_dir, "attn_hc_pre_comb.pt"))
-            torch.save(attn_hc_post_out.detach().cpu(), _hdos.path.join(_hd_dir, "attn_hc_post_out.pt"))
-        hidden_states = attn_hc_post_out
+        hidden_states = self.hc_post(hidden_states, residual, post, comb)
         residual = hidden_states.clone()
         hidden_states, post, comb = self.hc_pre(hidden_states, self.hc_ffn_fn, self.hc_ffn_scale, self.hc_ffn_base)
         hidden_states = self.post_attention_layernorm(hidden_states)
-        mlp_in = hidden_states
         hidden_states = self.mlp(hidden_states)
-        mlp_out = hidden_states
-        if _hd_dir and getattr(self, "_dumped_mlp", None) is None:
-            self._dumped_mlp = True
-            import os as _hdos
-
-            torch.save(mlp_in.detach().cpu(), _hdos.path.join(_hd_dir, "layer_mlp_in.pt"))
-            torch.save(mlp_out.detach().cpu(), _hdos.path.join(_hd_dir, "layer_mlp_out.pt"))
         hidden_states = self.hc_post(hidden_states, residual, post, comb)
 
         return hidden_states, residual
@@ -1236,74 +1205,44 @@ class DeepseekV4Model(nn.Module):
         if get_pp_group().is_first_rank:
             hidden_states = hidden_states.unsqueeze(1).repeat(1, self.hc_mult, 1)  # (b, s, h) -> (b, s, c, h)
 
-        # --- Heterogeneous debug hook (VLLM_HETERO_DEBUG): dump per-layer
-        # hidden states for the first few qualifying forwards so DP ranks can
-        # be compared. Each dump lands in <dir>/dp{dp}_tp{tp}/fwd{n}/ and every
-        # decision is logged, so warmup batches simply take an early fwd slot
-        # and the first real request is captured as the next one.
+        # Minimal hetero dump-dir setup (VLLM_HETERO_DEBUG): the o_proj rope
+        # input/output dumps in dsa_v1.py need an active dump dir.  No per-layer
+        # dumps here — this only computes dp/tp and sets the dir.
         import os as _os
 
-        _do_dump = False
-        _dout = ""
-        _max_layer = 0
         if _os.environ.get("VLLM_HETERO_DEBUG"):
-            from vllm_ascend.ascend_forward_context import _EXTRA_CTX
+            try:
+                from vllm.distributed.parallel_state import (
+                    get_tensor_model_parallel_rank,
+                    get_tensor_model_parallel_world_size,
+                    get_world_group,
+                )
+                from vllm_ascend.ascend_forward_context import _EXTRA_CTX, set_hetero_dump_dir
 
-            _n = int(input_ids.numel()) if input_ids is not None else 0
-            _ic = int(getattr(self, "_inner_call", 0))
-            if _ic < 30:
-                print(f"[hetero_debug] INNER forward call={_ic} num_tokens={_n}")
-            self._inner_call = _ic + 1
-            _nlow = int(_os.environ.get("VLLM_HETERO_DEBUG_MIN_TOKENS", "1000"))
-            _nhigh = int(_os.environ.get("VLLM_HETERO_DEBUG_MAX_TOKENS", "9000"))
-            _max_layer = int(_os.environ.get("VLLM_HETERO_DEBUG_LAYERS", "5"))
-            _max_dumps = int(_os.environ.get("VLLM_HETERO_DEBUG_N", "3"))
-            _base = _os.path.abspath(_os.environ.get("VLLM_HETERO_DEBUG_DIR", "hetero_debug"))
-            _count = int(getattr(self, "_hetero_dump_count", 0))
-            if _count >= _max_dumps:
-                print(f"[hetero_debug] skip dump: already dumped {_count} batches (num_tokens={_n})")
-            elif not (_nlow <= _n <= _nhigh):
-                print(f"[hetero_debug] skip dump: num_tokens={_n} not in [{_nlow},{_nhigh}]")
-            else:
-                try:
-                    from vllm.distributed.parallel_state import (
-                        get_tensor_model_parallel_rank,
-                        get_tensor_model_parallel_world_size,
-                        get_world_group,
-                    )
+                _grank = int(get_world_group().rank)
+                _tp_sizes = getattr(_EXTRA_CTX, "per_dp_tp_sizes", None)
+                if _tp_sizes:
+                    _dp, _tr = 0, _grank
+                    while _tr >= _tp_sizes[_dp]:
+                        _tr -= _tp_sizes[_dp]
+                        _dp += 1
+                else:
+                    _tr = int(get_tensor_model_parallel_rank())
+                    _dp = _grank // int(get_tensor_model_parallel_world_size())
+                _count = int(getattr(self, "_hetero_fwd_count", 0))
+                _dout = _os.path.join(
+                    _os.path.abspath(_os.environ.get("VLLM_HETERO_DEBUG_DIR", "hetero_debug")),
+                    f"dp{_dp}_tp{_tr}",
+                    f"fwd{_count}",
+                )
+                _os.makedirs(_dout, exist_ok=True)
+                set_hetero_dump_dir(_dout)
+                self._hetero_fwd_count = _count + 1
+            except Exception:
+                pass
 
-                    # get_current_vllm_config() is unavailable inside the model
-                    # forward at runtime; derive dp/tp from the process groups.
-                    _grank = int(get_world_group().rank)
-                    _tp_sizes = getattr(_EXTRA_CTX, "per_dp_tp_sizes", None)
-                    if _tp_sizes:
-                        _dp, _tr = 0, _grank
-                        while _tr >= _tp_sizes[_dp]:
-                            _tr -= _tp_sizes[_dp]
-                            _dp += 1
-                    else:
-                        _tp_world = int(get_tensor_model_parallel_world_size())
-                        _tr = int(get_tensor_model_parallel_rank())
-                        _dp = _grank // _tp_world
-                    _dout = _os.path.join(_base, f"dp{_dp}_tp{_tr}", f"fwd{_count}")
-                    _os.makedirs(_dout, exist_ok=True)
-                    from vllm_ascend.ascend_forward_context import set_hetero_dump_dir
-
-                    set_hetero_dump_dir(_dout)
-                    torch.save(input_ids.detach().cpu(), _os.path.join(_dout, "input_ids.pt"))
-                    torch.save(hidden_states.detach().cpu(), _os.path.join(_dout, "input_hidden.pt"))
-                    print(f"[hetero_debug] dumping to {_dout} (num_tokens={_n})")
-                    self._hetero_dump_count = _count + 1
-                    _do_dump = True
-                except Exception as _e:
-                    print(f"[hetero_debug] dump failed: {_e!r}")
-                    _do_dump = False
-        _layer_idx = 0
         for layer in islice(self.layers, self.start_layer, self.end_layer):
             hidden_states, residual = layer(positions, hidden_states, residual, llama_4_scaling)
-            if _do_dump and _layer_idx < _max_layer:
-                torch.save(hidden_states.detach().cpu(), _os.path.join(_dout, f"layer{_layer_idx}.pt"))
-            _layer_idx += 1
 
         # Stash pre-hc_head residual for the MTP draft (captured copy_).
         # When FlashComm1 (sequence parallelism) is enabled, tokens are
@@ -1439,21 +1378,6 @@ class AscendDeepseekV4ForCausalLM(nn.Module, SupportsPP, DeepseekV2MixtureOfExpe
         intermediate_tensors: IntermediateTensors | None = None,
         inputs_embeds: torch.Tensor | None = None,
     ) -> torch.Tensor | IntermediateTensors:
-        import os as _os
-
-        if _os.environ.get("VLLM_HETERO_DEBUG"):
-            _c = int(getattr(self, "_outer_call", 0))
-            if _c < 30:
-                _n = (
-                    int(input_ids.numel())
-                    if input_ids is not None
-                    else (int(inputs_embeds.shape[0]) if inputs_embeds is not None else -1)
-                )
-                print(
-                    f"[hetero_debug] OUTER forward call={_c} num_tokens={_n} "
-                    f"input_ids_shape={None if input_ids is None else tuple(input_ids.shape)}"
-                )
-            self._outer_call = _c + 1
         hidden_states = self.model(input_ids, positions, intermediate_tensors, inputs_embeds)
         return hidden_states
 
@@ -1461,13 +1385,6 @@ class AscendDeepseekV4ForCausalLM(nn.Module, SupportsPP, DeepseekV2MixtureOfExpe
         self,
         hidden_states: torch.Tensor,
     ) -> torch.Tensor | None:
-        import os as _os
-
-        if _os.environ.get("VLLM_HETERO_DEBUG"):
-            _c = int(getattr(self, "_logits_call", 0))
-            if _c < 30:
-                print(f"[hetero_debug] compute_logits call={_c} hidden_shape={tuple(hidden_states.shape)}")
-            self._logits_call = _c + 1
         logits = self.logits_processor(self.lm_head, hidden_states)
         return logits
 

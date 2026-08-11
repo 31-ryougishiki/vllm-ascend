@@ -1708,22 +1708,7 @@ class AscendDSAImpl(DSAAttentionImpl):
                 batch_split_factor=1,
             )
             o_proj_input = o_proj_input.reshape(num_tokens, -1)
-            try:
-                from vllm_ascend.ascend_forward_context import get_hetero_dump_dir
-                _hd = get_hetero_dump_dir()
-                if _hd and not globals().get("_OPROJ_WB_DUMPED"):
-                    import os as _hdos
-                    globals()["_OPROJ_WB_DUMPED"] = True
-                    _wb_out = self.wo_b(o_proj_input)
-                    torch.save(_wb_out.detach().cpu(), _hdos.path.join(_hd, "attn_wo_b_out.pt"))
-                    output[...] = _wb_out
-                else:
-                    output[...] = self.wo_b(o_proj_input)
-            except Exception as _e:
-                try:
-                    output[...] = self.wo_b(o_proj_input)
-                except Exception as _e2:
-                    print(f"[hetero_oproj] EXC2 {_e!r} / {_e2!r}")
+            output[...] = self.wo_b(o_proj_input)
         return output
     def _forward_o_proj_det(self, o_proj_input: torch.Tensor, output: torch.Tensor) -> torch.Tensor:
         """Deterministic o_proj (experimental, VLLM_HETERO_OPROJ_DET=1).
@@ -1737,7 +1722,6 @@ class AscendDSAImpl(DSAAttentionImpl):
         FULL group set (weights loaded with disable_tp=True), and slice the
         per-rank token chunk — every rank computes the bit-identical output.
         """
-        import os as _sdos
         from vllm.distributed import (
             get_tensor_model_parallel_rank,
             get_tensor_model_parallel_world_size,
@@ -1759,21 +1743,6 @@ class AscendDSAImpl(DSAAttentionImpl):
                 o_proj_input[_actual:] = 0
         except Exception:
             pass
-
-        # 0b) DIAGNOSTIC: dump the post-rope o_proj_input (the exact step
-        # between the bit-identical attn_op_out and the divergent det_o_full).
-        # If this matches 0.0 across DPs the bug is in the head-gather below;
-        # if it diverges, the bug is in the rope / o_proj_input assembly.
-        if _sdos.environ.get("VLLM_HETERO_DEBUG"):
-            if not getattr(self, "_det_internal_dumped", False):
-                try:
-                    from vllm_ascend.ascend_forward_context import get_hetero_dump_dir
-                    _dh = get_hetero_dump_dir()
-                    if _dh:
-                        torch.save(o_proj_input.detach().cpu(),
-                                   _sdos.path.join(_dh, "det_o_proj_input.pt"))
-                except Exception as _de:
-                    print(f"[hetero_oproj_det] o_proj_input dump failed: {_de!r}", flush=True)
 
         # 1) gather head-sharded attention output -> full n_heads.
         # NOTE: tensor_model_parallel_all_gather requires EVERY rank to send the
@@ -1801,19 +1770,6 @@ class AscendDSAImpl(DSAAttentionImpl):
         o_full = o_full.view(num_tokens, tp_size, max_local, head_dim)
         _valid = [o_full[:, r, : local_sizes[r]] for r in range(tp_size)]
         o_full = torch.cat(_valid, dim=1)  # (N, sum(local_sizes), head_dim)
-        # 1b) DIAGNOSTIC: dump the head-gathered (pre-reshape) o_full.
-        # If det_o_proj_input matches but this diverges, the bug is in the
-        # head-gather (all_gather / extract / cat), not the reshape.
-        if _sdos.environ.get("VLLM_HETERO_DEBUG"):
-            if not getattr(self, "_det_internal_dumped", False):
-                try:
-                    from vllm_ascend.ascend_forward_context import get_hetero_dump_dir
-                    _dh = get_hetero_dump_dir()
-                    if _dh:
-                        torch.save(o_full.detach().cpu(),
-                                   _sdos.path.join(_dh, "det_o_full_gathered.pt"))
-                except Exception as _de:
-                    print(f"[hetero_oproj_det] gathered dump failed: {_de!r}", flush=True)
         # 2) reshape to (N, n_groups, group_hidden_dim).
         n_groups = self.n_group
         gh = o_full.shape[1] * o_full.shape[2] // n_groups
@@ -1831,30 +1787,6 @@ class AscendDSAImpl(DSAAttentionImpl):
         ).reshape(num_tokens, -1)
         # 4) wo_b (replicated) -> full (N, dim); no cross-rank reduce (tp_size=1).
         o_wb = self.wo_b(o_wa)
-        # 4b) det-path internals dump (VLLM_HETERO_DEBUG, one-time per impl).
-        # o_full/o_wa/o_wb are FULL-token/full-head on every rank, so rank0 of
-        # each DP is directly comparable. Localizes the o_proj divergence to
-        # head-gather (o_full) vs wo_a/wo_b compute vs weights.
-        if _sdos.environ.get("VLLM_HETERO_DEBUG"):
-            if not getattr(self, "_det_internal_dumped", False):
-                self._det_internal_dumped = True
-                try:
-                    from vllm_ascend.ascend_forward_context import get_hetero_dump_dir
-                    _dh = get_hetero_dump_dir()
-                    if _dh:
-                        torch.save(o_full.detach().cpu(), _sdos.path.join(_dh, "det_o_full.pt"))
-                        torch.save(o_wa.detach().cpu(), _sdos.path.join(_dh, "det_o_wa.pt"))
-                        torch.save(o_wb.detach().cpu(), _sdos.path.join(_dh, "det_o_wb.pt"))
-                        torch.save(self.wo_a.weight.detach().cpu(), _sdos.path.join(_dh, "det_wo_a_weight.pt"))
-                        torch.save(self.wo_b.weight.detach().cpu(), _sdos.path.join(_dh, "det_wo_b_weight.pt"))
-                        if getattr(self.wo_a, "weight_scale", None) is not None:
-                            torch.save(self.wo_a.weight_scale.detach().cpu(),
-                                       _sdos.path.join(_dh, "det_wo_a_weight_scale.pt"))
-                        if getattr(self.wo_b, "weight_scale", None) is not None:
-                            torch.save(self.wo_b.weight_scale.detach().cpu(),
-                                       _sdos.path.join(_dh, "det_wo_b_weight_scale.pt"))
-                except Exception as _de:
-                    print(f"[hetero_oproj_det] internals dump failed: {_de!r}", flush=True)
         # 5) Write the per-rank share.  Under FlashComm1 SP the attention
         # output is per-rank token-chunked (padded_num_tokens // tp_size rows)
         # and o_wb is padded to padded_num_tokens then sliced contiguously.
@@ -1874,10 +1806,6 @@ class AscendDSAImpl(DSAAttentionImpl):
         _chunk = o_wb.shape[0] // tp_size
         _start = tp_rank * _chunk
         output[...] = o_wb[_start:_start + _chunk].contiguous()
-        if _sdos.environ.get("VLLM_HETERO_DEBUG"):
-            print(f"[hetero_oproj_det] o_full={tuple(o_full.shape)} n_groups={n_groups} "
-                  f"o_wa={tuple(o_wa.shape)} o_wb={tuple(o_wb.shape)} padded={_padded} "
-                  f"chunk={_chunk} output={tuple(output.shape)}", flush=True)
         return output
 
     def forward(  # type: ignore[override]
@@ -1909,35 +1837,6 @@ class AscendDSAImpl(DSAAttentionImpl):
         has_decode = attn_metadata[0].num_decodes > 0
         decode_tokens = attn_metadata[0].num_decode_tokens
         actual_tokens = attn_metadata[0].num_actual_tokens
-
-        # Heterogeneous debug: dump the batch/decode/prefill metadata that
-        # decides the [decode_tokens:actual_tokens] slice. The all-gather
-        # output (tp_gather_out) is identical across DPs but attn_hidden_in
-        # (= all_gather output sliced by these values) diverges, so these
-        # values must be compared per DP.
-        try:
-            from vllm_ascend.ascend_forward_context import _EXTRA_CTX, get_hetero_dump_dir
-            _hd = get_hetero_dump_dir()
-            if _hd and not getattr(self, "_meta_dumped", False):
-                import os as _hdos
-                self._meta_dumped = True
-                _m = attn_metadata[0]
-                _qsl = None
-                if getattr(_m, "prefill", None) is not None:
-                    _qsl = _m.prefill.query_start_loc
-                torch.save({
-                    "num_actual_tokens": int(actual_tokens),
-                    "num_decode_tokens": int(decode_tokens),
-                    "num_input_tokens": int(getattr(_m, "num_input_tokens", -1)),
-                    "num_decodes": int(getattr(_m, "num_decodes", -1)),
-                    "num_prefills": int(getattr(_m, "num_prefills", -1)),
-                    "num_tokens_ctx": int(getattr(_EXTRA_CTX, "num_tokens", -1)),
-                    "padded_num_tokens": int(getattr(_EXTRA_CTX, "padded_num_tokens", -1)),
-                    "pad_size": int(getattr(_EXTRA_CTX, "pad_size", -1)),
-                    "query_start_loc": None if _qsl is None else _qsl.detach().cpu(),
-                }, _hdos.path.join(_hd, "attn_meta.pt"))
-        except Exception:
-            pass
 
         # Process for Flash Comm V1
         hidden_states = torch.ops.vllm.maybe_all_gather_and_maybe_unpad(hidden_states, need_gather_q_kv)
@@ -1979,20 +1878,6 @@ class AscendDSAImpl(DSAAttentionImpl):
         if actual_tokens < o_proj_input.shape[0]:
             o_proj_input[actual_tokens:] = 0
 
-        # DIAGNOSTIC: the o_proj rope cos/sin.  If det_o_proj_input diverges,
-        # compare these across DPs (they must be identical full-range tensors,
-        # NOT per-rank position slices).
-        try:
-            from vllm_ascend.ascend_forward_context import get_hetero_dump_dir
-            _hd = get_hetero_dump_dir()
-            if _hd and not globals().get("_OPROJ_ROPE_DUMPED"):
-                globals()["_OPROJ_ROPE_DUMPED"] = True
-                import os as _hdos
-                torch.save(cos.detach().cpu(), _hdos.path.join(_hd, "oproj_rope_cos.pt"))
-                torch.save(sin.detach().cpu(), _hdos.path.join(_hd, "oproj_rope_sin.pt"))
-        except Exception:
-            pass
-
         # DIAGNOSTIC: rope input (pre-rope, after padding zeroing).
         try:
             from vllm_ascend.ascend_forward_context import get_hetero_dump_dir
@@ -2025,27 +1910,6 @@ class AscendDSAImpl(DSAAttentionImpl):
             pass
 
         # o
-        try:
-            from vllm_ascend.ascend_forward_context import get_hetero_dump_dir
-            _hd = get_hetero_dump_dir()
-            if _hd and not globals().get("_OPROJ_META_DUMPED"):
-                globals()["_OPROJ_META_DUMPED"] = True
-                import os as _hdos
-                torch.save({
-                    "n_local_heads": self.n_local_heads,
-                    "n_local_groups": self.n_local_groups,
-                    "num_tokens_ctx": int(getattr(get_forward_context(), "num_tokens", -1)),
-                    "o_proj_input": tuple(o_proj_input.shape),
-                    "output": tuple(output.shape),
-                    # Diagnostics: does the det path actually activate in this
-                    # worker, and are wo_a/wo_b really replicated (full size)?
-                    "det_env": _hdos.environ.get("VLLM_HETERO_OPROJ_DET"),
-                    "det_active": _hetero_oproj_det(),
-                    "wo_a_weight": tuple(self.wo_a.weight.shape),
-                    "wo_b_weight": tuple(self.wo_b.weight.shape),
-                }, _hdos.path.join(_hd, "oproj_meta.pt"))
-        except Exception:
-            pass
         self._forward_o_proj(o_proj_input, output)
 
         maybe_save_kv_layer_to_connector(layer_name, list(kv_cache))
@@ -2222,20 +2086,6 @@ class AscendDSAImpl(DSAAttentionImpl):
                 q = self.wq_b(qr).unflatten(-1, (self.n_local_heads, self.head_dim))
                 qr_pertoken_scale = None
 
-            # Heterogeneous debug: isolate the first divergence. All wq_b
-            # inputs already match (qr / weight / weight_scale), so save the
-            # RAW wq_b output (before q_rms + rotary) and the per-token scale.
-            try:
-                from vllm_ascend.ascend_forward_context import get_hetero_dump_dir
-                _hd = get_hetero_dump_dir()
-                if _hd and not globals().get("_HETERO_OP_DUMPED"):
-                    import os as _hdos
-                    torch.save(q.detach().cpu(), _hdos.path.join(_hd, "attn_wq_b_out.pt"))
-                    if qr_pertoken_scale is not None:
-                        torch.save(qr_pertoken_scale.detach().cpu(), _hdos.path.join(_hd, "attn_qr_scale.pt"))
-            except Exception:
-                pass
-
             q = DeviceOperator.apply_dsa_q_rms(q, self.eps, self.q_norm_without_weight)
 
             torch.ops._C_ascend.inplace_partial_rotary_mul(
@@ -2277,20 +2127,6 @@ class AscendDSAImpl(DSAAttentionImpl):
         DeviceOperator.add_dsa_sparse_attn_extra_kwargs(extra_attn_kwargs, cu_seqlens_ori_kv=actual_seq_lengths_query)
 
         if self.compress_ratio <= 1:
-            from vllm_ascend.ascend_forward_context import get_hetero_dump_dir
-
-            _hd_dir = get_hetero_dump_dir()
-            # NOTE: must be a module-global, NOT per-instance: multiple layers
-            # (e.g. DeepSeek-V4 compress_ratios[0]=0 and [1]=0) have
-            # compress_ratio <= 1, and per-instance flags let layer1 OVERWRITE
-            # layer0's dump files with its own data (silently redirecting every
-            # attn_op_*/attn_hidden_in comparison to the wrong layer).
-            _hd_dumped = globals().get("_HETERO_OP_DUMPED")
-            if _hd_dir and not _hd_dumped:
-                import os as _hdos
-
-                # The all-gathered, prefill-sliced hidden states (input to wq_a).
-                torch.save(hidden_states.detach().cpu(), _hdos.path.join(_hd_dir, "attn_hidden_in.pt"))
             notify_kv_cache_written(layer_name)
             record_attention_compute_start()
             _op_out = attn_op(
@@ -2310,34 +2146,6 @@ class AscendDSAImpl(DSAAttentionImpl):
                 layout_kv="PA_ND",
                 **extra_attn_kwargs,
             )[0]
-            if _hd_dir and not _hd_dumped:
-                globals()["_HETERO_OP_DUMPED"] = True
-                import os as _hdos
-
-                torch.save(q.detach().cpu(), _hdos.path.join(_hd_dir, "attn_op_q.pt"))
-                torch.save(self.attn_sink.detach().cpu(), _hdos.path.join(_hd_dir, "attn_op_sink.pt"))
-                torch.save(
-                    torch.tensor([self.n_local_heads]), _hdos.path.join(_hd_dir, "attn_op_nheads.pt")
-                )
-                try:
-                    torch.save(kv.detach().cpu(), _hdos.path.join(_hd_dir, "attn_op_kv.pt"))
-                except Exception:
-                    pass
-                torch.save(_op_out.detach().cpu(), _hdos.path.join(_hd_dir, "attn_op_out.pt"))
-                # Isolate the Q projection: qr (wq_b input, replicated weight)
-                # and the wq_b weights themselves (head-aligned comparison).
-                try:
-                    torch.save(qr.detach().cpu(), _hdos.path.join(_hd_dir, "attn_qr.pt"))
-                except Exception:
-                    pass
-                try:
-                    torch.save(self.wq_b.weight.detach().cpu(),
-                               _hdos.path.join(_hd_dir, "attn_wq_b_weight.pt"))
-                    if hasattr(self.wq_b, "weight_scale"):
-                        torch.save(self.wq_b.weight_scale.detach().cpu(),
-                                   _hdos.path.join(_hd_dir, "attn_wq_b_scale.pt"))
-                except Exception:
-                    pass
             return _op_out
 
         if self.compress_ratio > 1:
