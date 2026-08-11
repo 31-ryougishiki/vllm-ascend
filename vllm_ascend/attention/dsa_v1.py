@@ -20,6 +20,28 @@ def _hetero_oproj_det() -> bool:
     import os
 
     return os.environ.get("VLLM_HETERO_OPROJ_DET") == "1"
+
+
+def _maybe_dump_oproj(name: str, t: torch.Tensor) -> None:
+    """Dump an o_proj det-path tensor once per process (VLLM_HETERO_DEBUG),
+    so DP groups can be compared at each stage: input -> head-gather -> wo_a ->
+    wo_b -> output.  Per-name one-time flag so ALL probes land in the first
+    qualifying forward's dump dir."""
+    import os as _hdos
+
+    if not _hdos.environ.get("VLLM_HETERO_DEBUG"):
+        return
+    if globals().get(f"_OPROJ_DUMPED_{name}"):
+        return
+    try:
+        from vllm_ascend.ascend_forward_context import get_hetero_dump_dir
+        _hd = get_hetero_dump_dir()
+        if not _hd:
+            return
+        globals()[f"_OPROJ_DUMPED_{name}"] = True
+        torch.save(t.detach().cpu(), _hdos.path.join(_hd, f"{name}.pt"))
+    except Exception:
+        pass
 from vllm.distributed.utils import get_current_tp_sharding_ratios, get_tp_partition_size
 from vllm.forward_context import get_forward_context
 from vllm.triton_utils import HAS_TRITON
@@ -1744,6 +1766,9 @@ class AscendDSAImpl(DSAAttentionImpl):
         except Exception:
             pass
 
+        # --- hetero debug: o_proj det-path probes (VLLM_HETERO_DEBUG) ---
+        _maybe_dump_oproj("oproj_input", o_proj_input)  # post-rope, per-rank heads
+
         # 1) gather head-sharded attention output -> full n_heads.
         # NOTE: tensor_model_parallel_all_gather requires EVERY rank to send the
         # SAME tensor shape, but heterogeneous TP gives each rank a different
@@ -1774,6 +1799,7 @@ class AscendDSAImpl(DSAAttentionImpl):
         n_groups = self.n_group
         gh = o_full.shape[1] * o_full.shape[2] // n_groups
         o_full = o_full.reshape(num_tokens, n_groups, gh)
+        _maybe_dump_oproj("oproj_o_full", o_full)  # head-gather + reshape, full heads
         # 3) wo_a (replicated, full groups) batch matmul.
         o_wa = torch_npu.npu_transpose_batchmatmul(
             o_full,
@@ -1785,8 +1811,10 @@ class AscendDSAImpl(DSAAttentionImpl):
             perm_y=(1, 0, 2),
             batch_split_factor=1,
         ).reshape(num_tokens, -1)
+        _maybe_dump_oproj("oproj_o_wa", o_wa)  # after wo_a
         # 4) wo_b (replicated) -> full (N, dim); no cross-rank reduce (tp_size=1).
         o_wb = self.wo_b(o_wa)
+        _maybe_dump_oproj("oproj_o_wb", o_wb)  # after wo_b
         # 5) Write the per-rank share.  Under FlashComm1 SP the attention
         # output is per-rank token-chunked (padded_num_tokens // tp_size rows)
         # and o_wb is padded to padded_num_tokens then sliced contiguously.
@@ -1799,6 +1827,7 @@ class AscendDSAImpl(DSAAttentionImpl):
         _sp_on = bool(getattr(_fc, "flash_comm_v1_enabled", False))
         if not _sp_on:
             output[...] = o_wb[: output.shape[0]].contiguous()
+            _maybe_dump_oproj("oproj_out", output)  # final per-rank o_proj output
             return output
         _padded = int(getattr(_EXTRA_CTX, "padded_num_tokens", num_tokens) or num_tokens)
         if _padded > num_tokens:
@@ -1806,6 +1835,7 @@ class AscendDSAImpl(DSAAttentionImpl):
         _chunk = o_wb.shape[0] // tp_size
         _start = tp_rank * _chunk
         output[...] = o_wb[_start:_start + _chunk].contiguous()
+        _maybe_dump_oproj("oproj_out", output)  # final per-rank o_proj output
         return output
 
     def forward(  # type: ignore[override]
@@ -1878,17 +1908,6 @@ class AscendDSAImpl(DSAAttentionImpl):
         if actual_tokens < o_proj_input.shape[0]:
             o_proj_input[actual_tokens:] = 0
 
-        # DIAGNOSTIC: rope input (pre-rope, after padding zeroing).
-        try:
-            from vllm_ascend.ascend_forward_context import get_hetero_dump_dir
-            _hd = get_hetero_dump_dir()
-            if _hd and not globals().get("_OPROJ_ROPE_IO_DUMPED"):
-                import os as _hdos
-                torch.save(o_proj_input[:actual_tokens].detach().cpu(),
-                           _hdos.path.join(_hd, "oproj_rope_in.pt"))
-        except Exception:
-            pass
-
         torch.ops._C_ascend.inplace_partial_rotary_mul(
             o_proj_input[:actual_tokens].unsqueeze(1),
             cos[:actual_tokens],
@@ -1896,18 +1915,6 @@ class AscendDSAImpl(DSAAttentionImpl):
             rotary_mode="interleave",
             partial_slice=[self.nope_head_dim, self.head_dim],
         )
-
-        # DIAGNOSTIC: rope output (post-rope).
-        try:
-            from vllm_ascend.ascend_forward_context import get_hetero_dump_dir
-            _hd = get_hetero_dump_dir()
-            if _hd and not globals().get("_OPROJ_ROPE_IO_DUMPED"):
-                globals()["_OPROJ_ROPE_IO_DUMPED"] = True
-                import os as _hdos
-                torch.save(o_proj_input[:actual_tokens].detach().cpu(),
-                           _hdos.path.join(_hd, "oproj_rope_out.pt"))
-        except Exception:
-            pass
 
         # o
         self._forward_o_proj(o_proj_input, output)
