@@ -1062,11 +1062,16 @@ class DeepseekV2DecoderLayer(nn.Module):
     ) -> torch.Tensor:
         residual = hidden_states.clone()
         hidden_states, post, comb = self.hc_pre(hidden_states, self.hc_attn_fn, self.hc_attn_scale, self.hc_attn_base)
+        hc_pre_y = hidden_states
         hidden_states = self.input_layernorm(hidden_states)
+        attn_in = hidden_states
         attn_kwargs = {"positions": positions, "hidden_states": hidden_states, "llama_4_scaling": llama_4_scaling}
         hidden_states = self.self_attn(**attn_kwargs)
         hidden_states = self.hc_post(hidden_states, residual, post, comb)
-        # --- hetero debug: per-layer probes (VLLM_HETERO_DEBUG, one-time) ---
+        # --- hetero debug: full attention-path probes (VLLM_HETERO_DEBUG, one-time) ---
+        # o_proj_out is bit-identical (oproj_out=0), but layer_attn_out
+        # (hc_post output) diverges -> isolate residual / hc_pre(y/post/comb) /
+        # layernorm(attn_in) / hc_post.
         import os as _ldos
         if _ldos.environ.get("VLLM_HETERO_DEBUG") and not getattr(self, "_ldump", False):
             try:
@@ -1074,31 +1079,18 @@ class DeepseekV2DecoderLayer(nn.Module):
                 _ld = get_hetero_dump_dir()
                 if _ld:
                     self._ldump = True
+                    torch.save(residual.detach().cpu(), _ldos.path.join(_ld, "hc_residual.pt"))
+                    torch.save(hc_pre_y.detach().cpu(), _ldos.path.join(_ld, "hc_pre_y.pt"))
+                    torch.save(post.detach().cpu(), _ldos.path.join(_ld, "hc_pre_post.pt"))
+                    torch.save(comb.detach().cpu(), _ldos.path.join(_ld, "hc_pre_comb.pt"))
+                    torch.save(attn_in.detach().cpu(), _ldos.path.join(_ld, "attn_in.pt"))
                     torch.save(hidden_states.detach().cpu(), _ldos.path.join(_ld, "layer_attn_out.pt"))
             except Exception:
                 pass
         residual = hidden_states.clone()
         hidden_states, post, comb = self.hc_pre(hidden_states, self.hc_ffn_fn, self.hc_ffn_scale, self.hc_ffn_base)
         hidden_states = self.post_attention_layernorm(hidden_states)
-        if _ldos.environ.get("VLLM_HETERO_DEBUG") and not getattr(self, "_ldump", False):
-            try:
-                from vllm_ascend.ascend_forward_context import get_hetero_dump_dir
-                _ld = get_hetero_dump_dir()
-                if _ld:
-                    self._ldump = True
-                    torch.save(hidden_states.detach().cpu(), _ldos.path.join(_ld, "layer_mlp_in.pt"))
-            except Exception:
-                pass
         hidden_states = self.mlp(hidden_states)
-        if _ldos.environ.get("VLLM_HETERO_DEBUG") and not getattr(self, "_ldump", False):
-            try:
-                from vllm_ascend.ascend_forward_context import get_hetero_dump_dir
-                _ld = get_hetero_dump_dir()
-                if _ld:
-                    self._ldump = True
-                    torch.save(hidden_states.detach().cpu(), _ldos.path.join(_ld, "layer_mlp_out.pt"))
-            except Exception:
-                pass
         hidden_states = self.hc_post(hidden_states, residual, post, comb)
 
         return hidden_states, residual

@@ -1766,9 +1766,6 @@ class AscendDSAImpl(DSAAttentionImpl):
         except Exception:
             pass
 
-        # --- hetero debug: o_proj det-path probes (VLLM_HETERO_DEBUG) ---
-        _maybe_dump_oproj("oproj_input", o_proj_input)  # post-rope, per-rank heads
-
         # 1) gather head-sharded attention output -> full n_heads.
         # NOTE: tensor_model_parallel_all_gather requires EVERY rank to send the
         # SAME tensor shape, but heterogeneous TP gives each rank a different
@@ -1799,7 +1796,6 @@ class AscendDSAImpl(DSAAttentionImpl):
         n_groups = self.n_group
         gh = o_full.shape[1] * o_full.shape[2] // n_groups
         o_full = o_full.reshape(num_tokens, n_groups, gh)
-        _maybe_dump_oproj("oproj_o_full", o_full)  # head-gather + reshape, full heads
         # 3) wo_a (replicated, full groups) batch matmul.
         o_wa = torch_npu.npu_transpose_batchmatmul(
             o_full,
@@ -1811,10 +1807,8 @@ class AscendDSAImpl(DSAAttentionImpl):
             perm_y=(1, 0, 2),
             batch_split_factor=1,
         ).reshape(num_tokens, -1)
-        _maybe_dump_oproj("oproj_o_wa", o_wa)  # after wo_a
         # 4) wo_b (replicated) -> full (N, dim); no cross-rank reduce (tp_size=1).
         o_wb = self.wo_b(o_wa)
-        _maybe_dump_oproj("oproj_o_wb", o_wb)  # after wo_b
         # 5) Write the per-rank share.  Under FlashComm1 SP the attention
         # output is per-rank token-chunked (padded_num_tokens // tp_size rows)
         # and o_wb is padded to padded_num_tokens then sliced contiguously.
