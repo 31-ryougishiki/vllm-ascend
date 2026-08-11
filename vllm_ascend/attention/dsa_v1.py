@@ -1760,6 +1760,21 @@ class AscendDSAImpl(DSAAttentionImpl):
         except Exception:
             pass
 
+        # 0b) DIAGNOSTIC: dump the post-rope o_proj_input (the exact step
+        # between the bit-identical attn_op_out and the divergent det_o_full).
+        # If this matches 0.0 across DPs the bug is in the head-gather below;
+        # if it diverges, the bug is in the rope / o_proj_input assembly.
+        if _sdos.environ.get("VLLM_HETERO_DEBUG"):
+            if not getattr(self, "_det_internal_dumped", False):
+                try:
+                    from vllm_ascend.ascend_forward_context import get_hetero_dump_dir
+                    _dh = get_hetero_dump_dir()
+                    if _dh:
+                        torch.save(o_proj_input.detach().cpu(),
+                                   _sdos.path.join(_dh, "det_o_proj_input.pt"))
+                except Exception as _de:
+                    print(f"[hetero_oproj_det] o_proj_input dump failed: {_de!r}", flush=True)
+
         # 1) gather head-sharded attention output -> full n_heads.
         # NOTE: tensor_model_parallel_all_gather requires EVERY rank to send the
         # SAME tensor shape, but heterogeneous TP gives each rank a different
@@ -1786,6 +1801,19 @@ class AscendDSAImpl(DSAAttentionImpl):
         o_full = o_full.view(num_tokens, tp_size, max_local, head_dim)
         _valid = [o_full[:, r, : local_sizes[r]] for r in range(tp_size)]
         o_full = torch.cat(_valid, dim=1)  # (N, sum(local_sizes), head_dim)
+        # 1b) DIAGNOSTIC: dump the head-gathered (pre-reshape) o_full.
+        # If det_o_proj_input matches but this diverges, the bug is in the
+        # head-gather (all_gather / extract / cat), not the reshape.
+        if _sdos.environ.get("VLLM_HETERO_DEBUG"):
+            if not getattr(self, "_det_internal_dumped", False):
+                try:
+                    from vllm_ascend.ascend_forward_context import get_hetero_dump_dir
+                    _dh = get_hetero_dump_dir()
+                    if _dh:
+                        torch.save(o_full.detach().cpu(),
+                                   _sdos.path.join(_dh, "det_o_full_gathered.pt"))
+                except Exception as _de:
+                    print(f"[hetero_oproj_det] gathered dump failed: {_de!r}", flush=True)
         # 2) reshape to (N, n_groups, group_hidden_dim).
         n_groups = self.n_group
         gh = o_full.shape[1] * o_full.shape[2] // n_groups
@@ -1940,6 +1968,20 @@ class AscendDSAImpl(DSAAttentionImpl):
 
         cos = attn_metadata[0].cos[layer_name]
         sin = attn_metadata[0].sin[layer_name]
+
+        # DIAGNOSTIC: the o_proj rope cos/sin.  If det_o_proj_input diverges,
+        # compare these across DPs (they must be identical full-range tensors,
+        # NOT per-rank position slices).
+        try:
+            from vllm_ascend.ascend_forward_context import get_hetero_dump_dir
+            _hd = get_hetero_dump_dir()
+            if _hd and not globals().get("_OPROJ_ROPE_DUMPED"):
+                globals()["_OPROJ_ROPE_DUMPED"] = True
+                import os as _hdos
+                torch.save(cos.detach().cpu(), _hdos.path.join(_hd, "oproj_rope_cos.pt"))
+                torch.save(sin.detach().cpu(), _hdos.path.join(_hd, "oproj_rope_sin.pt"))
+        except Exception:
+            pass
 
         torch.ops._C_ascend.inplace_partial_rotary_mul(
             o_proj_input.unsqueeze(1),
