@@ -1769,8 +1769,8 @@ class AscendDSAImpl(DSAAttentionImpl):
         except Exception:
             pass
 
-        # --- hetero debug: o_proj input (post-rope, per-rank heads) ---
-        _maybe_dump_oproj("oproj_input", o_proj_input)
+        # --- hetero debug: o_proj input (post-rope) cut until the layer-input
+        # paradox is resolved; keep only oproj_out (second divergence line). ---
 
         # 1) gather head-sharded attention output -> full n_heads.
         # NOTE: tensor_model_parallel_all_gather requires EVERY rank to send the
@@ -2153,10 +2153,8 @@ class AscendDSAImpl(DSAAttentionImpl):
                 layout_kv="PA_ND",
                 **extra_attn_kwargs,
             )[0]
-            # --- hetero debug: attention internals (VLLM_HETERO_DEBUG) ---
-            _maybe_dump_oproj("attn_hidden_in", hidden_states)  # all-gathered prefill input
-            _maybe_dump_oproj("attn_op_q", q)
-            _maybe_dump_oproj("attn_op_out", _op_out)
+            # --- hetero debug: attention internals cut (downstream of the
+            # layer-input divergence). ---
             return _op_out
 
         if self.compress_ratio > 1:
