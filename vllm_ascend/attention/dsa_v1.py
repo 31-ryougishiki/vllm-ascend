@@ -23,22 +23,25 @@ def _hetero_oproj_det() -> bool:
 
 
 def _maybe_dump_oproj(name: str, t: torch.Tensor) -> None:
-    """Dump an o_proj det-path tensor once per process (VLLM_HETERO_DEBUG),
-    so DP groups can be compared at each stage: input -> head-gather -> wo_a ->
-    wo_b -> output.  Per-name one-time flag so ALL probes land in the first
-    qualifying forward's dump dir."""
+    """Dump a tensor when the current forward is the designated hetero capture
+    forward (VLLM_HETERO_DEBUG + VLLM_HETERO_OPROJ_DET), so DP groups can be
+    compared at each stage: input -> head-gather -> wo_a -> wo_b -> output.
+
+    ALL probes share the single _EXTRA_CTX.hetero_capture gate (set by the
+    model forward for one qualifying forward), so every dump lands in the SAME
+    forward -- the previous per-name one-time flags scattered probes across
+    different forwards and made cross-probe comparisons invalid."""
     import os as _hdos
 
     if not _hdos.environ.get("VLLM_HETERO_DEBUG"):
         return
-    if globals().get(f"_OPROJ_DUMPED_{name}"):
-        return
     try:
-        from vllm_ascend.ascend_forward_context import get_hetero_dump_dir
+        from vllm_ascend.ascend_forward_context import _EXTRA_CTX, get_hetero_dump_dir
+        if not getattr(_EXTRA_CTX, "hetero_capture", False):
+            return
         _hd = get_hetero_dump_dir()
         if not _hd:
             return
-        globals()[f"_OPROJ_DUMPED_{name}"] = True
         torch.save(t.detach().cpu(), _hdos.path.join(_hd, f"{name}.pt"))
     except Exception:
         pass

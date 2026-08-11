@@ -1073,18 +1073,18 @@ class DeepseekV2DecoderLayer(nn.Module):
         # (hc_post output) diverges -> isolate residual / hc_pre(y/post/comb) /
         # layernorm(attn_in) / hc_post.
         import os as _ldos
-        if _ldos.environ.get("VLLM_HETERO_DEBUG") and not getattr(self, "_ldump", False):
+        if _ldos.environ.get("VLLM_HETERO_DEBUG"):
             try:
-                from vllm_ascend.ascend_forward_context import get_hetero_dump_dir
-                _ld = get_hetero_dump_dir()
-                if _ld:
-                    self._ldump = True
-                    torch.save(residual.detach().cpu(), _ldos.path.join(_ld, "hc_residual.pt"))
-                    torch.save(hc_pre_y.detach().cpu(), _ldos.path.join(_ld, "hc_pre_y.pt"))
-                    torch.save(post.detach().cpu(), _ldos.path.join(_ld, "hc_pre_post.pt"))
-                    torch.save(comb.detach().cpu(), _ldos.path.join(_ld, "hc_pre_comb.pt"))
-                    torch.save(attn_in.detach().cpu(), _ldos.path.join(_ld, "attn_in.pt"))
-                    torch.save(hidden_states.detach().cpu(), _ldos.path.join(_ld, "layer_attn_out.pt"))
+                from vllm_ascend.ascend_forward_context import _EXTRA_CTX, get_hetero_dump_dir
+                if getattr(_EXTRA_CTX, "hetero_capture", False):
+                    _ld = get_hetero_dump_dir()
+                    if _ld:
+                        torch.save(residual.detach().cpu(), _ldos.path.join(_ld, "hc_residual.pt"))
+                        torch.save(hc_pre_y.detach().cpu(), _ldos.path.join(_ld, "hc_pre_y.pt"))
+                        torch.save(post.detach().cpu(), _ldos.path.join(_ld, "hc_pre_post.pt"))
+                        torch.save(comb.detach().cpu(), _ldos.path.join(_ld, "hc_pre_comb.pt"))
+                        torch.save(attn_in.detach().cpu(), _ldos.path.join(_ld, "attn_in.pt"))
+                        torch.save(hidden_states.detach().cpu(), _ldos.path.join(_ld, "layer_attn_out.pt"))
             except Exception:
                 pass
         residual = hidden_states.clone()
@@ -1226,18 +1226,6 @@ class DeepseekV4Model(nn.Module):
 
         if get_pp_group().is_first_rank:
             hidden_states = hidden_states.unsqueeze(1).repeat(1, self.hc_mult, 1)  # (b, s, h) -> (b, s, c, h)
-            # --- hetero debug: raw embedding vs repeated layer input ---
-            import os as _edos
-            if _edos.environ.get("VLLM_HETERO_DEBUG") and not getattr(self, "_edump", False):
-                try:
-                    from vllm_ascend.ascend_forward_context import get_hetero_dump_dir
-                    _ed = get_hetero_dump_dir()
-                    if _ed:
-                        self._edump = True
-                        torch.save(model_embed.detach().cpu(), _edos.path.join(_ed, "model_embed.pt"))
-                        torch.save(hidden_states.detach().cpu(), _edos.path.join(_ed, "model_embed_hc.pt"))
-                except Exception:
-                    pass
 
         # Minimal hetero dump-dir setup (VLLM_HETERO_DEBUG): the o_proj rope
         # input/output dumps in dsa_v1.py need an active dump dir.  No per-layer
@@ -1249,6 +1237,15 @@ class DeepseekV4Model(nn.Module):
 
         if _os.environ.get("VLLM_HETERO_DEBUG"):
             try:
+                from vllm_ascend.ascend_forward_context import _EXTRA_CTX, set_hetero_dump_dir
+                # Single per-forward capture gate: ALL probes (embedding, layer,
+                # attention, o_proj) check _EXTRA_CTX.hetero_capture, so every
+                # dump lands in the SAME qualifying forward.  The previous
+                # per-name one-time flags scattered probes across different
+                # forwards (a 12-token warmup captured model_embed while the
+                # real 1428-token prefill captured hc_residual), making every
+                # cross-probe comparison invalid.
+                _EXTRA_CTX.hetero_capture = False
                 _n = int(input_ids.numel()) if input_ids is not None else 0
                 _nlow = int(_os.environ.get("VLLM_HETERO_DEBUG_MIN_TOKENS", "1000"))
                 _nhigh = int(_os.environ.get("VLLM_HETERO_DEBUG_MAX_TOKENS", "9000"))
@@ -1258,7 +1255,6 @@ class DeepseekV4Model(nn.Module):
                         get_tensor_model_parallel_world_size,
                         get_world_group,
                     )
-                    from vllm_ascend.ascend_forward_context import _EXTRA_CTX, set_hetero_dump_dir
 
                     _grank = int(get_world_group().rank)
                     _tp_sizes = getattr(_EXTRA_CTX, "per_dp_tp_sizes", None)
@@ -1279,6 +1275,17 @@ class DeepseekV4Model(nn.Module):
                     _os.makedirs(_dout, exist_ok=True)
                     set_hetero_dump_dir(_dout)
                     self._hetero_fwd_count = _count + 1
+                    _EXTRA_CTX.hetero_capture = True
+                    # raw embedding vs repeated layer input, same capture forward
+                    try:
+                        if "model_embed" in locals():
+                            from vllm_ascend.ascend_forward_context import get_hetero_dump_dir
+                            _ed = get_hetero_dump_dir()
+                            if _ed:
+                                torch.save(model_embed.detach().cpu(), _os.path.join(_ed, "model_embed.pt"))
+                                torch.save(hidden_states.detach().cpu(), _os.path.join(_ed, "model_embed_hc.pt"))
+                    except Exception:
+                        pass
             except Exception:
                 pass
 
