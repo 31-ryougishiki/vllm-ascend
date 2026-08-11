@@ -1755,6 +1755,15 @@ class AscendDeepseekV4ForCausalLM(nn.Module, SupportsPP, DeepseekV2MixtureOfExpe
                         if is_pp_missing_parameter(name, self):
                             continue
 
+                        # Hetero debug (VLLM_HETERO_NUM_LAYERS): when the layer
+                        # count is clamped below the checkpoint's, the checkpoint
+                        # still carries weights for the clamped-out layers (e.g.
+                        # model.layers.10.* while only layer0 is built).  Skip
+                        # them -- vLLM's default loader drops mismatched keys --
+                        # instead of raising KeyError.
+                        if name not in params_dict:
+                            continue
+
                         param = params_dict[name]
                         weight_loader = getattr(param, "weight_loader", default_weight_loader)
                         weight_loader(param, loaded_weight)
