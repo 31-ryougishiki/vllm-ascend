@@ -1076,13 +1076,19 @@ class DeepseekV2DecoderLayer(nn.Module):
         attn_kwargs = {"positions": positions, "hidden_states": hidden_states, "llama_4_scaling": llama_4_scaling}
         hidden_states = self.self_attn(**attn_kwargs)
         attn_out = hidden_states
+        attn_hc_post_out = self.hc_post(hidden_states, residual, post, comb)
         if _hd_dir and not _HETERO_LAYER_DUMPED:
             _HETERO_LAYER_DUMPED = True
             import os as _hdos
 
             torch.save(attn_in.detach().cpu(), _hdos.path.join(_hd_dir, "layer_attn_in.pt"))
             torch.save(attn_out.detach().cpu(), _hdos.path.join(_hd_dir, "layer_attn_out.pt"))
-        hidden_states = self.hc_post(hidden_states, residual, post, comb)
+            # hc_pre post/comb + hc_post output (isolate the o_proj -> hc_post ->
+            # layernorm -> mlp_in gap when layer_attn_out is clean).
+            torch.save(post.detach().cpu(), _hdos.path.join(_hd_dir, "attn_hc_pre_post.pt"))
+            torch.save(comb.detach().cpu(), _hdos.path.join(_hd_dir, "attn_hc_pre_comb.pt"))
+            torch.save(attn_hc_post_out.detach().cpu(), _hdos.path.join(_hd_dir, "attn_hc_post_out.pt"))
+        hidden_states = attn_hc_post_out
         residual = hidden_states.clone()
         hidden_states, post, comb = self.hc_pre(hidden_states, self.hc_ffn_fn, self.hc_ffn_scale, self.hc_ffn_base)
         hidden_states = self.post_attention_layernorm(hidden_states)
