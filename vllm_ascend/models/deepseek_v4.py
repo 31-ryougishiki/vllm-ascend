@@ -1069,13 +1069,14 @@ class DeepseekV2DecoderLayer(nn.Module):
         import os as _lios
         if _lios.environ.get("VLLM_HETERO_DEBUG"):
             try:
-                from vllm_ascend.ascend_forward_context import get_hetero_capture, get_hetero_dump_dir
+                from vllm_ascend.ascend_forward_context import get_hetero_capture, get_hetero_dump_dir, get_hetero_fwd
                 if get_hetero_capture():
                     _li = get_hetero_dump_dir()
                     if _li:
-                        # Record the storage address so we can tell whether the
-                        # layer0 input is the SAME buffer as model_pre_layer0
-                        # (in-place rewrite) or a DIFFERENT buffer (aliasing).
+                        # Record the storage address + forward tag so we can tell
+                        # whether the layer0 input is the SAME buffer/forward as
+                        # model_pre_layer0 (same ptr + same fwd) or a different
+                        # buffer / different forward (aliasing or fwd mixing).
                         try:
                             import torch_npu
                             torch_npu.npu.synchronize()
@@ -1084,7 +1085,8 @@ class DeepseekV2DecoderLayer(nn.Module):
                         torch.save(hidden_states.detach().cpu(), _lios.path.join(_li, "layer0_input.pt"))
                         try:
                             torch.save(
-                                {"ptr": int(hidden_states.data_ptr()), "shape": list(hidden_states.shape)},
+                                {"ptr": int(hidden_states.data_ptr()), "shape": list(hidden_states.shape),
+                                 "fwd": get_hetero_fwd()},
                                 _lios.path.join(_li, "layer0_input_meta.pt"),
                             )
                         except Exception:
@@ -1278,6 +1280,7 @@ class DeepseekV4Model(nn.Module):
                     get_hetero_capture,
                     set_hetero_capture,
                     set_hetero_dump_dir,
+                    set_hetero_fwd,
                 )
                 # Single per-forward capture gate: ALL probes (embedding, layer,
                 # attention, o_proj) check get_hetero_capture(), so every dump
@@ -1327,6 +1330,7 @@ class DeepseekV4Model(nn.Module):
                     set_hetero_dump_dir(_dout)
                     self._hetero_fwd_count = _count + 1
                     set_hetero_capture(True)
+                    set_hetero_fwd(_count)
                     # raw embedding vs repeated layer input, same capture forward
                     try:
                         if "model_embed" in locals():
@@ -1350,7 +1354,7 @@ class DeepseekV4Model(nn.Module):
         import os as _plos
         if _plos.environ.get("VLLM_HETERO_DEBUG"):
             try:
-                from vllm_ascend.ascend_forward_context import get_hetero_capture, get_hetero_dump_dir
+                from vllm_ascend.ascend_forward_context import get_hetero_capture, get_hetero_dump_dir, get_hetero_fwd
                 if get_hetero_capture():
                     _pl = get_hetero_dump_dir()
                     if _pl:
@@ -1362,7 +1366,8 @@ class DeepseekV4Model(nn.Module):
                         torch.save(hidden_states.detach().cpu(), _plos.path.join(_pl, "model_pre_layer0.pt"))
                         try:
                             torch.save(
-                                {"ptr": int(hidden_states.data_ptr()), "shape": list(hidden_states.shape)},
+                                {"ptr": int(hidden_states.data_ptr()), "shape": list(hidden_states.shape),
+                                 "fwd": get_hetero_fwd()},
                                 _plos.path.join(_pl, "model_pre_layer0_meta.pt"),
                             )
                         except Exception:

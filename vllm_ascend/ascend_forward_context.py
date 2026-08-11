@@ -63,6 +63,22 @@ def get_hetero_capture() -> bool:
     return _HETERO_CAPTURE
 
 
+# Per-forward hetero sequence number, so each dump can be tagged with WHICH
+# forward it came from.  Lets us tell whether two probes that both landed in
+# fwd0 actually belong to the same forward (they MUST share the same fwd tag)
+# or were mixed from different forwards by a bad fwd counter.
+_HETERO_FWD = -1
+
+
+def set_hetero_fwd(n: int) -> None:
+    global _HETERO_FWD
+    _HETERO_FWD = n
+
+
+def get_hetero_fwd() -> int:
+    return _HETERO_FWD
+
+
 @contextmanager
 def override_mrv2_in_profile_run(enabled: bool):
     """Override MRv2's extra profile-run marker for one forward path.
