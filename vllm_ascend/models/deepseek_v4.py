@@ -1607,6 +1607,10 @@ class AscendDeepseekV4ForCausalLM(nn.Module, SupportsPP, DeepseekV2MixtureOfExpe
             if "sink" in name:
                 if is_pp_missing_parameter(name, self):
                     continue
+                # Hetero debug (VLLM_HETERO_NUM_LAYERS): sink weights of layers
+                # clamped out of the model are absent from params_dict.
+                if name not in params_dict:
+                    continue
                 param = params_dict[name]
                 if enable_dsa_cp():
                     param.data.copy_(loaded_weight)
@@ -1647,6 +1651,11 @@ class AscendDeepseekV4ForCausalLM(nn.Module, SupportsPP, DeepseekV2MixtureOfExpe
                     continue
 
                 if is_pp_missing_parameter(name, self):
+                    continue
+
+                # Hetero debug (VLLM_HETERO_NUM_LAYERS): stacked weights of
+                # layers clamped out of the model are absent from params_dict.
+                if name not in params_dict:
                     continue
 
                 param = params_dict[name]
@@ -1710,6 +1719,13 @@ class AscendDeepseekV4ForCausalLM(nn.Module, SupportsPP, DeepseekV2MixtureOfExpe
                         name_mapped = chunk_name.replace(weight_name, param_name)
 
                         if is_pp_missing_parameter(name_mapped, self):
+                            continue
+
+                        # Hetero debug (VLLM_HETERO_NUM_LAYERS): skip expert
+                        # weights for layers clamped out of the model (the
+                        # checkpoint carries layers.1..59 experts, but only
+                        # layer0's experts are built).
+                        if name_mapped not in params_dict:
                             continue
 
                         param = params_dict[name_mapped]
