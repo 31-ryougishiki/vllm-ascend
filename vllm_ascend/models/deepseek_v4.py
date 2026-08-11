@@ -1207,37 +1207,44 @@ class DeepseekV4Model(nn.Module):
 
         # Minimal hetero dump-dir setup (VLLM_HETERO_DEBUG): the o_proj rope
         # input/output dumps in dsa_v1.py need an active dump dir.  No per-layer
-        # dumps here — this only computes dp/tp and sets the dir.
+        # dumps here — this only computes dp/tp and sets the dir.  The dir is
+        # only set for QUALIFYING forwards (num_tokens in [MIN,MAX]) so warmup/
+        # dummy batches don't claim the first fwd slot; the one-time rope dump
+        # therefore lands on the first real prefill request.
         import os as _os
 
         if _os.environ.get("VLLM_HETERO_DEBUG"):
             try:
-                from vllm.distributed.parallel_state import (
-                    get_tensor_model_parallel_rank,
-                    get_tensor_model_parallel_world_size,
-                    get_world_group,
-                )
-                from vllm_ascend.ascend_forward_context import _EXTRA_CTX, set_hetero_dump_dir
+                _n = int(input_ids.numel()) if input_ids is not None else 0
+                _nlow = int(_os.environ.get("VLLM_HETERO_DEBUG_MIN_TOKENS", "1000"))
+                _nhigh = int(_os.environ.get("VLLM_HETERO_DEBUG_MAX_TOKENS", "9000"))
+                if _nlow <= _n <= _nhigh:
+                    from vllm.distributed.parallel_state import (
+                        get_tensor_model_parallel_rank,
+                        get_tensor_model_parallel_world_size,
+                        get_world_group,
+                    )
+                    from vllm_ascend.ascend_forward_context import _EXTRA_CTX, set_hetero_dump_dir
 
-                _grank = int(get_world_group().rank)
-                _tp_sizes = getattr(_EXTRA_CTX, "per_dp_tp_sizes", None)
-                if _tp_sizes:
-                    _dp, _tr = 0, _grank
-                    while _tr >= _tp_sizes[_dp]:
-                        _tr -= _tp_sizes[_dp]
-                        _dp += 1
-                else:
-                    _tr = int(get_tensor_model_parallel_rank())
-                    _dp = _grank // int(get_tensor_model_parallel_world_size())
-                _count = int(getattr(self, "_hetero_fwd_count", 0))
-                _dout = _os.path.join(
-                    _os.path.abspath(_os.environ.get("VLLM_HETERO_DEBUG_DIR", "hetero_debug")),
-                    f"dp{_dp}_tp{_tr}",
-                    f"fwd{_count}",
-                )
-                _os.makedirs(_dout, exist_ok=True)
-                set_hetero_dump_dir(_dout)
-                self._hetero_fwd_count = _count + 1
+                    _grank = int(get_world_group().rank)
+                    _tp_sizes = getattr(_EXTRA_CTX, "per_dp_tp_sizes", None)
+                    if _tp_sizes:
+                        _dp, _tr = 0, _grank
+                        while _tr >= _tp_sizes[_dp]:
+                            _tr -= _tp_sizes[_dp]
+                            _dp += 1
+                    else:
+                        _tr = int(get_tensor_model_parallel_rank())
+                        _dp = _grank // int(get_tensor_model_parallel_world_size())
+                    _count = int(getattr(self, "_hetero_fwd_count", 0))
+                    _dout = _os.path.join(
+                        _os.path.abspath(_os.environ.get("VLLM_HETERO_DEBUG_DIR", "hetero_debug")),
+                        f"dp{_dp}_tp{_tr}",
+                        f"fwd{_count}",
+                    )
+                    _os.makedirs(_dout, exist_ok=True)
+                    set_hetero_dump_dir(_dout)
+                    self._hetero_fwd_count = _count + 1
             except Exception:
                 pass
 
