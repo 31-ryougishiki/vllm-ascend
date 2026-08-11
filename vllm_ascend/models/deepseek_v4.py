@@ -1134,6 +1134,17 @@ class DeepseekV4Model(nn.Module):
             )
         else:
             self.embed_tokens = PPMissingLayer()
+        # Hetero debug: optionally clamp the layer count (VLLM_HETERO_NUM_LAYERS,
+        # e.g. 1) so server startup / forward is much faster.  vLLM's loader
+        # skips the extra checkpoint keys (layers.N..max) since only 1 layer is
+        # built.  NOTE: does NOT change layer-0 INPUT divergence (embedding /
+        # HC-repeat produce it before any layer), so it mainly speeds up the
+        # restart/memory, not the current divergence question.
+        import os as _nlo
+        _nlayers = int(_nlo.environ.get("VLLM_HETERO_NUM_LAYERS", "0"))
+        if _nlayers > 0:
+            config.num_hidden_layers = _nlayers
+            config.num_moe_layers = _nlayers
         self.start_layer, self.end_layer, self.layers = make_layers(
             config.num_hidden_layers,
             lambda prefix: DeepseekV2DecoderLayer(vllm_config, prefix, topk_indices_buffer=topk_indices_buffer),
