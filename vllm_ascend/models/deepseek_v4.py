@@ -1325,6 +1325,24 @@ class DeepseekV4Model(nn.Module):
             except Exception:
                 pass
 
+        # --- hetero debug: model_embed_hc(0.0) vs layer0_input(6.375) paradox.
+        # Save hidden_states right before the layer loop to see whether the
+        # divergence appears between the setter's .cpu() snapshot and here, or
+        # inside the layer0 call.  (model_embed_hc == model_pre_layer0 == 0 but
+        # layer0_input == 6.375 -> divergence inside the layer0 call; if
+        # model_pre_layer0 already == 6.375 -> async/stream mutation of the
+        # hidden_states buffer between the snapshot and the loop.) ---
+        import os as _plos
+        if _plos.environ.get("VLLM_HETERO_DEBUG"):
+            try:
+                from vllm_ascend.ascend_forward_context import get_hetero_capture, get_hetero_dump_dir
+                if get_hetero_capture():
+                    _pl = get_hetero_dump_dir()
+                    if _pl:
+                        torch.save(hidden_states.detach().cpu(), _plos.path.join(_pl, "model_pre_layer0.pt"))
+            except Exception:
+                pass
+
         for layer in islice(self.layers, self.start_layer, self.end_layer):
             hidden_states, residual = layer(positions, hidden_states, residual, llama_4_scaling)
 
