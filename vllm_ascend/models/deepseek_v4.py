@@ -1061,6 +1061,21 @@ class DeepseekV2DecoderLayer(nn.Module):
         llama_4_scaling: torch.Tensor | None = None,
     ) -> torch.Tensor:
         residual = hidden_states.clone()
+        # --- hetero debug: layer-entry input (clone-free) vs model-level
+        # model_embed_hc.  hc_residual (the clone) diverged 1.97e4 while
+        # model_embed_hc matched 0.0 -- same tensor, impossible unless the
+        # input is mutated between model forward and layer entry OR the two
+        # dumps came from different forwards.  layer0_input resolves which.
+        import os as _lios
+        if _lios.environ.get("VLLM_HETERO_DEBUG"):
+            try:
+                from vllm_ascend.ascend_forward_context import get_hetero_capture, get_hetero_dump_dir
+                if get_hetero_capture():
+                    _li = get_hetero_dump_dir()
+                    if _li:
+                        torch.save(hidden_states.detach().cpu(), _lios.path.join(_li, "layer0_input.pt"))
+            except Exception:
+                pass
         hidden_states, post, comb = self.hc_pre(hidden_states, self.hc_attn_fn, self.hc_attn_scale, self.hc_attn_base)
         hc_pre_y = hidden_states
         hidden_states = self.input_layernorm(hidden_states)
