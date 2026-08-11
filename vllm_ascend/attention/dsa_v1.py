@@ -1969,6 +1969,15 @@ class AscendDSAImpl(DSAAttentionImpl):
         cos = attn_metadata[0].cos[layer_name]
         sin = attn_metadata[0].sin[layer_name]
 
+        # FIX (hetero): zero the padding rows BEFORE the in-place rope.  The
+        # rows [actual_tokens:num_tokens] come from torch.empty() and hold
+        # uninitialized (often NaN) memory; feeding NaN into the rope kernel
+        # makes its vectorized output diverge per-rank (bit-identical input +
+        # cos -> different output across DP groups with different n_local_heads).
+        # The old det-path zeroing ran AFTER the rope, too late to protect it.
+        if actual_tokens < o_proj_input.shape[0]:
+            o_proj_input[actual_tokens:] = 0
+
         # DIAGNOSTIC: the o_proj rope cos/sin.  If det_o_proj_input diverges,
         # compare these across DPs (they must be identical full-range tensors,
         # NOT per-rank position slices).
