@@ -1073,16 +1073,22 @@ class DeepseekV2DecoderLayer(nn.Module):
                 if get_hetero_capture():
                     _li = get_hetero_dump_dir()
                     if _li:
-                        # Force a full-device sync so the dump reads the live
-                        # GPU buffer, not a stale snapshot from an unsynced
-                        # upstream stream (embedding/SP may write hidden_states
-                        # asynchronously).
+                        # Record the storage address so we can tell whether the
+                        # layer0 input is the SAME buffer as model_pre_layer0
+                        # (in-place rewrite) or a DIFFERENT buffer (aliasing).
                         try:
                             import torch_npu
                             torch_npu.npu.synchronize()
                         except Exception:
                             pass
                         torch.save(hidden_states.detach().cpu(), _lios.path.join(_li, "layer0_input.pt"))
+                        try:
+                            torch.save(
+                                {"ptr": int(hidden_states.data_ptr()), "shape": list(hidden_states.shape)},
+                                _lios.path.join(_li, "layer0_input_meta.pt"),
+                            )
+                        except Exception:
+                            pass
             except Exception:
                 pass
         hidden_states, post, comb = self.hc_pre(hidden_states, self.hc_attn_fn, self.hc_attn_scale, self.hc_attn_base)
@@ -1354,6 +1360,13 @@ class DeepseekV4Model(nn.Module):
                         except Exception:
                             pass
                         torch.save(hidden_states.detach().cpu(), _plos.path.join(_pl, "model_pre_layer0.pt"))
+                        try:
+                            torch.save(
+                                {"ptr": int(hidden_states.data_ptr()), "shape": list(hidden_states.shape)},
+                                _plos.path.join(_pl, "model_pre_layer0_meta.pt"),
+                            )
+                        except Exception:
+                            pass
             except Exception:
                 pass
 
