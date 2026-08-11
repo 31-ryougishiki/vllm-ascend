@@ -136,30 +136,41 @@ def update_cos_sin(positions):
         return
 
     num_tokens = positions.size(0)
-    # DIAG bisect inside update_cos_sin: sync after each sub-step to find
-    # where the lazy device work originates. Each block is additive.
-    def _diag_sync(tag: str):
+    # DIAG bisect inside update_cos_sin (removed/gated since 2026-08-07):
+    # sync after each sub-step to find where the lazy device work originates.
+    # Each block is additive.  Re-enable with VLLM_DIAG_COS_SYNC=1.
+    import os as _os_diag
+    if _os_diag.environ.get("VLLM_DIAG_COS_SYNC", "") == "1":
         import time as _time_diag
-        _t0 = _time_diag.perf_counter()
-        torch.npu.synchronize()
-        _t1 = _time_diag.perf_counter()
-        _ms = (_t1 - _t0) * 1000.0
-        if _ms > 10.0:
-            from vllm.logger import init_logger as _init_logger_diag
-            _init_logger_diag(__name__).warning(
-                "DIAG update_cos_sin[%s] sync=%.1fms num_tokens=%d",
-                tag, _ms, num_tokens,
-            )
 
-    _diag_sync("entry")
-    _cos[:, :num_tokens] = (
-        _cos_sin_cache.index_select(0, positions).view(num_tokens, 2, -1).repeat(1, 1, 2).chunk(2, dim=-2)[0]
-    )
-    _diag_sync("after_cos")
-    _sin[:, :num_tokens] = (
-        _cos_sin_cache.index_select(0, positions).view(num_tokens, 2, -1).repeat(1, 1, 2).chunk(2, dim=-2)[1]
-    )
-    _diag_sync("after_sin")
+        def _diag_sync(tag: str):
+            _t0 = _time_diag.perf_counter()
+            torch.npu.synchronize()
+            _t1 = _time_diag.perf_counter()
+            _ms = (_t1 - _t0) * 1000.0
+            if _ms > 10.0:
+                from vllm.logger import init_logger as _init_logger_diag
+                _init_logger_diag(__name__).warning(
+                    "DIAG update_cos_sin[%s] sync=%.1fms num_tokens=%d",
+                    tag, _ms, num_tokens,
+                )
+
+        _diag_sync("entry")
+        _cos[:, :num_tokens] = (
+            _cos_sin_cache.index_select(0, positions).view(num_tokens, 2, -1).repeat(1, 1, 2).chunk(2, dim=-2)[0]
+        )
+        _diag_sync("after_cos")
+        _sin[:, :num_tokens] = (
+            _cos_sin_cache.index_select(0, positions).view(num_tokens, 2, -1).repeat(1, 1, 2).chunk(2, dim=-2)[1]
+        )
+        _diag_sync("after_sin")
+    else:
+        _cos[:, :num_tokens] = (
+            _cos_sin_cache.index_select(0, positions).view(num_tokens, 2, -1).repeat(1, 1, 2).chunk(2, dim=-2)[0]
+        )
+        _sin[:, :num_tokens] = (
+            _cos_sin_cache.index_select(0, positions).view(num_tokens, 2, -1).repeat(1, 1, 2).chunk(2, dim=-2)[1]
+        )
     _cos_slice = _cos[:, :num_tokens]
     _sin_slice = _sin[:, :num_tokens]
 

@@ -284,6 +284,53 @@ def _format_span_summary(root) -> str:
     return "\n".join(lines)
 
 
+class _DiagPhase:
+    """Per-step phase timer: host wall-clock + NPU event device-elapsed.
+
+    Events are created once in ``__init__`` and reused every step (record()
+    overwrites the event position).  ``dev_ms()`` must only be called after
+    the device is synchronised (e.g. after ``step_end`` in NPU-event mode),
+    otherwise ``elapsed_time`` blocks the host — which is exactly the
+    ordering distortion this diagnostic avoids.
+
+    The two numbers answer different questions for the same region:
+      * ``host_ms`` — where the *host* spent/blocked time (CPU work like
+        triton compile, allocator waits, python overhead, queue backpressure).
+      * ``dev_ms``  — where the *device* actually executed (kernel time on
+        the recorded stream, including any host-induced idle bubble).
+    """
+
+    __slots__ = ("name", "ev_start", "ev_end", "host_start_s", "host_ms")
+
+    def __init__(self, name: str) -> None:
+        self.name = name
+        self.host_start_s = 0.0
+        self.host_ms = 0.0
+        try:
+            import torch
+            self.ev_start = torch.npu.Event(enable_timing=True)
+            self.ev_end = torch.npu.Event(enable_timing=True)
+        except Exception:
+            self.ev_start = None
+            self.ev_end = None
+
+    def __enter__(self) -> "_DiagPhase":
+        self.host_start_s = time.perf_counter()
+        if self.ev_start is not None:
+            self.ev_start.record()
+        return self
+
+    def __exit__(self, *args: object) -> None:
+        self.host_ms = (time.perf_counter() - self.host_start_s) * 1000.0
+        if self.ev_end is not None:
+            self.ev_end.record()
+
+    def dev_ms(self) -> float:
+        if self.ev_start is not None and self.ev_end is not None:
+            return self.ev_start.elapsed_time(self.ev_end)  # ms
+        return 0.0
+
+
 class NPUModelRunner(GPUModelRunner):
     def __init__(self, vllm_config: VllmConfig, device: torch.device):
         _init_t0 = time.perf_counter()
@@ -632,6 +679,18 @@ class NPUModelRunner(GPUModelRunner):
                 self._cs_tracer = None
                 self._cs_collector = None
                 self._cs_span = _NOOP_SPAN
+
+        # --- DIAG: per-step phase timers (host + NPU event) ---
+        # Reused every step; see _DiagPhase.  Enabled when callstack tracing
+        # is on; otherwise the objects are still created but never entered.
+        self._diag_phases = {
+            "prep": _DiagPhase("prep"),
+            "cos": _DiagPhase("cos"),
+            "fwd": _DiagPhase("fwd"),
+            "post": _DiagPhase("post"),
+        }
+        self._diag_prev_memR = -1.0  # MiB reserved at prev step end (-1 = unset)
+        self._diag_last_padded = 0  # num_tokens_padded of the current step
         _init_elapsed = (time.perf_counter() - _init_t0) * 1000
 
     @property
@@ -1857,7 +1916,11 @@ class NPUModelRunner(GPUModelRunner):
 
         # DIAG: torch.npu.synchronize() removed (was before prepare_input) to
         # repro the occasional layer_0 spike.
-        with self._cs_span("prepare_input"), record_function_or_nullcontext("prepare input"):
+        with (
+            self._diag_phases["prep"],
+            self._cs_span("prepare_input"),
+            record_function_or_nullcontext("prepare input"),
+        ):
             with self.synchronize_input_prep():
                 # Fix up prev_req_id_to_index for requests that were discarded
                 # in the previous sample_tokens step. If a request has
@@ -1979,6 +2042,7 @@ class NPUModelRunner(GPUModelRunner):
                 )
 
                 num_tokens_padded = batch_desc.num_tokens
+                self._diag_last_padded = int(num_tokens_padded)
                 num_reqs_padded = batch_desc.num_reqs if batch_desc.num_reqs is not None else num_reqs
                 ubatch_slices, ubatch_slices_padded = maybe_create_ubatch_slices(
                     should_ubatch,
@@ -2097,7 +2161,8 @@ class NPUModelRunner(GPUModelRunner):
             )
 
             # update global cos, sin
-            update_cos_sin(positions)
+            with self._diag_phases["cos"], self._cs_span("update_cos_sin"):
+                update_cos_sin(positions)
 
         if self.dynamic_eplb:
             with record_function_or_nullcontext("EPLB weight D2D"):
@@ -2128,6 +2193,7 @@ class NPUModelRunner(GPUModelRunner):
         # Temporarily restore with host timer to measure how much async work
         # is pending before model_forward.
         with (
+            self._diag_phases["fwd"],
             self._cs_span("model_forward"),
             record_function_or_nullcontext("forward"),
             set_ascend_forward_context(
@@ -2168,7 +2234,11 @@ class NPUModelRunner(GPUModelRunner):
             hidden_states = self._model_forward(
                 num_tokens_padded, input_ids, positions, intermediate_tensors, inputs_embeds, **model_kwargs
             )
-        with self._cs_span("post_process"), record_function_or_nullcontext("post process"):
+        with (
+            self._diag_phases["post"],
+            self._cs_span("post_process"),
+            record_function_or_nullcontext("post process"),
+        ):
             aux_hidden_states = None
             if self.use_aux_hidden_state_outputs:
                 hidden_states, aux_hidden_states = hidden_states
@@ -2270,37 +2340,77 @@ class NPUModelRunner(GPUModelRunner):
         tracer = self._cs_tracer
         if tracer is None or not tracer.active:
             return
+        # DIAG: time the step-end synchronise.  In NPU-event mode this is the
+        # device drain; a large value here means the host enqueued device work
+        # faster than the device executed it (host ran ahead / backlog).
+        _diag_d0 = time.perf_counter()
         tracer.step_end()
+        _diag_drain_ms = (time.perf_counter() - _diag_d0) * 1000.0
+
+        # Span paths are hierarchical (e.g.
+        # "model_forward/model/model_body/model/layer_0/model/attn/..."),
+        # so search by suffix rather than hard-coding the full prefix.
+        _root = tracer._root
+        _spans = tracer.flatten_spans()  # dev (or host when not NPU-event)
+        _host_spans = tracer.flatten_spans(timing="host")
+
+        def _g(spans: dict, suffix: str) -> float:
+            for k, v in spans.items():
+                if k.endswith(suffix):
+                    return v / 1000.0
+            return 0.0
+
+        _layer0_ms = _g(_spans, "/layer_0")
+        _attn_ms = _g(_spans, "/layer_0/model/attn")
+        _phase = ("prefill" if _g(_spans, "/layer_0/model/attn/prefill") > 0
+                  else ("decode" if _g(_spans, "/layer_0/model/attn/decode") > 0
+                        else "-"))
+        _q_rms_rope_ms = _g(_spans, f"/layer_0/model/attn/{_phase}/mla_prolog/standard/q_rms_rope") if _phase != "-" else 0.0
+
+        # DIAG: host/dev split for the four phases + drain + memory.  Logged on
+        # ALL ranks (not just rank 0) so a spike isolated to one DP shard is
+        # still captured.  dev values are only meaningful after step_end
+        # (device synchronised) — hence computed here.
+        _ph = []
+        for _name in ("prep", "cos", "fwd", "post"):
+            _p = self._diag_phases.get(_name)
+            if _p is not None:
+                _ph.append(f"{_name}_h={_p.host_ms:.1f}")
+                _ph.append(f"{_name}_d={_p.dev_ms():.1f}")
+        try:
+            _memA = torch.npu.memory_allocated() / (1024 * 1024)
+            _memR = torch.npu.memory_reserved() / (1024 * 1024)
+        except Exception:
+            _memA = _memR = -1.0
+        _dmemR = (_memR - self._diag_prev_memR
+                  if self._diag_prev_memR > 0 else 0.0)
+        self._diag_prev_memR = _memR
+        logger.info(
+            "DIAGSTEP %d: tok=%d pad=%d %s drain=%.1fms "
+            "layer0_h=%.1f layer0_d=%.1f qrms_h=%.1f qrms_d=%.1f "
+            "moe_h=%.1f moe_d=%.1f memR=%.0fMiB dMemR=%+.0fMiB memA=%.0fMiB",
+            self._cs_step_counter, num_tokens, self._diag_last_padded,
+            " ".join(_ph), _diag_drain_ms,
+            _g(_host_spans, "/layer_0"), _layer0_ms,
+            _g(_host_spans, f"/layer_0/model/attn/{_phase}/mla_prolog/standard/q_rms_rope") if _phase != "-" else 0.0,
+            _q_rms_rope_ms,
+            _g(_host_spans, "/layer_0/model/moe"), _g(_spans, "/layer_0/model/moe"),
+            _memR, _dmemR, _memA,
+        )
 
         # Compact one-line per-step summary (rank 0 only).  Keeps the log
         # small even when every step is recorded.
-        _root = tracer._root
         _rank0 = not dist.is_initialized() or dist.get_rank() == 0
         if _rank0:
-            _spans = tracer.flatten_spans()
-            # Span paths are hierarchical (e.g.
-            # "model_forward/model/model_body/model/layer_0/model/attn/..."),
-            # so search by suffix rather than hard-coding the full prefix.
-            def _g(suffix: str) -> float:
-                for k, v in _spans.items():
-                    if k.endswith(suffix):
-                        return v / 1000.0
-                return 0.0
-            _layer0_ms = _g("/layer_0")
-            _attn_ms = _g("/layer_0/model/attn")
-            _phase = ("prefill" if _g("/layer_0/model/attn/prefill") > 0
-                      else ("decode" if _g("/layer_0/model/attn/decode") > 0
-                            else "-"))
-            _q_rms_rope_ms = _g(f"/layer_0/model/attn/{_phase}/mla_prolog/standard/q_rms_rope") if _phase != "-" else 0.0
             logger.info(
                 "CallStack step %d: tok=%d total=%.1fms fwd=%.1fms "
                 "prep=%.1fms layer0=%.1fms attn=%.1fms %s=%.1fms "
                 "q_rms_rope=%.1fms",
                 self._cs_step_counter, num_tokens,
-                _g("model_forward") + _g("prepare_input") + _g("post_process"),
-                _g("model_forward"), _g("prepare_input"),
+                _g(_spans, "model_forward") + _g(_spans, "prepare_input") + _g(_spans, "post_process"),
+                _g(_spans, "model_forward"), _g(_spans, "prepare_input"),
                 _layer0_ms, _attn_ms,
-                _phase, _g(f"/layer_0/model/attn/{_phase}") if _phase != "-" else 0.0,
+                _phase, _g(_spans, f"/layer_0/model/attn/{_phase}") if _phase != "-" else 0.0,
                 _q_rms_rope_ms,
             )
             # Full tree only when layer_0 exceeds the configured threshold.
