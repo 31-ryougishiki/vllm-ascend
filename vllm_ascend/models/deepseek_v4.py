@@ -1073,6 +1073,15 @@ class DeepseekV2DecoderLayer(nn.Module):
                 if get_hetero_capture():
                     _li = get_hetero_dump_dir()
                     if _li:
+                        # Force a full-device sync so the dump reads the live
+                        # GPU buffer, not a stale snapshot from an unsynced
+                        # upstream stream (embedding/SP may write hidden_states
+                        # asynchronously).
+                        try:
+                            import torch_npu
+                            torch_npu.npu.synchronize()
+                        except Exception:
+                            pass
                         torch.save(hidden_states.detach().cpu(), _lios.path.join(_li, "layer0_input.pt"))
             except Exception:
                 pass
@@ -1339,6 +1348,11 @@ class DeepseekV4Model(nn.Module):
                 if get_hetero_capture():
                     _pl = get_hetero_dump_dir()
                     if _pl:
+                        try:
+                            import torch_npu
+                            torch_npu.npu.synchronize()
+                        except Exception:
+                            pass
                         torch.save(hidden_states.detach().cpu(), _plos.path.join(_pl, "model_pre_layer0.pt"))
             except Exception:
                 pass
