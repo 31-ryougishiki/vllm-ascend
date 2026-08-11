@@ -1993,6 +1993,17 @@ class AscendDSAImpl(DSAAttentionImpl):
         except Exception:
             pass
 
+        # DIAGNOSTIC: rope input (pre-rope, after padding zeroing).
+        try:
+            from vllm_ascend.ascend_forward_context import get_hetero_dump_dir
+            _hd = get_hetero_dump_dir()
+            if _hd and not globals().get("_OPROJ_ROPE_IO_DUMPED"):
+                import os as _hdos
+                torch.save(o_proj_input[:actual_tokens].detach().cpu(),
+                           _hdos.path.join(_hd, "oproj_rope_in.pt"))
+        except Exception:
+            pass
+
         torch.ops._C_ascend.inplace_partial_rotary_mul(
             o_proj_input[:actual_tokens].unsqueeze(1),
             cos[:actual_tokens],
@@ -2000,6 +2011,18 @@ class AscendDSAImpl(DSAAttentionImpl):
             rotary_mode="interleave",
             partial_slice=[self.nope_head_dim, self.head_dim],
         )
+
+        # DIAGNOSTIC: rope output (post-rope).
+        try:
+            from vllm_ascend.ascend_forward_context import get_hetero_dump_dir
+            _hd = get_hetero_dump_dir()
+            if _hd and not globals().get("_OPROJ_ROPE_IO_DUMPED"):
+                globals()["_OPROJ_ROPE_IO_DUMPED"] = True
+                import os as _hdos
+                torch.save(o_proj_input[:actual_tokens].detach().cpu(),
+                           _hdos.path.join(_hd, "oproj_rope_out.pt"))
+        except Exception:
+            pass
 
         # o
         try:
