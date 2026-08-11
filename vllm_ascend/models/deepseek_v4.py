@@ -1205,6 +1205,7 @@ class DeepseekV4Model(nn.Module):
                 hidden_states = inputs_embeds
             else:
                 hidden_states = self.embed_input_ids(input_ids)
+            model_embed = hidden_states  # raw embedding, before unsqueeze/repeat
             residual = None
         else:
             assert intermediate_tensors is not None
@@ -1225,6 +1226,18 @@ class DeepseekV4Model(nn.Module):
 
         if get_pp_group().is_first_rank:
             hidden_states = hidden_states.unsqueeze(1).repeat(1, self.hc_mult, 1)  # (b, s, h) -> (b, s, c, h)
+            # --- hetero debug: raw embedding vs repeated layer input ---
+            import os as _edos
+            if _edos.environ.get("VLLM_HETERO_DEBUG") and not getattr(self, "_edump", False):
+                try:
+                    from vllm_ascend.ascend_forward_context import get_hetero_dump_dir
+                    _ed = get_hetero_dump_dir()
+                    if _ed:
+                        self._edump = True
+                        torch.save(model_embed.detach().cpu(), _edos.path.join(_ed, "model_embed.pt"))
+                        torch.save(hidden_states.detach().cpu(), _edos.path.join(_ed, "model_embed_hc.pt"))
+                except Exception:
+                    pass
 
         # Minimal hetero dump-dir setup (VLLM_HETERO_DEBUG): the o_proj rope
         # input/output dumps in dsa_v1.py need an active dump dir.  No per-layer
