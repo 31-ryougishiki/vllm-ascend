@@ -1993,19 +1993,6 @@ class NPUModelRunner(GPUModelRunner):
                 num_scheduled_tokens_np = np.array(tokens, dtype=np.int32)
                 max_num_scheduled_tokens = int(num_scheduled_tokens_np.max())
 
-                # DIAG: sync before prepare_inputs to measure pending device
-                # work carried over from the previous step's tail.  A large
-                # value here = async device work queued before this step's
-                # prepare_inputs (e.g. prev-step sampler / post_process / EPLB
-                # D2D).  Grep: DIAGPREP
-                _diag_prep_sync_t0 = time.perf_counter()
-                torch.npu.synchronize()
-                _diag_prep_sync_ms = (time.perf_counter() - _diag_prep_sync_t0) * 1000.0
-                logger.info(
-                    "DIAGPREP step=%d sync_before_prepare_inputs=%.1fms tok=%d",
-                    self._cs_step_counter, _diag_prep_sync_ms, num_scheduled_tokens,
-                )
-
                 (
                     logits_indices,
                     spec_decode_metadata,
@@ -2014,6 +2001,19 @@ class NPUModelRunner(GPUModelRunner):
                 ) = self._prepare_inputs(
                     scheduler_output,
                     num_scheduled_tokens_np,
+                )
+
+                # DIAG: sync after prepare_inputs to measure pending device
+                # work enqueued by prepare_inputs (input transfers, attention
+                # metadata, etc.) that model_forward would otherwise inherit.
+                # A large value = the spike work is enqueued inside
+                # prepare_inputs.  Grep: DIAGPREP
+                _diag_prep_sync_t0 = time.perf_counter()
+                torch.npu.synchronize()
+                _diag_prep_sync_ms = (time.perf_counter() - _diag_prep_sync_t0) * 1000.0
+                logger.info(
+                    "DIAGPREP step=%d sync_after_prepare_inputs=%.1fms tok=%d",
+                    self._cs_step_counter, _diag_prep_sync_ms, num_scheduled_tokens,
                 )
 
                 num_tokens_unpadded = scheduler_output.total_num_scheduled_tokens
