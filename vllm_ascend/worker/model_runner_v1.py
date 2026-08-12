@@ -2003,19 +2003,6 @@ class NPUModelRunner(GPUModelRunner):
                     num_scheduled_tokens_np,
                 )
 
-                # DIAG: sync after prepare_inputs to measure pending device
-                # work enqueued by prepare_inputs (input transfers, attention
-                # metadata, etc.) that model_forward would otherwise inherit.
-                # A large value = the spike work is enqueued inside
-                # prepare_inputs.  Grep: DIAGPREP
-                _diag_prep_sync_t0 = time.perf_counter()
-                torch.npu.synchronize()
-                _diag_prep_sync_ms = (time.perf_counter() - _diag_prep_sync_t0) * 1000.0
-                logger.info(
-                    "DIAGPREP step=%d sync_after_prepare_inputs=%.1fms tok=%d",
-                    self._cs_step_counter, _diag_prep_sync_ms, num_scheduled_tokens,
-                )
-
                 num_tokens_unpadded = scheduler_output.total_num_scheduled_tokens
                 if self.pcp_size > 1:
                     num_tokens_unpadded = self.pcp_manager.total_num_sampled_tokens_pcp
@@ -2202,9 +2189,20 @@ class NPUModelRunner(GPUModelRunner):
 
         # Run forward pass
         clear_kv_metadata = self.speculative_config is None
-        # DIAG: torch.npu.synchronize() removed to repro layer_0 spike.
-        # Temporarily restore with host timer to measure how much async work
-        # is pending before model_forward.
+
+        # DIAG: sync right before model_forward to measure pending device work
+        # enqueued by everything up to here (prepare_inputs / attention
+        # metadata / EPLB D2D).  A large value = async work drained here that
+        # model_forward would otherwise inherit.  Grep: DIAGPREP
+        _diag_prep_sync_t0 = time.perf_counter()
+        torch.npu.synchronize()
+        _diag_prep_sync_ms = (time.perf_counter() - _diag_prep_sync_t0) * 1000.0
+        logger.info(
+            "DIAGPREP step=%d sync_before_model_forward=%.1fms tok=%d pad=%d",
+            self._cs_step_counter, _diag_prep_sync_ms,
+            num_scheduled_tokens, num_tokens_padded,
+        )
+
         with (
             self._diag_phases["fwd"],
             self._cs_span("model_forward"),
