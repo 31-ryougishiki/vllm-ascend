@@ -509,6 +509,22 @@ class DeepseekV4MoE(nn.Module):
         num_tokens, hidden_dim = hidden_states.shape
         hidden_states = hidden_states.view(-1, hidden_dim)
 
+        # --- hetero trace: confirm DeepseekV4MoE.forward is the path ---
+        import os as _mtr
+        if _mtr.environ.get("VLLM_HETERO_DEBUG"):
+            _tr = getattr(self, "_hetero_trace_moe", 0)
+            if _tr < 10:
+                self._hetero_trace_moe = _tr + 1
+                logger.info(
+                    "[hetero-trace] DeepseekV4MoE.forward layer=%s internal_router=%s sp=%s "
+                    "experts=%s gate_weight=%s",
+                    getattr(self, "layer_idx", "?"),
+                    self.experts.is_internal_router,
+                    self.is_sequence_parallel,
+                    type(self.experts).__name__,
+                    self.gate.weight is not None,
+                )
+
         # --- hetero debug: per-layer MoE-internal probes.  self.layer_idx is
         # set on DeepseekV4MoE (parse of the module prefix). ---
         def _mdump(name: str, t: torch.Tensor):

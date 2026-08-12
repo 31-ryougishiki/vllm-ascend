@@ -166,6 +166,15 @@ class AscendUnquantizedFusedMoEMethod(UnquantizedFusedMoEMethod):
         zero_expert_type = getattr(layer, "zero_expert_type", None)
         input_ids = getattr(get_forward_context(), "input_ids", None)
         num_shared_experts = getattr(layer, "n_shared_experts", 0)
+
+        # --- hetero trace: confirm AscendUnquantizedFusedMoEMethod.apply is hit ---
+        import os as _apt
+        if _apt.environ.get("VLLM_HETERO_DEBUG"):
+            _tr = getattr(self, "_hetero_trace_apply", 0)
+            if _tr < 10:
+                self._hetero_trace_apply = _tr + 1
+                from vllm.logger import logger as _apt_logger
+                _apt_logger.info("[hetero-trace] AscendUnquantizedFusedMoEMethod.apply reached")
         if num_shared_experts is None:
             num_shared_experts = 0
         num_logical_experts = get_moe_num_logical_experts(
@@ -197,14 +206,25 @@ class AscendUnquantizedFusedMoEMethod(UnquantizedFusedMoEMethod):
         if _topos.environ.get("VLLM_HETERO_DEBUG"):
             try:
                 from vllm_ascend.ascend_forward_context import get_hetero_capture, get_hetero_dump_dir
-                if get_hetero_capture():
-                    _tpd = get_hetero_dump_dir()
-                    if _tpd:
-                        _mli = getattr(get_forward_context(), "moe_layer_index", "?")
-                        torch.save(topk_ids.detach().cpu(), _topos.path.join(_tpd, f"moe{_mli}_expert_ids.pt"))
-                        torch.save(topk_weights.detach().cpu(), _topos.path.join(_tpd, f"moe{_mli}_expert_weights.pt"))
-            except Exception:
-                pass
+                _tpc = get_hetero_capture()
+                _tpd = get_hetero_dump_dir()
+                _tr2 = getattr(self, "_hetero_trace_dump", 0)
+                if _tr2 < 10:
+                    self._hetero_trace_dump = _tr2 + 1
+                    from vllm.logger import logger as _tpl
+                    _tpl.info(
+                        "[hetero-trace] routing dump block: cap=%s dir=%s topk_ids_shape=%s",
+                        _tpc,
+                        _tpd,
+                        tuple(topk_ids.shape),
+                    )
+                if _tpc and _tpd:
+                    _mli = getattr(get_forward_context(), "moe_layer_index", "?")
+                    torch.save(topk_ids.detach().cpu(), _topos.path.join(_tpd, f"moe{_mli}_expert_ids.pt"))
+                    torch.save(topk_weights.detach().cpu(), _topos.path.join(_tpd, f"moe{_mli}_expert_weights.pt"))
+            except Exception as _tpe:
+                from vllm.logger import logger as _tpe_logger
+                _tpe_logger.info("[hetero-trace] routing dump block error: %r", _tpe)
         if vllm_version_is("0.23.0"):
             model_config = layer.vllm_config.model_config
         else:

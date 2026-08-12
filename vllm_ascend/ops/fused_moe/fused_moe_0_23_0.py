@@ -113,6 +113,18 @@ class AscendMoERunner(MoERunner):
         This delegates to the layer's forward_impl method which contains the
         Ascend-specific MoE computation logic.
         """
+        # --- hetero trace: which runner delegate is taken ---
+        import os as _rft
+        if _rft.environ.get("VLLM_HETERO_DEBUG"):
+            _tr = getattr(self, "_hetero_trace_runner_fi", 0)
+            if _tr < 10:
+                self._hetero_trace_runner_fi = _tr + 1
+                from vllm.logger import logger as _rfl
+                _rfl.info(
+                    "[hetero-trace] AscendMoERunner.forward_impl shared_experts=%s layer=%s",
+                    self.shared_experts is not None,
+                    type(layer).__name__,
+                )
         if self.shared_experts is None:
             result = layer.forward_impl(hidden_states, router_logits)
             # If the layer has shared experts, forward_impl returns a tuple (shared_out, routed_out)
@@ -420,6 +432,18 @@ class AscendFusedMoE(FusedMoE):
         hidden_states: torch.Tensor,
         router_logits: torch.Tensor,
     ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
+        # --- hetero trace: confirm AscendFusedMoE.forward + runner type ---
+        import os as _afs
+        if _afs.environ.get("VLLM_HETERO_DEBUG"):
+            _tr = getattr(self, "_hetero_trace_fmoe", 0)
+            if _tr < 10:
+                self._hetero_trace_fmoe = _tr + 1
+                from vllm.logger import logger as _afl
+                _afl.info(
+                    "[hetero-trace] AscendFusedMoE.forward runner=%s internal_router=%s",
+                    type(self.runner).__name__,
+                    getattr(self, "is_internal_router", None),
+                )
         self.ensure_moe_quant_config_init()
         return self.runner.forward(
             hidden_states,
@@ -430,6 +454,19 @@ class AscendFusedMoE(FusedMoE):
         self, hidden_states: torch.Tensor, router_logits: torch.Tensor, return_with_event: bool = False
     ) -> torch.Tensor | FusedMoEResult:
         assert self.quant_method is not None
+
+        # --- hetero trace: confirm AscendFusedMoE.forward_impl is the path ---
+        import os as _firt
+        if _firt.environ.get("VLLM_HETERO_DEBUG"):
+            _tr = getattr(self, "_hetero_trace_fi", 0)
+            if _tr < 10:
+                self._hetero_trace_fi = _tr + 1
+                from vllm.logger import logger as _firt_logger
+                _firt_logger.info(
+                    "[hetero-trace] AscendFusedMoE.forward_impl gate=%s quant=%s",
+                    self.multistream_overlap_gate,
+                    type(self.quant_method).__name__,
+                )
 
         forward_context = get_forward_context()
         # When static kernels are enabled, the forward pass runs twice (compilation + capture),
