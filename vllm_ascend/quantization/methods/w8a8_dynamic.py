@@ -287,6 +287,20 @@ class AscendW8A8DynamicFusedMoEMethod(AscendMoEScheme):
             )
         assert topk_ids is not None
         assert topk_weights is not None
+        # --- hetero debug: dump the ACTUAL selected experts (W8A8 route) ---
+        import os as _wkos
+        if _wkos.environ.get("VLLM_HETERO_DEBUG"):
+            try:
+                from vllm_ascend.ascend_forward_context import get_hetero_capture, get_hetero_dump_dir
+                if get_hetero_capture():
+                    _wkd = get_hetero_dump_dir()
+                    if _wkd:
+                        from vllm.forward_context import get_forward_context as _wkfc
+                        _mli = getattr(_wkfc(), "moe_layer_index", "?")
+                        torch.save(topk_ids.detach().cpu(), _wkos.path.join(_wkd, f"moe{_mli}_expert_ids.pt"))
+                        torch.save(topk_weights.detach().cpu(), _wkos.path.join(_wkd, f"moe{_mli}_expert_weights.pt"))
+            except Exception:
+                pass
         if zero_expert_num > 0 and zero_expert_type is not None:
             topk_ids, topk_weights, zero_expert_result = zero_experts_compute(
                 expert_indices=topk_ids,
