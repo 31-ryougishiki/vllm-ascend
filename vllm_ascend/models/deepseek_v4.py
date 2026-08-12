@@ -1059,64 +1059,7 @@ class DeepseekV2DecoderLayer(nn.Module):
         residual: torch.Tensor | None,
         llama_4_scaling: torch.Tensor | None = None,
     ) -> torch.Tensor:
-        # --- hetero debug: layer-ENTRY input, BEFORE the residual clone.  This
-        # captures the exact tensor the layer computes on (after the offloader's
-        # wait_prefetch).  Compare with model_post_clone (0.0, same object) to
-        # pin whether the fresh buffer is overwritten between model and layer. ---
-        import os as _les
-        if _les.environ.get("VLLM_HETERO_DEBUG"):
-            try:
-                from vllm_ascend.ascend_forward_context import get_hetero_capture, get_hetero_dump_dir
-                # Only dump the FIRST layer: every layer runs this forward and
-                # would otherwise overwrite the file with a later layer's
-                # (post-attention+MLP) data, masking layer0's true input.
-                if get_hetero_capture() and self.layer_idx == 0:
-                    _le = get_hetero_dump_dir()
-                    if _le:
-                        torch.save(hidden_states.detach().cpu(), _les.path.join(_le, "layer0_entry.pt"))
-                        try:
-                            torch.save(
-                                {"ptr": int(hidden_states.data_ptr()), "shape": list(hidden_states.shape)},
-                                _les.path.join(_le, "layer0_entry_meta.pt"),
-                            )
-                        except Exception:
-                            pass
-            except Exception:
-                pass
         residual = hidden_states.clone()
-        # --- hetero debug: layer-entry input (clone-free) vs model-level
-        # model_embed_hc.  hc_residual (the clone) diverged 1.97e4 while
-        # model_embed_hc matched 0.0 -- same tensor, impossible unless the
-        # input is mutated between model forward and layer entry OR the two
-        # dumps came from different forwards.  layer0_input resolves which.
-        import os as _lios
-        if _lios.environ.get("VLLM_HETERO_DEBUG"):
-            try:
-                from vllm_ascend.ascend_forward_context import get_hetero_capture, get_hetero_dump_dir, get_hetero_fwd
-                # Only dump the FIRST layer (see layer0_entry).
-                if get_hetero_capture() and self.layer_idx == 0:
-                    _li = get_hetero_dump_dir()
-                    if _li:
-                        # Record the storage address + forward tag so we can tell
-                        # whether the layer0 input is the SAME buffer/forward as
-                        # model_pre_layer0 (same ptr + same fwd) or a different
-                        # buffer / different forward (aliasing or fwd mixing).
-                        try:
-                            import torch_npu
-                            torch_npu.npu.synchronize()
-                        except Exception:
-                            pass
-                        torch.save(hidden_states.detach().cpu(), _lios.path.join(_li, "layer0_input.pt"))
-                        try:
-                            torch.save(
-                                {"ptr": int(hidden_states.data_ptr()), "shape": list(hidden_states.shape),
-                                 "fwd": get_hetero_fwd()},
-                                _lios.path.join(_li, "layer0_input_meta.pt"),
-                            )
-                        except Exception:
-                            pass
-            except Exception:
-                pass
         hidden_states, post, comb = self.hc_pre(hidden_states, self.hc_attn_fn, self.hc_attn_scale, self.hc_attn_base)
         hc_pre_y = hidden_states
         hidden_states = self.input_layernorm(hidden_states)
@@ -1124,26 +1067,41 @@ class DeepseekV2DecoderLayer(nn.Module):
         attn_kwargs = {"positions": positions, "hidden_states": hidden_states, "llama_4_scaling": llama_4_scaling}
         hidden_states = self.self_attn(**attn_kwargs)
         hidden_states = self.hc_post(hidden_states, residual, post, comb)
-        # --- hetero debug: keep only the layer-input clone (hc_residual); the
-        # hc_pre / attn / hc_post downstream probes are cut until the
-        # model_embed_hc(0.0) vs layer0_input/hc_residual(1.97e4) paradox is
-        # resolved. ---
+        # --- hetero debug: per-layer attention-path probes (filename carries
+        # the layer index so the FIRST diverging layer can be located in one
+        # run; every layer dumps its own files). ---
         import os as _ldos
         if _ldos.environ.get("VLLM_HETERO_DEBUG"):
             try:
                 from vllm_ascend.ascend_forward_context import get_hetero_capture, get_hetero_dump_dir
-                # Only dump the FIRST layer (see layer0_entry).
-                if get_hetero_capture() and self.layer_idx == 0:
+                if get_hetero_capture():
                     _ld = get_hetero_dump_dir()
                     if _ld:
-                        torch.save(residual.detach().cpu(), _ldos.path.join(_ld, "hc_residual.pt"))
+                        _lix = self.layer_idx
+                        torch.save(hc_pre_y.detach().cpu(), _ldos.path.join(_ld, f"layer{_lix}_hc_pre_y.pt"))
+                        torch.save(attn_in.detach().cpu(), _ldos.path.join(_ld, f"layer{_lix}_attn_in.pt"))
+                        torch.save(hidden_states.detach().cpu(), _ldos.path.join(_ld, f"layer{_lix}_attn_out.pt"))
             except Exception:
                 pass
         residual = hidden_states.clone()
         hidden_states, post, comb = self.hc_pre(hidden_states, self.hc_ffn_fn, self.hc_ffn_scale, self.hc_ffn_base)
+        mlp_in = hidden_states
         hidden_states = self.post_attention_layernorm(hidden_states)
         hidden_states = self.mlp(hidden_states)
         hidden_states = self.hc_post(hidden_states, residual, post, comb)
+        # --- hetero debug: per-layer MLP-path probes. ---
+        import os as _lmos
+        if _lmos.environ.get("VLLM_HETERO_DEBUG"):
+            try:
+                from vllm_ascend.ascend_forward_context import get_hetero_capture, get_hetero_dump_dir
+                if get_hetero_capture():
+                    _lm = get_hetero_dump_dir()
+                    if _lm:
+                        _lix = self.layer_idx
+                        torch.save(mlp_in.detach().cpu(), _lmos.path.join(_lm, f"layer{_lix}_mlp_in.pt"))
+                        torch.save(hidden_states.detach().cpu(), _lmos.path.join(_lm, f"layer{_lix}_mlp_out.pt"))
+            except Exception:
+                pass
 
         return hidden_states, residual
 
@@ -1268,7 +1226,6 @@ class DeepseekV4Model(nn.Module):
                 hidden_states = inputs_embeds
             else:
                 hidden_states = self.embed_input_ids(input_ids)
-            model_embed = hidden_states  # raw embedding, before unsqueeze/repeat
             residual = None
         else:
             assert intermediate_tensors is not None
@@ -1356,81 +1313,9 @@ class DeepseekV4Model(nn.Module):
                     self._hetero_fwd_count = _count + 1
                     set_hetero_capture(True)
                     set_hetero_fwd(_count)
-                    # raw embedding vs repeated layer input, same capture forward
-                    try:
-                        if "model_embed" in locals():
-                            from vllm_ascend.ascend_forward_context import get_hetero_dump_dir
-                            _ed = get_hetero_dump_dir()
-                            if _ed:
-                                torch.save(model_embed.detach().cpu(), _os.path.join(_ed, "model_embed.pt"))
-                                torch.save(hidden_states.detach().cpu(), _os.path.join(_ed, "model_embed_hc.pt"))
-                    except Exception:
-                        pass
             except Exception:
                 pass
 
-        # --- hetero debug: model_embed_hc(0.0) vs layer0_input(6.375) paradox.
-        # Save hidden_states right before the layer loop to see whether the
-        # divergence appears between the setter's .cpu() snapshot and here, or
-        # inside the layer0 call.  (model_embed_hc == model_pre_layer0 == 0 but
-        # layer0_input == 6.375 -> divergence inside the layer0 call; if
-        # model_pre_layer0 already == 6.375 -> async/stream mutation of the
-        # hidden_states buffer between the snapshot and the loop.) ---
-        import os as _plos
-        if _plos.environ.get("VLLM_HETERO_DEBUG"):
-            try:
-                from vllm_ascend.ascend_forward_context import get_hetero_capture, get_hetero_dump_dir, get_hetero_fwd
-                if get_hetero_capture():
-                    _pl = get_hetero_dump_dir()
-                    if _pl:
-                        try:
-                            import torch_npu
-                            torch_npu.npu.synchronize()
-                        except Exception:
-                            pass
-                        torch.save(hidden_states.detach().cpu(), _plos.path.join(_pl, "model_pre_layer0.pt"))
-                        try:
-                            torch.save(
-                                {"ptr": int(hidden_states.data_ptr()), "shape": list(hidden_states.shape),
-                                 "fwd": get_hetero_fwd()},
-                                _plos.path.join(_pl, "model_pre_layer0_meta.pt"),
-                            )
-                        except Exception:
-                            pass
-            except Exception:
-                pass
-
-        # HETERO DEBUG: model_pre_layer0 (0.0, ptr A) vs layer0_input (6.375,
-        # ptr B) — same forward, same logical hidden_states, but layer0 reads a
-        # DIFFERENT buffer.  Hypothesis: the input buffer gets asynchronously
-        # overwritten (pooled/SP workspace reuse, heterogeneous across DP)
-        # between the model forward and the layer entry.  Test: pass a fresh
-        # clone captured while the data is still correct, and see if the layer
-        # input (and downstream) becomes bit-identical.
-        hidden_states = hidden_states.detach().clone()
-        # --- hetero debug: dump the clone value right after cloning.  If
-        # model_pre_layer0 (sync, 0.0) == model_post_clone (0.0) but
-        # layer0_input == 6.375, the FRESH clone buffer is corrupted by a
-        # separate-stream writer between model and layer0.  If model_post_clone
-        # already == 6.375, the SOURCE hidden_states.data is corrupted by an
-        # unsynced stream before the clone. ---
-        import os as _pcos
-        if _pcos.environ.get("VLLM_HETERO_DEBUG"):
-            try:
-                from vllm_ascend.ascend_forward_context import get_hetero_capture, get_hetero_dump_dir
-                if get_hetero_capture():
-                    _pc = get_hetero_dump_dir()
-                    if _pc:
-                        torch.save(hidden_states.detach().cpu(), _pcos.path.join(_pc, "model_post_clone.pt"))
-                        try:
-                            torch.save(
-                                {"ptr": int(hidden_states.data_ptr()), "shape": list(hidden_states.shape)},
-                                _pcos.path.join(_pc, "model_post_clone_meta.pt"),
-                            )
-                        except Exception:
-                            pass
-            except Exception:
-                pass
         for layer in islice(self.layers, self.start_layer, self.end_layer):
             hidden_states, residual = layer(positions, hidden_states, residual, llama_4_scaling)
 
