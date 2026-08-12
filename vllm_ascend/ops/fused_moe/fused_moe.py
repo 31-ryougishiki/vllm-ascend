@@ -14,6 +14,8 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 #
+import time
+
 from collections.abc import Callable
 from dataclasses import dataclass, field
 from functools import wraps
@@ -61,6 +63,12 @@ else:
             f"{local_index.item()}->{global_index.item()}"
             for local_index, global_index in zip(local_indices, global_indices)
         )
+
+
+# DIAG: (num_tokens, routed_tokens) shape keys already seen by the Ascend
+# MoE fused op.  A "new" key => per-shape op compile/init cost (one of the
+# suspects for the layer_0 quant_apply spike).  Grep: DIAGMOE
+_seen_moe_shapes: set = set()
 
 
 @dataclass
@@ -231,6 +239,7 @@ class AscendUnquantizedFusedMoEMethod(UnquantizedFusedMoEMethod):
             w1_scale_bias = None
             w2_scale_bias = None
 
+        _diag_t0 = time.perf_counter()
         final_hidden_states = moe_comm_method.fused_experts(
             fused_experts_input=build_fused_experts_input(
                 hidden_states=x,
@@ -256,6 +265,17 @@ class AscendUnquantizedFusedMoEMethod(UnquantizedFusedMoEMethod):
                 swiglu_limit=layer.swiglu_limit,
             )
         )
+        _diag_ms = (time.perf_counter() - _diag_t0) * 1000.0
+        _diag_ntok = int(hidden_states.shape[0])
+        _diag_routed = int(topk_ids.numel())
+        _diag_key = (_diag_ntok, _diag_routed)
+        _diag_new = _diag_key not in _seen_moe_shapes
+        _seen_moe_shapes.add(_diag_key)
+        if _diag_new or _diag_ms > 50.0:
+            logger.info(
+                "DIAGMOE ntok=%d routed=%d new=%s host_ms=%.1f",
+                _diag_ntok, _diag_routed, _diag_new, _diag_ms,
+            )
         if zero_expert_num > 0 and zero_expert_type is not None:
             final_hidden_states += zero_expert_result
         return final_hidden_states
