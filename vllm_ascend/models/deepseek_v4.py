@@ -1375,6 +1375,14 @@ class DeepseekV4Model(nn.Module):
             except Exception:
                 pass
 
+        # HETERO DEBUG: model_pre_layer0 (0.0, ptr A) vs layer0_input (6.375,
+        # ptr B) — same forward, same logical hidden_states, but layer0 reads a
+        # DIFFERENT buffer.  Hypothesis: the input buffer gets asynchronously
+        # overwritten (pooled/SP workspace reuse, heterogeneous across DP)
+        # between the model forward and the layer entry.  Test: pass a fresh
+        # clone captured while the data is still correct, and see if the layer
+        # input (and downstream) becomes bit-identical.
+        hidden_states = hidden_states.detach().clone()
         for layer in islice(self.layers, self.start_layer, self.end_layer):
             hidden_states, residual = layer(positions, hidden_states, residual, llama_4_scaling)
 
