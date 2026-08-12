@@ -532,7 +532,7 @@ class DeepseekV4MoE(nn.Module):
             hidden_states = sequence_parallel_chunk(hidden_states)
 
         if self.experts.is_internal_router:
-            # In this case, the gate/router runs inside the FusedMoE class
+            # In this case, the gate/router runs inside the FusedMoE class.
             _mdump("mlp_router_in", hidden_states)
             fused_moe_out = self.experts(hidden_states=hidden_states, router_logits=hidden_states)
         else:

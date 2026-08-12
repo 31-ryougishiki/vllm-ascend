@@ -190,6 +190,21 @@ class AscendUnquantizedFusedMoEMethod(UnquantizedFusedMoEMethod):
             tid2eid=self.tid2eid,
             input_ids=input_ids,
         )
+        # --- hetero debug: dump the ACTUAL selected experts (what the MoE
+        # kernel will use).  Compare DP0 vs DP1: same topk -> routing is not
+        # the divergence source; different -> router flips on tiny input diffs. ---
+        import os as _topos
+        if _topos.environ.get("VLLM_HETERO_DEBUG"):
+            try:
+                from vllm_ascend.ascend_forward_context import get_hetero_capture, get_hetero_dump_dir
+                if get_hetero_capture():
+                    _tpd = get_hetero_dump_dir()
+                    if _tpd:
+                        _mli = getattr(get_forward_context(), "moe_layer_index", "?")
+                        torch.save(topk_ids.detach().cpu(), _topos.path.join(_tpd, f"moe{_mli}_expert_ids.pt"))
+                        torch.save(topk_weights.detach().cpu(), _topos.path.join(_tpd, f"moe{_mli}_expert_weights.pt"))
+            except Exception:
+                pass
         if vllm_version_is("0.23.0"):
             model_config = layer.vllm_config.model_config
         else:
