@@ -509,6 +509,21 @@ class DeepseekV4MoE(nn.Module):
         num_tokens, hidden_dim = hidden_states.shape
         hidden_states = hidden_states.view(-1, hidden_dim)
 
+        # --- hetero debug: per-layer MoE-internal probes. ---
+        def _mdump(name: str, t: torch.Tensor):
+            import os as _mo
+            if not _mo.environ.get("VLLM_HETERO_DEBUG"):
+                return
+            try:
+                from vllm_ascend.ascend_forward_context import _EXTRA_CTX, get_hetero_capture, get_hetero_dump_dir
+                if get_hetero_capture():
+                    _md = get_hetero_dump_dir()
+                    if _md:
+                        _li = getattr(_EXTRA_CTX, "layer_idx", "?")
+                        torch.save(t.detach().cpu(), _mo.path.join(_md, f"layer{_li}_{name}.pt"))
+            except Exception:
+                pass
+
         # Chunk the hidden states so they aren't replicated across TP ranks.
         # This avoids duplicate computation in self.experts.
         # TODO: We can replace the all_reduce at the end of attn with a
@@ -522,11 +537,15 @@ class DeepseekV4MoE(nn.Module):
         else:
             # router_logits: (num_tokens, n_experts)
             router_logits = F.linear(hidden_states.float(), self.gate.weight)
+            _mdump("mlp_router", router_logits)
             fused_moe_out = self.experts(hidden_states=hidden_states, router_logits=router_logits)
 
         fused_moe_out_is_tuple = isinstance(fused_moe_out, tuple)
         if fused_moe_out_is_tuple:
             shared_output, final_hidden_states = fused_moe_out
+            if shared_output is not None:
+                _mdump("mlp_shared", shared_output)
+            _mdump("mlp_routed", final_hidden_states)
             if self.shared_experts is None:
                 assert shared_output is None
 
@@ -546,6 +565,8 @@ class DeepseekV4MoE(nn.Module):
                 )
         else:
             final_hidden_states = fused_moe_out
+
+        _mdump("mlp_combined", final_hidden_states)
 
         if self.is_sequence_parallel:
             final_hidden_states = tensor_model_parallel_all_gather(final_hidden_states, 0)
