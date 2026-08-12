@@ -1993,6 +1993,19 @@ class NPUModelRunner(GPUModelRunner):
                 num_scheduled_tokens_np = np.array(tokens, dtype=np.int32)
                 max_num_scheduled_tokens = int(num_scheduled_tokens_np.max())
 
+                # DIAG: sync before prepare_inputs to measure pending device
+                # work carried over from the previous step's tail.  A large
+                # value here = async device work queued before this step's
+                # prepare_inputs (e.g. prev-step sampler / post_process / EPLB
+                # D2D).  Grep: DIAGPREP
+                _diag_prep_sync_t0 = time.perf_counter()
+                torch.npu.synchronize()
+                _diag_prep_sync_ms = (time.perf_counter() - _diag_prep_sync_t0) * 1000.0
+                logger.info(
+                    "DIAGPREP step=%d sync_before_prepare_inputs=%.1fms tok=%d",
+                    self._cs_step_counter, _diag_prep_sync_ms, num_scheduled_tokens,
+                )
+
                 (
                     logits_indices,
                     spec_decode_metadata,
