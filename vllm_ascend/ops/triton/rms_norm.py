@@ -1,23 +1,5 @@
-import time
-
 import torch
 from vllm.triton_utils import tl, triton
-
-# DIAG: shapes for which the triton kernel was already launched.  A new key
-# (esp. TOTAL_BATCH change from a new num_tokens) forces a triton JIT
-# recompile on first use — one of the suspects for the occasional spike.
-_seen_shapes: set = set()
-
-
-def _diag_launch_log(is_new, key, setup_ms, alloc_ms, launch_ms):
-    from vllm.logger import init_logger
-    _lg = init_logger("vllm_ascend.ops.triton.rms_norm")
-    _lg.warning(
-        "DIAG triton_q_rms new=%s key=(total_batch=%s,dim=%s,BLOCK_M=%s,vc=%s) "
-        "setup=%.1fms alloc=%.1fms launch=%.1fms",
-        is_new, key[0], key[1], key[2], key[3],
-        setup_ms, alloc_ms, launch_ms,
-    )
 
 
 @triton.jit
@@ -55,7 +37,6 @@ def triton_q_rms(
     q,  # bs, 64, 512
     variance_epsilon,
 ):
-    _t0 = time.perf_counter()
     bs, head_num, dim = q.shape
     total_batch = bs * head_num
     q = q.view(total_batch, dim)
@@ -71,9 +52,7 @@ def triton_q_rms(
     BLOCK_M = min(ROW_BLOCK_SIZE, batch_per_core)
 
     grid = (num_vectorcore,)
-    _t1 = time.perf_counter()
     norm_output = torch.empty_like(q)
-    _t2 = time.perf_counter()
 
     triton_rms_kernel[grid](
         q,
@@ -84,18 +63,4 @@ def triton_q_rms(
         dim,
         BLOCK_M,
     )
-    _t3 = time.perf_counter()
-
-    # DIAG: split the function into setup / allocation / kernel-launch host
-    # time.  A large `launch` on a *new* shape => triton JIT recompile;
-    # a large `alloc` => memory allocation stalling on the allocator/device.
-    _key = (total_batch, dim, BLOCK_M, num_vectorcore)
-    _is_new = _key not in _seen_shapes
-    _seen_shapes.add(_key)
-    _setup_ms = (_t1 - _t0) * 1000.0
-    _alloc_ms = (_t2 - _t1) * 1000.0
-    _launch_ms = (_t3 - _t2) * 1000.0
-    if _is_new or max(_alloc_ms, _launch_ms) > 50.0:
-        _diag_launch_log(_is_new, _key, _setup_ms, _alloc_ms, _launch_ms)
-
     return norm_output.view(bs, head_num, dim)
