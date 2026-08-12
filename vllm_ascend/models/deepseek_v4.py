@@ -1071,6 +1071,13 @@ class DeepseekV2DecoderLayer(nn.Module):
                     _le = get_hetero_dump_dir()
                     if _le:
                         torch.save(hidden_states.detach().cpu(), _les.path.join(_le, "layer0_entry.pt"))
+                        try:
+                            torch.save(
+                                {"ptr": int(hidden_states.data_ptr()), "shape": list(hidden_states.shape)},
+                                _les.path.join(_le, "layer0_entry_meta.pt"),
+                            )
+                        except Exception:
+                            pass
             except Exception:
                 pass
         residual = hidden_states.clone()
@@ -1410,6 +1417,13 @@ class DeepseekV4Model(nn.Module):
                     _pc = get_hetero_dump_dir()
                     if _pc:
                         torch.save(hidden_states.detach().cpu(), _pcos.path.join(_pc, "model_post_clone.pt"))
+                        try:
+                            torch.save(
+                                {"ptr": int(hidden_states.data_ptr()), "shape": list(hidden_states.shape)},
+                                _pcos.path.join(_pc, "model_post_clone_meta.pt"),
+                            )
+                        except Exception:
+                            pass
             except Exception:
                 pass
         for layer in islice(self.layers, self.start_layer, self.end_layer):
