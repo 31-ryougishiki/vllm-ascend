@@ -1059,6 +1059,20 @@ class DeepseekV2DecoderLayer(nn.Module):
         residual: torch.Tensor | None,
         llama_4_scaling: torch.Tensor | None = None,
     ) -> torch.Tensor:
+        # --- hetero debug: layer-ENTRY input, BEFORE the residual clone.  This
+        # captures the exact tensor the layer computes on (after the offloader's
+        # wait_prefetch).  Compare with model_post_clone (0.0, same object) to
+        # pin whether the fresh buffer is overwritten between model and layer. ---
+        import os as _les
+        if _les.environ.get("VLLM_HETERO_DEBUG"):
+            try:
+                from vllm_ascend.ascend_forward_context import get_hetero_capture, get_hetero_dump_dir
+                if get_hetero_capture():
+                    _le = get_hetero_dump_dir()
+                    if _le:
+                        torch.save(hidden_states.detach().cpu(), _les.path.join(_le, "layer0_entry.pt"))
+            except Exception:
+                pass
         residual = hidden_states.clone()
         # --- hetero debug: layer-entry input (clone-free) vs model-level
         # model_embed_hc.  hc_residual (the clone) diverged 1.97e4 while
