@@ -509,18 +509,18 @@ class DeepseekV4MoE(nn.Module):
         num_tokens, hidden_dim = hidden_states.shape
         hidden_states = hidden_states.view(-1, hidden_dim)
 
-        # --- hetero debug: per-layer MoE-internal probes. ---
+        # --- hetero debug: per-layer MoE-internal probes.  self.layer_idx is
+        # set on DeepseekV4MoE (parse of the module prefix). ---
         def _mdump(name: str, t: torch.Tensor):
             import os as _mo
             if not _mo.environ.get("VLLM_HETERO_DEBUG"):
                 return
             try:
-                from vllm_ascend.ascend_forward_context import _EXTRA_CTX, get_hetero_capture, get_hetero_dump_dir
+                from vllm_ascend.ascend_forward_context import get_hetero_capture, get_hetero_dump_dir
                 if get_hetero_capture():
                     _md = get_hetero_dump_dir()
                     if _md:
-                        _li = getattr(_EXTRA_CTX, "layer_idx", "?")
-                        torch.save(t.detach().cpu(), _mo.path.join(_md, f"layer{_li}_{name}.pt"))
+                        torch.save(t.detach().cpu(), _mo.path.join(_md, f"layer{self.layer_idx}_{name}.pt"))
             except Exception:
                 pass
 
@@ -533,6 +533,7 @@ class DeepseekV4MoE(nn.Module):
 
         if self.experts.is_internal_router:
             # In this case, the gate/router runs inside the FusedMoE class
+            _mdump("mlp_router_in", hidden_states)
             fused_moe_out = self.experts(hidden_states=hidden_states, router_logits=hidden_states)
         else:
             # router_logits: (num_tokens, n_experts)
@@ -540,6 +541,8 @@ class DeepseekV4MoE(nn.Module):
             _mdump("mlp_router", router_logits)
             fused_moe_out = self.experts(hidden_states=hidden_states, router_logits=router_logits)
 
+        if isinstance(fused_moe_out, torch.Tensor):
+            _mdump("mlp_fused", fused_moe_out)
         fused_moe_out_is_tuple = isinstance(fused_moe_out, tuple)
         if fused_moe_out_is_tuple:
             shared_output, final_hidden_states = fused_moe_out
