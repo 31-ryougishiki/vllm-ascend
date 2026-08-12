@@ -415,18 +415,7 @@ class NPUWorker(WorkerBase):
                 if dp_local_rank is None:
                     dp_local_rank = parallel_config.data_parallel_index
                 tp_pp_world_size = parallel_config.pipeline_parallel_size * parallel_config.tensor_parallel_size
-                if parallel_config.is_heterogeneous_tp:
-                    # HETEROGENEOUS-FIX: device index must equal the GLOBAL
-                    # (torch) rank so HCCL rank<->device align.  DP offsets are
-                    # the cumulative actual TP sizes (get_rank_offset_for_dp),
-                    # NOT dp*uniform_tp (DP0's tp=3 makes these differ).  Pairs
-                    # with identity-mapped visible devices (see
-                    # set_device_control_env_var).
-                    self.local_rank += parallel_config.get_rank_offset_for_dp(
-                        dp_local_rank
-                    )
-                else:
-                    self.local_rank += dp_local_rank * tp_pp_world_size
+                self.local_rank += dp_local_rank * tp_pp_world_size
 
             # Publish the logical-to-physical mapping for topology queries.
             assigned_physical_gpu_ids = parallel_config.assigned_physical_gpu_ids
