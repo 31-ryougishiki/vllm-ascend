@@ -1067,7 +1067,10 @@ class DeepseekV2DecoderLayer(nn.Module):
         if _les.environ.get("VLLM_HETERO_DEBUG"):
             try:
                 from vllm_ascend.ascend_forward_context import get_hetero_capture, get_hetero_dump_dir
-                if get_hetero_capture():
+                # Only dump the FIRST layer: every layer runs this forward and
+                # would otherwise overwrite the file with a later layer's
+                # (post-attention+MLP) data, masking layer0's true input.
+                if get_hetero_capture() and self.layer_idx == 0:
                     _le = get_hetero_dump_dir()
                     if _le:
                         torch.save(hidden_states.detach().cpu(), _les.path.join(_le, "layer0_entry.pt"))
@@ -1090,7 +1093,8 @@ class DeepseekV2DecoderLayer(nn.Module):
         if _lios.environ.get("VLLM_HETERO_DEBUG"):
             try:
                 from vllm_ascend.ascend_forward_context import get_hetero_capture, get_hetero_dump_dir, get_hetero_fwd
-                if get_hetero_capture():
+                # Only dump the FIRST layer (see layer0_entry).
+                if get_hetero_capture() and self.layer_idx == 0:
                     _li = get_hetero_dump_dir()
                     if _li:
                         # Record the storage address + forward tag so we can tell
@@ -1128,7 +1132,8 @@ class DeepseekV2DecoderLayer(nn.Module):
         if _ldos.environ.get("VLLM_HETERO_DEBUG"):
             try:
                 from vllm_ascend.ascend_forward_context import get_hetero_capture, get_hetero_dump_dir
-                if get_hetero_capture():
+                # Only dump the FIRST layer (see layer0_entry).
+                if get_hetero_capture() and self.layer_idx == 0:
                     _ld = get_hetero_dump_dir()
                     if _ld:
                         torch.save(residual.detach().cpu(), _ldos.path.join(_ld, "hc_residual.pt"))
