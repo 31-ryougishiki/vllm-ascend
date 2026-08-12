@@ -1382,6 +1382,22 @@ class DeepseekV4Model(nn.Module):
         # clone captured while the data is still correct, and see if the layer
         # input (and downstream) becomes bit-identical.
         hidden_states = hidden_states.detach().clone()
+        # --- hetero debug: dump the clone value right after cloning.  If
+        # model_pre_layer0 (sync, 0.0) == model_post_clone (0.0) but
+        # layer0_input == 6.375, the FRESH clone buffer is corrupted by a
+        # separate-stream writer between model and layer0.  If model_post_clone
+        # already == 6.375, the SOURCE hidden_states.data is corrupted by an
+        # unsynced stream before the clone. ---
+        import os as _pcos
+        if _pcos.environ.get("VLLM_HETERO_DEBUG"):
+            try:
+                from vllm_ascend.ascend_forward_context import get_hetero_capture, get_hetero_dump_dir
+                if get_hetero_capture():
+                    _pc = get_hetero_dump_dir()
+                    if _pc:
+                        torch.save(hidden_states.detach().cpu(), _pcos.path.join(_pc, "model_post_clone.pt"))
+            except Exception:
+                pass
         for layer in islice(self.layers, self.start_layer, self.end_layer):
             hidden_states, residual = layer(positions, hidden_states, residual, llama_4_scaling)
 
