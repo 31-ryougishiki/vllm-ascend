@@ -53,31 +53,64 @@ from vllm.model_executor.layers.linear import (
     RowParallelLinear,
 )
 def _hetero_oproj_det() -> bool:
-    """Experimental (gated by VLLM_HETERO_OPROJ_DET=1): load wo_a/wo_b fully
-    replicated so the o_proj does NOT do a cross-rank reduce_scatter. The
-    heterogeneous row-parallel reduction sums the per-rank group contributions
-    in a rank-grouping-dependent order (3-way vs 4-way), which introduces
+    """Load wo_a/wo_b fully replicated (disable_tp) so the o_proj does NOT do
+    a cross-rank reduce_scatter. The heterogeneous row-parallel reduction sums
+    the per-rank group contributions in a rank-grouping-dependent order (DP0
+    sums 3 shards with ratios [2,1,1], DP1-3 sum 4 shards), which introduces
     float-rounding differences (~1e-2) that the hypersensitive MoE router
-    amplifies into garbage. Replicating the o_proj makes every rank compute the
-    identical full output (bit-identical across DP groups)."""
+    amplifies into garbage. Replicating the o_proj makes every rank compute
+    the identical full output (bit-identical across DP groups).
+
+    Default-ON under heterogeneous TP. VLLM_HETERO_OPROJ_DET=1 forces it on,
+    =0 forces it off (debugging only). Only call where the per-rank vllm
+    config is set (construction / weight loading); runtime forward paths use
+    the cached ``AscendDSAImpl._use_oproj_det`` flag."""
     import os
 
-    return os.environ.get("VLLM_HETERO_OPROJ_DET") == "1"
+    _env = os.environ.get("VLLM_HETERO_OPROJ_DET")
+    if _env == "1":
+        return True
+    if _env == "0":
+        return False
+    try:
+        from vllm.config import get_current_vllm_config
+
+        _cfg = get_current_vllm_config()
+        return _cfg is not None and _cfg.parallel_config.is_heterogeneous_tp
+    except Exception:
+        return False
 
 
 def _hetero_shared_exp_det() -> bool:
-    """Experimental (gated by VLLM_HETERO_SHARED_EXP_DET=1): replicate the
-    shared expert (disable_tp) so every rank computes the FULL shared-expert
-    contribution instead of a TP shard.  Under the ALLGATHER + FlashComm1 SP
-    path the sharded shared output is never cross-rank reduced, so DP0
-    (sharded [2,1,1]) and DP1 (sharded 4-way) get different shared partials for
-    the same token — an O(1) divergence the MoE router amplifies into garbage.
-    WARNING: replication also changes the decode path (no-SP TP all-reduce of
-    the combined output would sum a replicated shared tp_size times); verify
-    prefill bit-identity AND coherent decode before formalizing."""
+    """Replicate the shared expert (disable_tp) so every rank computes the
+    FULL shared-expert contribution instead of a TP shard.  Under the
+    ALLGATHER + FlashComm1 SP path the sharded shared output is never
+    cross-rank reduced (shared_expert_dp_enabled() is True whenever SP is on),
+    so DP0 (sharded [2,1,1]) and DP1 (sharded 4-way) would get different
+    shared partials for the same token — an O(1) divergence the MoE router
+    amplifies into garbage.
+
+    Default-ON under heterogeneous TP. VLLM_HETERO_SHARED_EXP_DET=1 forces it
+    on, =0 forces it off (debugging only).
+
+    WARNING: replication assumes FlashComm1 SP stays enabled (it is, for MoE
+    models, in both prefill and decode).  If SP were disabled, the combined
+    MoE output TP all-reduce would sum a replicated shared tp_size times —
+    heterogeneous TP + disabled FlashComm1 is rejected at worker init."""
     import os
 
-    return os.environ.get("VLLM_HETERO_SHARED_EXP_DET") == "1"
+    _env = os.environ.get("VLLM_HETERO_SHARED_EXP_DET")
+    if _env == "1":
+        return True
+    if _env == "0":
+        return False
+    try:
+        from vllm.config import get_current_vllm_config
+
+        _cfg = get_current_vllm_config()
+        return _cfg is not None and _cfg.parallel_config.is_heterogeneous_tp
+    except Exception:
+        return False
 
 
 from vllm.model_executor.layers.logits_processor import LogitsProcessor
@@ -444,11 +477,12 @@ class DeepseekV4MoE(nn.Module):
             # [2,1,1]) vs DP1 (sharded 4-way) under heterogeneous TP — an
             # O(1) divergence the MoE router amplifies into garbage.
             #
-            # Gated by VLLM_HETERO_SHARED_EXP_DET=1 because replication changes
-            # the decode path too: without SP (flash_comm_v1 off) the combined
-            # MoE output is TP all-reduced, so a replicated (full) shared expert
-            # would be summed tp_size times.  Verify prefill layer_mlp_out == 0
-            # AND that generation (decode) is coherent before formalizing.
+            # Default-ON under heterogeneous TP (see _hetero_shared_exp_det).
+            # Replication is safe in decode too because FlashComm1 SP stays on
+            # for MoE models at any batch size; the no-SP combined-output
+            # all-reduce (which would sum a replicated shared tp_size times)
+            # is unreachable since heterogeneous TP + disabled FlashComm1 is
+            # rejected at worker init.
             _repl_shared = _hetero_shared_exp_det()
             self.shared_experts = DeepseekV2MLP(
                 hidden_size=config.hidden_size,

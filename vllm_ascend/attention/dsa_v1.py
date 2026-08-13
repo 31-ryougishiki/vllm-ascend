@@ -16,10 +16,33 @@ from vllm.distributed import (
 
 
 def _hetero_oproj_det() -> bool:
-    """Experimental deterministic o_proj gate (VLLM_HETERO_OPROJ_DET=1)."""
+    """Deterministic o_proj gate.
+
+    Under heterogeneous TP the row-parallel o_proj reduce_scatter sums the
+    per-rank group contributions in a rank-grouping-dependent order (DP0
+    sums 3 shards with ratios [2,1,1], DP1-3 sum 4 shards), so the float
+    rounding differs per token (~1e-2) and the hypersensitive MoE router
+    amplifies it into garbage.  The deterministic path (replicated wo_a/wo_b
+    + head all_gather + full o_proj + per-rank token slice) computes the
+    bit-identical output on every rank, so it is the DEFAULT under
+    heterogeneous TP.  VLLM_HETERO_OPROJ_DET=1 forces it on, =0 forces it
+    off (debugging only).
+
+    Must only be called where the per-rank vllm config is set (model
+    construction / weight loading); runtime forward paths use the cached
+    ``AscendDSAImpl._use_oproj_det`` flag instead."""
     import os
 
-    return os.environ.get("VLLM_HETERO_OPROJ_DET") == "1"
+    _env = os.environ.get("VLLM_HETERO_OPROJ_DET")
+    if _env == "1":
+        return True
+    if _env == "0":
+        return False
+    try:
+        _cfg = get_current_vllm_config()
+        return _cfg is not None and _cfg.parallel_config.is_heterogeneous_tp
+    except Exception:
+        return False
 
 
 def _maybe_dump_oproj(name: str, t: torch.Tensor) -> None:
@@ -45,7 +68,7 @@ def _maybe_dump_oproj(name: str, t: torch.Tensor) -> None:
         torch.save(t.detach().cpu(), _hdos.path.join(_hd, f"{name}.pt"))
     except Exception:
         pass
-from vllm.distributed.utils import get_current_tp_sharding_ratios, get_tp_partition_size
+from vllm.distributed.utils import get_tp_partition_size
 from vllm.forward_context import get_forward_context
 from vllm.triton_utils import HAS_TRITON
 from vllm.v1.attention.backend import AttentionBackend, AttentionCGSupport, AttentionMetadataBuilder
@@ -96,15 +119,24 @@ BUILD_METADATA_STEP_DECODE = 1
 _DSV4_DSA_OVERLAP_STREAM = None
 
 
-def _get_dsa_local_heads(total_num_heads: int, tp_size: int) -> int:
+def _get_dsa_local_heads(vllm_config: VllmConfig | None, total_num_heads: int, tp_size: int) -> int:
     """Return the number of local attention heads for DSA metadata.
 
     Under heterogeneous TP with asymmetric sharding ratios, the uniform
     ``total_num_heads // tp_size`` yields the wrong value (e.g. 21 instead
     of 32/16/16 for tp=3 with ratios [2,1,1]).  Use get_tp_partition_size
     when ratios are set.
+
+    NOTE: the per-rank vllm config global is NOT set inside the model
+    forward at runtime, so the ratios must be read from the builder's own
+    vllm_config (stored in __init__) — get_current_tp_sharding_ratios()
+    returns None there and silently falls back to the wrong uniform value.
     """
-    ratios = get_current_tp_sharding_ratios()
+    ratios = None
+    if vllm_config is not None and vllm_config.parallel_config.is_heterogeneous_tp:
+        ratios = vllm_config.parallel_config.get_sharding_ratios_for_dp(
+            vllm_config.parallel_config.data_parallel_rank
+        )
     if ratios is not None:
         tp_rank = get_tensor_model_parallel_rank()
         return get_tp_partition_size(total_num_heads, tp_rank, tp_size, ratios)
@@ -789,7 +821,7 @@ class AscendDSAMetadataBuilder(AttentionMetadataBuilder[AscendDSAMetadata]):
             prefill_slot_mapping = self.slot_mapping[tokens_start : tokens_start + self.num_prefill_tokens]
 
         tp_size = get_tensor_model_parallel_world_size()
-        n_local_heads = _get_dsa_local_heads(self.model_config.hf_config.num_attention_heads, tp_size)
+        n_local_heads = _get_dsa_local_heads(self.vllm_config, self.model_config.hf_config.num_attention_heads, tp_size)
         index_topk = self.model_config.hf_config.index_topk
 
         cu_c4_cmp_seqlen_list = None
@@ -1010,7 +1042,7 @@ class AscendDSAMetadataBuilder(AttentionMetadataBuilder[AscendDSAMetadata]):
             )
 
         tp_size = get_tensor_model_parallel_world_size()
-        n_local_heads = _get_dsa_local_heads(self.model_config.hf_config.num_attention_heads, tp_size)
+        n_local_heads = _get_dsa_local_heads(self.vllm_config, self.model_config.hf_config.num_attention_heads, tp_size)
         index_topk = self.model_config.hf_config.index_topk
 
         assert self.decode_sas_metadata is not None
@@ -1228,8 +1260,7 @@ class AscendDSAMetadataBuilder(AttentionMetadataBuilder[AscendDSAMetadata]):
         **kwargs,
     ) -> AscendDSAPrefillMetadata:
         tp_size = get_tensor_model_parallel_world_size()
-        n_local_heads = _get_dsa_local_heads(self.model_config.hf_config.num_attention_heads, tp_size)
-
+        n_local_heads = _get_dsa_local_heads(self.vllm_config, self.model_config.hf_config.num_attention_heads, tp_size)
         reqs_start = kwargs.get("reqs_start")
         tokens_start = kwargs.get("tokens_start")
         num_prefill_tokens = kwargs.get("num_prefill_tokens")
@@ -1299,8 +1330,7 @@ class AscendDSAMetadataBuilder(AttentionMetadataBuilder[AscendDSAMetadata]):
         **kwargs,
     ) -> AscendDSADecodeMetadata:
         tp_size = get_tensor_model_parallel_world_size()
-        n_local_heads = _get_dsa_local_heads(self.model_config.hf_config.num_attention_heads, tp_size)
-
+        n_local_heads = _get_dsa_local_heads(self.vllm_config, self.model_config.hf_config.num_attention_heads, tp_size)
         num_decodes = kwargs.get("num_decodes")
         num_decode_tokens = kwargs.get("num_decode_tokens")
         num_decodes_typed = num_decodes or 0
@@ -1473,12 +1503,18 @@ class AscendDSAImpl(DSAAttentionImpl):
         self.multistream_dsv4_dsa_overlap = ascend_config.multistream_dsv4_dsa_overlap
         self.vllm_config = get_current_vllm_config()
 
+        # Deterministic o_proj decision, cached at construction (the current
+        # vllm config is NOT available inside the model forward at runtime, so
+        # _hetero_oproj_det() cannot be re-evaluated there).  Must agree with
+        # the wo_a/wo_b disable_tp construction in DeepseekV4Attention.
+        self._use_oproj_det = _hetero_oproj_det()
+
         # Per-rank n_local_heads, cached at construction (the current vllm
         # config is NOT available inside the model forward at runtime, so we
         # cannot call get_current_tp_sharding_ratios() there).  Used by the
         # deterministic o_proj path (_forward_o_proj_det).
         self._hetero_local_sizes: list[int] | None = None
-        if _hetero_oproj_det() and self.vllm_config is not None and getattr(
+        if self._use_oproj_det and self.vllm_config is not None and getattr(
             self.vllm_config.parallel_config, "is_heterogeneous_tp", False
         ):
             try:
@@ -1626,7 +1662,7 @@ class AscendDSAImpl(DSAAttentionImpl):
         return x
 
     def _forward_o_proj(self, o_proj_input: torch.Tensor, output: torch.Tensor) -> torch.Tensor:
-        if _hetero_oproj_det():
+        if self._use_oproj_det:
             return self._forward_o_proj_det(o_proj_input, output)
         num_tokens = o_proj_input.shape[0]
         group_hidden_dim = o_proj_input.shape[1] * o_proj_input.shape[2] // self.n_local_groups
