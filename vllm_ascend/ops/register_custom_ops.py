@@ -56,16 +56,22 @@ def _maybe_all_gather_and_maybe_unpad_impl(x: torch.Tensor, label: bool, is_ep_c
             per_dp = getattr(_EXTRA_CTX, 'per_dp_padded_lengths', None)
             tp_sizes = getattr(_EXTRA_CTX, 'per_dp_tp_sizes', None)
             if per_dp is not None and tp_sizes is not None:
-                # Heterogeneous TP: after sequence_parallel_chunk each DP rank
-                # holds ceil(N_dp / tp_dp) tokens, which differs across DP
-                # groups. The EP all_gather requires every rank to contribute
-                # the SAME number of rows, so pad each rank to a uniform
-                # per-rank size first, then unpad rank-by-rank (the homogeneous
-                # code walks per-DP strides over a uniform layout).
-                uniform_rank = max(
-                    (per_dp[i] + tp_sizes[i] - 1) // tp_sizes[i]
-                    for i in range(len(tp_sizes))
-                )
+                # Heterogeneous TP: the residual stream per rank is chunked to
+                # padded_length / tp_dp rows (padded_length is aligned to the
+                # LCM of all DP-rank TP sizes), which differs across DP groups
+                # (e.g. tp3 -> 684 rows, tp4 -> 513 rows for N=2048).  The EP
+                # all_gather requires every rank to contribute the SAME number
+                # of rows, so pad each rank to a uniform per-rank size derived
+                # from padded_num_tokens (== padded_length, both equal the
+                # LCM-multiple >= max(per_dp)), then unpad rank-by-rank.
+                # NOTE: do NOT derive the block width from per_dp (tp-aligned
+                # N_dp) — per_dp[i]/tp_i is 683 while the real chunk is 684;
+                # that off-by-one makes the all_gather shapes unequal and the
+                # unpack walk misaligned for any N not divisible by the LCM.
+                padded_num = int(getattr(_EXTRA_CTX, "padded_num_tokens", 0) or 0)
+                if padded_num <= 0:
+                    padded_num = max(per_dp)
+                uniform_rank = max(padded_num // tp_i for tp_i in tp_sizes)
                 if x.shape[0] < uniform_rank:
                     # Pad only dim 0 (token dim); tensors here may be 1-D
                     # (e.g. pertoken_scale) or 2-D+ (hidden states).
@@ -83,14 +89,17 @@ def _maybe_all_gather_and_maybe_unpad_impl(x: torch.Tensor, label: bool, is_ep_c
                 x_offset = 0
                 for i in range(len(tp_sizes)):
                     actual_i = int(num_tokens_across_dp_cpu[i].item())
-                    chunk = per_dp[i] // tp_sizes[i]
+                    chunk = padded_num // tp_sizes[i]
                     for r in range(tp_sizes[i]):
                         start = r * chunk
-                        if start >= actual_i:
-                            break
-                        n = min(chunk, actual_i - start)
-                        result[result_offset : result_offset + n] = x[x_offset : x_offset + n]
-                        result_offset += n
+                        if start < actual_i:
+                            n = min(chunk, actual_i - start)
+                            result[result_offset : result_offset + n] = x[x_offset : x_offset + n]
+                            result_offset += n
+                        # Always advance past this rank's full slot, even when
+                        # it is skipped (decode: only the first rank of a DP
+                        # holds real tokens) — otherwise the next DP's block
+                        # is read from the wrong rows.
                         x_offset += uniform_rank
                 return result
             x = get_ep_group().all_gather(x, 0)
@@ -146,13 +155,16 @@ def _maybe_pad_and_reduce_impl(x: torch.Tensor, is_ep_comm: bool = False) -> tor
                 return get_ep_group().reduce_scatter(x.view(-1, *x.shape[1:]), 0)
             # Heterogeneous TP: reduce_scatter hands every rank the SAME
             # number of rows, but each DP rank must receive its own
-            # ceil(N_dp / tp_dp) share. Pack each rank's real share into a
+            # padded_length / tp_dp share. Pack each rank's real share into a
             # uniform per-rank slot, reduce_scatter, then slice the local
-            # share.
-            uniform_rank = max(
-                (per_dp[i] + tp_sizes[i] - 1) // tp_sizes[i]
-                for i in range(len(tp_sizes))
-            )
+            # share. The block width must match the residual-stream chunking
+            # (padded_num_tokens / tp_dp, LCM-aligned) — NOT per_dp / tp_dp
+            # (tp-aligned N), which is off by one whenever the LCM alignment
+            # bumps padded_length above max(per_dp).
+            padded_num = int(getattr(_EXTRA_CTX, "padded_num_tokens", 0) or 0)
+            if padded_num <= 0:
+                padded_num = max(per_dp)
+            uniform_rank = max(padded_num // tp_i for tp_i in tp_sizes)
             ep_world_size = get_ep_group().world_size
             padded_x = torch.empty(
                 (ep_world_size * uniform_rank, *x.shape[1:]),
@@ -163,14 +175,17 @@ def _maybe_pad_and_reduce_impl(x: torch.Tensor, is_ep_comm: bool = False) -> tor
             padded_offset = 0
             for i in range(len(tp_sizes)):
                 actual_i = int(num_tokens_across_dp_cpu[i].item())
-                chunk = per_dp[i] // tp_sizes[i]
+                chunk = padded_num // tp_sizes[i]
                 for r in range(tp_sizes[i]):
                     start = r * chunk
-                    if start >= actual_i:
-                        break
-                    n = min(chunk, actual_i - start)
-                    padded_x[padded_offset : padded_offset + n] = x[x_offset : x_offset + n]
-                    x_offset += n
+                    if start < actual_i:
+                        n = min(chunk, actual_i - start)
+                        padded_x[padded_offset : padded_offset + n] = x[x_offset : x_offset + n]
+                        x_offset += n
+                    # Always advance past this rank's full slot (skipped ranks
+                    # own only pad rows). Their slot tail stays uninitialized
+                    # and is sliced off after the scatter (n_local <= 0), so
+                    # the garbage never reaches real rows.
                     padded_offset += uniform_rank
             x = get_ep_group().reduce_scatter(padded_x, 0)
             # Slice this rank's real share from its uniform slot.
@@ -180,7 +195,7 @@ def _maybe_pad_and_reduce_impl(x: torch.Tensor, is_ep_comm: bool = False) -> tor
                 ep_rank -= tp_sizes[i]
                 i += 1
             local_dp, local_tp = i, ep_rank
-            chunk_local = per_dp[local_dp] // tp_sizes[local_dp]
+            chunk_local = padded_num // tp_sizes[local_dp]
             actual_local = int(num_tokens_across_dp_cpu[local_dp].item())
             n_local = min(chunk_local, actual_local - local_tp * chunk_local)
             return x[: max(n_local, 0)]
