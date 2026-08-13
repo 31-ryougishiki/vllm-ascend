@@ -11,63 +11,7 @@ from vllm.config import VllmConfig, get_current_vllm_config
 from vllm.distributed import (
     get_tensor_model_parallel_rank,
     get_tensor_model_parallel_world_size,
-    tensor_model_parallel_all_gather,
 )
-
-
-def _hetero_oproj_det() -> bool:
-    """Deterministic o_proj gate.
-
-    Under heterogeneous TP the row-parallel o_proj reduce_scatter sums the
-    per-rank group contributions in a rank-grouping-dependent order (DP0
-    sums 3 shards with ratios [2,1,1], DP1-3 sum 4 shards), so the float
-    rounding differs per token (~1e-2) and the hypersensitive MoE router
-    amplifies it into garbage.  The deterministic path (replicated wo_a/wo_b
-    + head all_gather + full o_proj + per-rank token slice) computes the
-    bit-identical output on every rank, so it is the DEFAULT under
-    heterogeneous TP.  VLLM_HETERO_OPROJ_DET=1 forces it on, =0 forces it
-    off (debugging only).
-
-    Must only be called where the per-rank vllm config is set (model
-    construction / weight loading); runtime forward paths use the cached
-    ``AscendDSAImpl._use_oproj_det`` flag instead."""
-    import os
-
-    _env = os.environ.get("VLLM_HETERO_OPROJ_DET")
-    if _env == "1":
-        return True
-    if _env == "0":
-        return False
-    try:
-        _cfg = get_current_vllm_config()
-        return _cfg is not None and _cfg.parallel_config.is_heterogeneous_tp
-    except Exception:
-        return False
-
-
-def _maybe_dump_oproj(name: str, t: torch.Tensor) -> None:
-    """Dump a tensor when the current forward is the designated hetero capture
-    forward (VLLM_HETERO_DEBUG + VLLM_HETERO_OPROJ_DET), so DP groups can be
-    compared at each stage: input -> head-gather -> wo_a -> wo_b -> output.
-
-    ALL probes share the single get_hetero_capture() gate (set by the model
-    forward for one qualifying forward), so every dump lands in the SAME
-    forward -- the previous per-name one-time flags scattered probes across
-    different forwards and made cross-probe comparisons invalid."""
-    import os as _hdos
-
-    if not _hdos.environ.get("VLLM_HETERO_DEBUG"):
-        return
-    try:
-        from vllm_ascend.ascend_forward_context import get_hetero_capture, get_hetero_dump_dir
-        if not get_hetero_capture():
-            return
-        _hd = get_hetero_dump_dir()
-        if not _hd:
-            return
-        torch.save(t.detach().cpu(), _hdos.path.join(_hd, f"{name}.pt"))
-    except Exception:
-        pass
 from vllm.distributed.utils import get_tp_partition_size
 from vllm.forward_context import get_forward_context
 from vllm.triton_utils import HAS_TRITON
@@ -1503,31 +1447,6 @@ class AscendDSAImpl(DSAAttentionImpl):
         self.multistream_dsv4_dsa_overlap = ascend_config.multistream_dsv4_dsa_overlap
         self.vllm_config = get_current_vllm_config()
 
-        # Deterministic o_proj decision, cached at construction (the current
-        # vllm config is NOT available inside the model forward at runtime, so
-        # _hetero_oproj_det() cannot be re-evaluated there).  Must agree with
-        # the wo_a/wo_b disable_tp construction in DeepseekV4Attention.
-        self._use_oproj_det = _hetero_oproj_det()
-
-        # Per-rank n_local_heads, cached at construction (the current vllm
-        # config is NOT available inside the model forward at runtime, so we
-        # cannot call get_current_tp_sharding_ratios() there).  Used by the
-        # deterministic o_proj path (_forward_o_proj_det).
-        self._hetero_local_sizes: list[int] | None = None
-        if self._use_oproj_det and self.vllm_config is not None and getattr(
-            self.vllm_config.parallel_config, "is_heterogeneous_tp", False
-        ):
-            try:
-                _ratios = self.vllm_config.parallel_config.get_sharding_ratios_for_dp(
-                    self.vllm_config.parallel_config.data_parallel_rank
-                )
-                _tp = get_tensor_model_parallel_world_size()
-                self._hetero_local_sizes = [
-                    get_tp_partition_size(self.num_heads, r, _tp, _ratios) for r in range(_tp)
-                ]
-            except Exception:
-                self._hetero_local_sizes = None
-
         # indexer param
         if self.indexer is not None:
             self.indexer_heads: int = self.indexer.n_heads
@@ -1662,8 +1581,6 @@ class AscendDSAImpl(DSAAttentionImpl):
         return x
 
     def _forward_o_proj(self, o_proj_input: torch.Tensor, output: torch.Tensor) -> torch.Tensor:
-        if self._use_oproj_det:
-            return self._forward_o_proj_det(o_proj_input, output)
         num_tokens = o_proj_input.shape[0]
         group_hidden_dim = o_proj_input.shape[1] * o_proj_input.shape[2] // self.n_local_groups
         o_proj_input = o_proj_input.view(num_tokens, self.n_local_groups, group_hidden_dim)
@@ -1770,108 +1687,6 @@ class AscendDSAImpl(DSAAttentionImpl):
             )
             o_proj_input = o_proj_input.reshape(num_tokens, -1)
             output[...] = self.wo_b(o_proj_input)
-        return output
-    def _forward_o_proj_det(self, o_proj_input: torch.Tensor, output: torch.Tensor) -> torch.Tensor:
-        """Deterministic o_proj (experimental, VLLM_HETERO_OPROJ_DET=1).
-
-        The default path is a row-parallel o_proj whose reduce_scatter sums the
-        per-rank group contributions in a rank-grouping-dependent order; under
-        heterogeneous TP (different tp_size per DP) DP0 sums 4+2+2 groups and
-        DP1 sums 2+2+2+2, so the float rounding differs per token (~1e-2) and
-        the MoE router amplifies it into garbage.  Here we instead gather the
-        head-sharded attention output to the full 64 heads, run wo_a/wo_b on the
-        FULL group set (weights loaded with disable_tp=True), and slice the
-        per-rank token chunk — every rank computes the bit-identical output.
-        """
-        from vllm.distributed import (
-            get_tensor_model_parallel_rank,
-            get_tensor_model_parallel_world_size,
-            tensor_model_parallel_all_gather,
-        )
-        from vllm_ascend.ascend_forward_context import _EXTRA_CTX
-
-        num_tokens = o_proj_input.shape[0]
-        tp_rank = get_tensor_model_parallel_rank()
-        tp_size = get_tensor_model_parallel_world_size()
-
-        # Zero the uninitialized tail rows (num_actual .. num_tokens) so the
-        # padding positions don't introduce NaN / garbage.
-        try:
-            _fc = get_forward_context()
-            _actual = int(_fc.attn_metadata[0].num_actual_tokens)
-            if _actual < num_tokens:
-                o_proj_input = o_proj_input.clone()
-                o_proj_input[_actual:] = 0
-        except Exception:
-            pass
-
-        # --- hetero debug: o_proj input (post-rope) cut until the layer-input
-        # paradox is resolved; keep only oproj_out (second divergence line). ---
-
-        # 1) gather head-sharded attention output -> full n_heads.
-        # NOTE: tensor_model_parallel_all_gather requires EVERY rank to send the
-        # SAME tensor shape, but heterogeneous TP gives each rank a different
-        # n_local_heads (DP0: 32/16/16). Pad each rank's heads to the group max
-        # (zeros at the tail), gather the uniform tensors, then slice the valid
-        # [0:n_heads] — rank order preserved (rank0 heads, rank1 heads, ...).
-        head_dim = self.head_dim
-        local_sizes = self._hetero_local_sizes
-        if not local_sizes:
-            raise RuntimeError(
-                "VLLM_HETERO_OPROJ_DET requires heterogeneous TP + _hetero_local_sizes "
-                "(computed in AscendDSAImpl.__init__)."
-            )
-        max_local = max(local_sizes)
-        if o_proj_input.shape[1] < max_local:
-            _op = torch.zeros(
-                (num_tokens, max_local, head_dim), dtype=o_proj_input.dtype, device=o_proj_input.device
-            )
-            _op[:, : o_proj_input.shape[1]] = o_proj_input
-            o_proj_input = _op
-        o_full = tensor_model_parallel_all_gather(o_proj_input, 1)
-        # Compress the per-rank valid heads (each rank's valid heads are the
-        # first `local_sizes[r]` of its padded block; the rest are zero pad).
-        o_full = o_full.view(num_tokens, tp_size, max_local, head_dim)
-        _valid = [o_full[:, r, : local_sizes[r]] for r in range(tp_size)]
-        o_full = torch.cat(_valid, dim=1)  # (N, sum(local_sizes), head_dim)
-        # 2) reshape to (N, n_groups, group_hidden_dim).
-        n_groups = self.n_group
-        gh = o_full.shape[1] * o_full.shape[2] // n_groups
-        o_full = o_full.reshape(num_tokens, n_groups, gh)
-        # 3) wo_a (replicated, full groups) batch matmul.
-        o_wa = torch_npu.npu_transpose_batchmatmul(
-            o_full,
-            self.wo_a.weight,
-            bias=None,
-            scale=None,
-            perm_x1=(1, 0, 2),
-            perm_x2=(0, 1, 2),
-            perm_y=(1, 0, 2),
-            batch_split_factor=1,
-        ).reshape(num_tokens, -1)
-        # 4) wo_b (replicated) -> full (N, dim); no cross-rank reduce (tp_size=1).
-        o_wb = self.wo_b(o_wa)
-        # 5) Write the per-rank share.  Under FlashComm1 SP the attention
-        # output is per-rank token-chunked (padded_num_tokens // tp_size rows)
-        # and o_wb is padded to padded_num_tokens then sliced contiguously.
-        # WITHOUT SP (e.g. decode, num_tokens <= 1000) every rank holds the
-        # FULL token set, so the output buffer holds num_tokens rows and o_wb
-        # must be written in full — slicing padded_num_tokens // tp would
-        # misalign (and shape-mismatch for DP1-3, e.g. output 4 rows vs a
-        # 3-row slice).
-        _fc = get_forward_context()
-        _sp_on = bool(getattr(_fc, "flash_comm_v1_enabled", False))
-        if not _sp_on:
-            output[...] = o_wb[: output.shape[0]].contiguous()
-            _maybe_dump_oproj("oproj_out", output)  # final per-rank o_proj output
-            return output
-        _padded = int(getattr(_EXTRA_CTX, "padded_num_tokens", num_tokens) or num_tokens)
-        if _padded > num_tokens:
-            o_wb = torch.nn.functional.pad(o_wb, (0, 0, 0, _padded - num_tokens))
-        _chunk = o_wb.shape[0] // tp_size
-        _start = tp_rank * _chunk
-        output[...] = o_wb[_start:_start + _chunk].contiguous()
-        _maybe_dump_oproj("oproj_out", output)  # final per-rank o_proj output
         return output
 
     def forward(  # type: ignore[override]
@@ -2189,8 +2004,6 @@ class AscendDSAImpl(DSAAttentionImpl):
                 layout_kv="PA_ND",
                 **extra_attn_kwargs,
             )[0]
-            # --- hetero debug: attention internals cut (downstream of the
-            # layer-input divergence). ---
             return _op_out
 
         if self.compress_ratio > 1:

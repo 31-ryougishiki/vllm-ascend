@@ -167,14 +167,6 @@ class AscendUnquantizedFusedMoEMethod(UnquantizedFusedMoEMethod):
         input_ids = getattr(get_forward_context(), "input_ids", None)
         num_shared_experts = getattr(layer, "n_shared_experts", 0)
 
-        # --- hetero trace: confirm AscendUnquantizedFusedMoEMethod.apply is hit ---
-        import os as _apt
-        if _apt.environ.get("VLLM_HETERO_DEBUG"):
-            _tr = getattr(self, "_hetero_trace_apply", 0)
-            if _tr < 10:
-                self._hetero_trace_apply = _tr + 1
-                from vllm.logger import logger as _apt_logger
-                _apt_logger.info("[hetero-trace] AscendUnquantizedFusedMoEMethod.apply reached")
         if num_shared_experts is None:
             num_shared_experts = 0
         num_logical_experts = get_moe_num_logical_experts(

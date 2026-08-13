@@ -52,36 +52,7 @@ from vllm.model_executor.layers.linear import (
     ReplicatedLinear,
     RowParallelLinear,
 )
-def _hetero_oproj_det() -> bool:
-    """Load wo_a/wo_b fully replicated (disable_tp) so the o_proj does NOT do
-    a cross-rank reduce_scatter. The heterogeneous row-parallel reduction sums
-    the per-rank group contributions in a rank-grouping-dependent order (DP0
-    sums 3 shards with ratios [2,1,1], DP1-3 sum 4 shards), which introduces
-    float-rounding differences (~1e-2) that the hypersensitive MoE router
-    amplifies into garbage. Replicating the o_proj makes every rank compute
-    the identical full output (bit-identical across DP groups).
-
-    Default-ON under heterogeneous TP. VLLM_HETERO_OPROJ_DET=1 forces it on,
-    =0 forces it off (debugging only). Only call where the per-rank vllm
-    config is set (construction / weight loading); runtime forward paths use
-    the cached ``AscendDSAImpl._use_oproj_det`` flag."""
-    import os
-
-    _env = os.environ.get("VLLM_HETERO_OPROJ_DET")
-    if _env == "1":
-        return True
-    if _env == "0":
-        return False
-    try:
-        from vllm.config import get_current_vllm_config
-
-        _cfg = get_current_vllm_config()
-        return _cfg is not None and _cfg.parallel_config.is_heterogeneous_tp
-    except Exception:
-        return False
-
-
-def _hetero_shared_exp_det() -> bool:
+def _hetero_shared_exp_replicated() -> bool:
     """Replicate the shared expert (disable_tp) so every rank computes the
     FULL shared-expert contribution instead of a TP shard.  Under the
     ALLGATHER + FlashComm1 SP path the sharded shared output is never
@@ -90,20 +61,12 @@ def _hetero_shared_exp_det() -> bool:
     shared partials for the same token — an O(1) divergence the MoE router
     amplifies into garbage.
 
-    Default-ON under heterogeneous TP. VLLM_HETERO_SHARED_EXP_DET=1 forces it
-    on, =0 forces it off (debugging only).
+    Always on under heterogeneous TP.
 
     WARNING: replication assumes FlashComm1 SP stays enabled (it is, for MoE
     models, in both prefill and decode).  If SP were disabled, the combined
     MoE output TP all-reduce would sum a replicated shared tp_size times —
     heterogeneous TP + disabled FlashComm1 is rejected at worker init."""
-    import os
-
-    _env = os.environ.get("VLLM_HETERO_SHARED_EXP_DET")
-    if _env == "1":
-        return True
-    if _env == "0":
-        return False
     try:
         from vllm.config import get_current_vllm_config
 
@@ -132,8 +95,6 @@ from vllm.sequence import IntermediateTensors
 from vllm.transformers_utils.configs.deepseek_v4 import DeepseekV4Config
 from vllm.v1.attention.backends.mla.sparse_swa import DeepseekV4SWACache as VllmDeepseekV4SWACache
 from vllm.v1.kv_cache_interface import KVCacheSpec
-
-from vllm.logger import logger
 
 from vllm_ascend.ascend_config import get_ascend_config
 from vllm_ascend.core.kv_cache_interface import AscendSlidingWindowMLASpec
@@ -466,24 +427,24 @@ class DeepseekV4MoE(nn.Module):
         else:
             intermediate_size = config.moe_intermediate_size * config.n_shared_experts
 
-            # A single shared expert is applied to EVERY token, so its weights
-            # must be replicated across TP ranks (disable_tp) — a TP shard of a
-            # shared expert only produces a partial contribution that nothing
-            # ever cross-rank reduces under the ALLGATHER + FlashComm1 SP path.
-            # shared_expert_dp_enabled() (True whenever enable_sp) is exactly
-            # the condition under which the MoE runner/combine skips the shared
-            # output all-reduce, so the construction must agree with it or the
-            # same token gets a DIFFERENT shared partial on DP0 (sharded
-            # [2,1,1]) vs DP1 (sharded 4-way) under heterogeneous TP — an
-            # O(1) divergence the MoE router amplifies into garbage.
+            # A single shared expert is applied to EVERY token, so under
+            # heterogeneous TP its weights are replicated across TP ranks
+            # (disable_tp) — a TP shard of a shared expert only produces a
+            # partial contribution that nothing ever cross-rank reduces under
+            # the ALLGATHER + FlashComm1 SP path.  shared_expert_dp_enabled()
+            # (True whenever enable_sp) is exactly the condition under which
+            # the MoE runner/combine skips the shared output all-reduce, so
+            # the construction must agree with it or the same token gets a
+            # DIFFERENT shared partial on DP0 (sharded [2,1,1]) vs DP1
+            # (sharded 4-way) — an O(1) divergence the MoE router amplifies
+            # into garbage.
             #
-            # Default-ON under heterogeneous TP (see _hetero_shared_exp_det).
             # Replication is safe in decode too because FlashComm1 SP stays on
             # for MoE models at any batch size; the no-SP combined-output
             # all-reduce (which would sum a replicated shared tp_size times)
             # is unreachable since heterogeneous TP + disabled FlashComm1 is
             # rejected at worker init.
-            _repl_shared = _hetero_shared_exp_det()
+            _repl_shared = _hetero_shared_exp_replicated()
             self.shared_experts = DeepseekV2MLP(
                 hidden_size=config.hidden_size,
                 intermediate_size=intermediate_size,
@@ -543,37 +504,6 @@ class DeepseekV4MoE(nn.Module):
         num_tokens, hidden_dim = hidden_states.shape
         hidden_states = hidden_states.view(-1, hidden_dim)
 
-        # --- hetero trace: confirm DeepseekV4MoE.forward is the path ---
-        import os as _mtr
-        if _mtr.environ.get("VLLM_HETERO_DEBUG"):
-            _tr = getattr(self, "_hetero_trace_moe", 0)
-            if _tr < 10:
-                self._hetero_trace_moe = _tr + 1
-                logger.info(
-                    "[hetero-trace] DeepseekV4MoE.forward layer=%s internal_router=%s sp=%s "
-                    "experts=%s gate_weight=%s",
-                    getattr(self, "layer_idx", "?"),
-                    self.experts.is_internal_router,
-                    self.is_sequence_parallel,
-                    type(self.experts).__name__,
-                    self.gate.weight is not None,
-                )
-
-        # --- hetero debug: per-layer MoE-internal probes.  self.layer_idx is
-        # set on DeepseekV4MoE (parse of the module prefix). ---
-        def _mdump(name: str, t: torch.Tensor):
-            import os as _mo
-            if not _mo.environ.get("VLLM_HETERO_DEBUG"):
-                return
-            try:
-                from vllm_ascend.ascend_forward_context import get_hetero_capture, get_hetero_dump_dir
-                if get_hetero_capture():
-                    _md = get_hetero_dump_dir()
-                    if _md:
-                        torch.save(t.detach().cpu(), _mo.path.join(_md, f"layer{self.layer_idx}_{name}.pt"))
-            except Exception:
-                pass
-
         # Chunk the hidden states so they aren't replicated across TP ranks.
         # This avoids duplicate computation in self.experts.
         # TODO: We can replace the all_reduce at the end of attn with a
@@ -583,22 +513,15 @@ class DeepseekV4MoE(nn.Module):
 
         if self.experts.is_internal_router:
             # In this case, the gate/router runs inside the FusedMoE class.
-            _mdump("mlp_router_in", hidden_states)
             fused_moe_out = self.experts(hidden_states=hidden_states, router_logits=hidden_states)
         else:
             # router_logits: (num_tokens, n_experts)
             router_logits = F.linear(hidden_states.float(), self.gate.weight)
-            _mdump("mlp_router", router_logits)
             fused_moe_out = self.experts(hidden_states=hidden_states, router_logits=router_logits)
 
-        if isinstance(fused_moe_out, torch.Tensor):
-            _mdump("mlp_fused", fused_moe_out)
         fused_moe_out_is_tuple = isinstance(fused_moe_out, tuple)
         if fused_moe_out_is_tuple:
             shared_output, final_hidden_states = fused_moe_out
-            if shared_output is not None:
-                _mdump("mlp_shared", shared_output)
-            _mdump("mlp_routed", final_hidden_states)
             if self.shared_experts is None:
                 assert shared_output is None
 
@@ -618,8 +541,6 @@ class DeepseekV4MoE(nn.Module):
                 )
         else:
             final_hidden_states = fused_moe_out
-
-        _mdump("mlp_combined", final_hidden_states)
 
         if self.is_sequence_parallel:
             final_hidden_states = tensor_model_parallel_all_gather(final_hidden_states, 0)
@@ -920,7 +841,6 @@ class DeepseekV4Attention(nn.Module):
             quant_config=quant_config,
             prefix=f"{prefix}.wo_a",
             return_bias=False,
-            disable_tp=_hetero_oproj_det(),
         )
         self.wo_b = RowParallelLinear(
             self.n_groups * config.o_lora_rank,
@@ -929,7 +849,6 @@ class DeepseekV4Attention(nn.Module):
             quant_config=quant_config,
             prefix=f"{prefix}.wo_b",
             return_bias=False,
-            disable_tp=_hetero_oproj_det(),
         )
         self.compress_ratio = get_dsv4_compress_ratio(config, config_layer_idx)
 
@@ -1135,47 +1054,15 @@ class DeepseekV2DecoderLayer(nn.Module):
     ) -> torch.Tensor:
         residual = hidden_states.clone()
         hidden_states, post, comb = self.hc_pre(hidden_states, self.hc_attn_fn, self.hc_attn_scale, self.hc_attn_base)
-        hc_pre_y = hidden_states
         hidden_states = self.input_layernorm(hidden_states)
-        attn_in = hidden_states
         attn_kwargs = {"positions": positions, "hidden_states": hidden_states, "llama_4_scaling": llama_4_scaling}
         hidden_states = self.self_attn(**attn_kwargs)
         hidden_states = self.hc_post(hidden_states, residual, post, comb)
-        # --- hetero debug: per-layer attention-path probes (filename carries
-        # the layer index so the FIRST diverging layer can be located in one
-        # run; every layer dumps its own files). ---
-        import os as _ldos
-        if _ldos.environ.get("VLLM_HETERO_DEBUG"):
-            try:
-                from vllm_ascend.ascend_forward_context import get_hetero_capture, get_hetero_dump_dir
-                if get_hetero_capture():
-                    _ld = get_hetero_dump_dir()
-                    if _ld:
-                        _lix = self.layer_idx
-                        torch.save(hc_pre_y.detach().cpu(), _ldos.path.join(_ld, f"layer{_lix}_hc_pre_y.pt"))
-                        torch.save(attn_in.detach().cpu(), _ldos.path.join(_ld, f"layer{_lix}_attn_in.pt"))
-                        torch.save(hidden_states.detach().cpu(), _ldos.path.join(_ld, f"layer{_lix}_attn_out.pt"))
-            except Exception:
-                pass
         residual = hidden_states.clone()
         hidden_states, post, comb = self.hc_pre(hidden_states, self.hc_ffn_fn, self.hc_ffn_scale, self.hc_ffn_base)
-        mlp_in = hidden_states
         hidden_states = self.post_attention_layernorm(hidden_states)
         hidden_states = self.mlp(hidden_states)
         hidden_states = self.hc_post(hidden_states, residual, post, comb)
-        # --- hetero debug: per-layer MLP-path probes. ---
-        import os as _lmos
-        if _lmos.environ.get("VLLM_HETERO_DEBUG"):
-            try:
-                from vllm_ascend.ascend_forward_context import get_hetero_capture, get_hetero_dump_dir
-                if get_hetero_capture():
-                    _lm = get_hetero_dump_dir()
-                    if _lm:
-                        _lix = self.layer_idx
-                        torch.save(mlp_in.detach().cpu(), _lmos.path.join(_lm, f"layer{_lix}_mlp_in.pt"))
-                        torch.save(hidden_states.detach().cpu(), _lmos.path.join(_lm, f"layer{_lix}_mlp_out.pt"))
-            except Exception:
-                pass
 
         return hidden_states, residual
 
@@ -1218,17 +1105,6 @@ class DeepseekV4Model(nn.Module):
             )
         else:
             self.embed_tokens = PPMissingLayer()
-        # Hetero debug: optionally clamp the layer count (VLLM_HETERO_NUM_LAYERS,
-        # e.g. 1) so server startup / forward is much faster.  vLLM's loader
-        # skips the extra checkpoint keys (layers.N..max) since only 1 layer is
-        # built.  NOTE: does NOT change layer-0 INPUT divergence (embedding /
-        # HC-repeat produce it before any layer), so it mainly speeds up the
-        # restart/memory, not the current divergence question.
-        import os as _nlo
-        _nlayers = int(_nlo.environ.get("VLLM_HETERO_NUM_LAYERS", "0"))
-        if _nlayers > 0:
-            config.num_hidden_layers = _nlayers
-            config.num_moe_layers = _nlayers
         self.start_layer, self.end_layer, self.layers = make_layers(
             config.num_hidden_layers,
             lambda prefix: DeepseekV2DecoderLayer(vllm_config, prefix, topk_indices_buffer=topk_indices_buffer),
@@ -1320,75 +1196,6 @@ class DeepseekV4Model(nn.Module):
 
         if get_pp_group().is_first_rank:
             hidden_states = hidden_states.unsqueeze(1).repeat(1, self.hc_mult, 1)  # (b, s, h) -> (b, s, c, h)
-
-        # Minimal hetero dump-dir setup (VLLM_HETERO_DEBUG): the o_proj rope
-        # input/output dumps in dsa_v1.py need an active dump dir.  No per-layer
-        # dumps here — this only computes dp/tp and sets the dir.  The dir is
-        # only set for QUALIFYING forwards (num_tokens in [MIN,MAX]) so warmup/
-        # dummy batches don't claim the first fwd slot; the one-time rope dump
-        # therefore lands on the first real prefill request.
-        import os as _os
-
-        if _os.environ.get("VLLM_HETERO_DEBUG"):
-            try:
-                from vllm_ascend.ascend_forward_context import (
-                    _EXTRA_CTX,
-                    get_hetero_capture,
-                    set_hetero_capture,
-                    set_hetero_dump_dir,
-                    set_hetero_fwd,
-                )
-                # Single per-forward capture gate: ALL probes (embedding, layer,
-                # attention, o_proj) check get_hetero_capture(), so every dump
-                # lands in the SAME qualifying forward.  The previous per-name
-                # one-time flags scattered probes across different forwards (a
-                # 12-token warmup captured model_embed while the real prefill
-                # captured hc_residual), making every cross-probe comparison
-                # invalid.  Kept off _EXTRA_CTX because its proxy only allows
-                # the whitelisted extra_attrs.
-                set_hetero_capture(False)
-                _n = int(input_ids.numel()) if input_ids is not None else 0
-                _nlow = int(_os.environ.get("VLLM_HETERO_DEBUG_MIN_TOKENS", "1000"))
-                _nhigh = int(_os.environ.get("VLLM_HETERO_DEBUG_MAX_TOKENS", "9000"))
-                _print_count = int(getattr(self, "_hetero_debug_print", 0))
-                if _print_count < 20:
-                    self._hetero_debug_print = _print_count + 1
-                    import sys as _sys
-                    print(
-                        f"[hetero] n={_n} qualify={_nlow <= _n <= _nhigh} "
-                        f"range=[{_nlow},{_nhigh}]",
-                        file=_sys.stderr, flush=True,
-                    )
-                if _nlow <= _n <= _nhigh:
-                    from vllm.distributed.parallel_state import (
-                        get_tensor_model_parallel_rank,
-                        get_tensor_model_parallel_world_size,
-                        get_world_group,
-                    )
-
-                    _grank = int(get_world_group().rank)
-                    _tp_sizes = getattr(_EXTRA_CTX, "per_dp_tp_sizes", None)
-                    if _tp_sizes:
-                        _dp, _tr = 0, _grank
-                        while _tr >= _tp_sizes[_dp]:
-                            _tr -= _tp_sizes[_dp]
-                            _dp += 1
-                    else:
-                        _tr = int(get_tensor_model_parallel_rank())
-                        _dp = _grank // int(get_tensor_model_parallel_world_size())
-                    _count = int(getattr(self, "_hetero_fwd_count", 0))
-                    _dout = _os.path.join(
-                        _os.path.abspath(_os.environ.get("VLLM_HETERO_DEBUG_DIR", "hetero_debug")),
-                        f"dp{_dp}_tp{_tr}",
-                        f"fwd{_count}",
-                    )
-                    _os.makedirs(_dout, exist_ok=True)
-                    set_hetero_dump_dir(_dout)
-                    self._hetero_fwd_count = _count + 1
-                    set_hetero_capture(True)
-                    set_hetero_fwd(_count)
-            except Exception:
-                pass
 
         for layer in islice(self.layers, self.start_layer, self.end_layer):
             hidden_states, residual = layer(positions, hidden_states, residual, llama_4_scaling)
@@ -1672,10 +1479,6 @@ class AscendDeepseekV4ForCausalLM(nn.Module, SupportsPP, DeepseekV2MixtureOfExpe
             if "sink" in name:
                 if is_pp_missing_parameter(name, self):
                     continue
-                # Hetero debug (VLLM_HETERO_NUM_LAYERS): sink weights of layers
-                # clamped out of the model are absent from params_dict.
-                if name not in params_dict:
-                    continue
                 param = params_dict[name]
                 if enable_dsa_cp():
                     param.data.copy_(loaded_weight)
@@ -1716,11 +1519,6 @@ class AscendDeepseekV4ForCausalLM(nn.Module, SupportsPP, DeepseekV2MixtureOfExpe
                     continue
 
                 if is_pp_missing_parameter(name, self):
-                    continue
-
-                # Hetero debug (VLLM_HETERO_NUM_LAYERS): stacked weights of
-                # layers clamped out of the model are absent from params_dict.
-                if name not in params_dict:
                     continue
 
                 param = params_dict[name]
@@ -1786,13 +1584,6 @@ class AscendDeepseekV4ForCausalLM(nn.Module, SupportsPP, DeepseekV2MixtureOfExpe
                         if is_pp_missing_parameter(name_mapped, self):
                             continue
 
-                        # Hetero debug (VLLM_HETERO_NUM_LAYERS): skip expert
-                        # weights for layers clamped out of the model (the
-                        # checkpoint carries layers.1..59 experts, but only
-                        # layer0's experts are built).
-                        if name_mapped not in params_dict:
-                            continue
-
                         param = params_dict[name_mapped]
                         # We should ask the weight loader to return success or
                         # not here since otherwise we may skip experts with
@@ -1829,15 +1620,6 @@ class AscendDeepseekV4ForCausalLM(nn.Module, SupportsPP, DeepseekV2MixtureOfExpe
                             continue
 
                         if is_pp_missing_parameter(name, self):
-                            continue
-
-                        # Hetero debug (VLLM_HETERO_NUM_LAYERS): when the layer
-                        # count is clamped below the checkpoint's, the checkpoint
-                        # still carries weights for the clamped-out layers (e.g.
-                        # model.layers.10.* while only layer0 is built).  Skip
-                        # them -- vLLM's default loader drops mismatched keys --
-                        # instead of raising KeyError.
-                        if name not in params_dict:
                             continue
 
                         param = params_dict[name]

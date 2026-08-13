@@ -245,19 +245,6 @@ class DeepSeekV4MTP(nn.Module, SupportsPP, DeepseekV2MixtureOfExperts):
         inputs_embeds: torch.Tensor | None = None,
         spec_step_idx: int = 0,
     ) -> torch.Tensor:
-        # Hetero debug (VLLM_HETERO_DEBUG): the draft reuses DeepseekV2DecoderLayer
-        # and DeepseekV4MoE, whose probe filenames (layer{i}_*.pt / moe{i}_*.pt)
-        # collide with the target model's dumps.  The target forward sets
-        # set_hetero_capture(True) for one qualifying forward; disable it for
-        # the draft forward so it cannot overwrite the target's dumps.
-        try:
-            import os as _mtp_dbg_os
-            if _mtp_dbg_os.environ.get("VLLM_HETERO_DEBUG"):
-                from vllm_ascend.ascend_forward_context import set_hetero_capture
-
-                set_hetero_capture(False)
-        except Exception:
-            pass
         hidden_states = self.model(input_ids, positions, hidden_states, inputs_embeds, spec_step_idx)
         return hidden_states
 

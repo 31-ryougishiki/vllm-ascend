@@ -33,51 +33,6 @@ class MoECommType(Enum):
 
 _MRV2_IN_PROFILE_RUN: ContextVar[bool] = ContextVar("_MRV2_IN_PROFILE_RUN", default=False)
 
-# Debug hook: the model forward sets the active dump dir; the DSA attention
-# impl reads it to dump the raw op inputs/outputs for heterogeneous-TP analysis.
-_HETERO_DUMP_DIR: str | None = None
-
-
-def set_hetero_dump_dir(d: str | None) -> None:
-    global _HETERO_DUMP_DIR
-    _HETERO_DUMP_DIR = d
-
-
-def get_hetero_dump_dir() -> str | None:
-    return _HETERO_DUMP_DIR
-
-
-# Per-forward capture flag shared by ALL hetero debug probes (embedding, layer,
-# attention, o_proj).  Set True by the model forward for ONE qualifying forward
-# so every dump lands in the SAME forward.  Kept as a module global (not on
-# _EXTRA_CTX) because _ExtraForwardContextProxy only allows its extra_attrs.
-_HETERO_CAPTURE = False
-
-
-def set_hetero_capture(v: bool) -> None:
-    global _HETERO_CAPTURE
-    _HETERO_CAPTURE = v
-
-
-def get_hetero_capture() -> bool:
-    return _HETERO_CAPTURE
-
-
-# Per-forward hetero sequence number, so each dump can be tagged with WHICH
-# forward it came from.  Lets us tell whether two probes that both landed in
-# fwd0 actually belong to the same forward (they MUST share the same fwd tag)
-# or were mixed from different forwards by a bad fwd counter.
-_HETERO_FWD = -1
-
-
-def set_hetero_fwd(n: int) -> None:
-    global _HETERO_FWD
-    _HETERO_FWD = n
-
-
-def get_hetero_fwd() -> int:
-    return _HETERO_FWD
-
 
 @contextmanager
 def override_mrv2_in_profile_run(enabled: bool):
