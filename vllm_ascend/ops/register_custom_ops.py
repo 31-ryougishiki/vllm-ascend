@@ -37,14 +37,48 @@ def _maybe_chunk_residual_impl(x: torch.Tensor, residual: torch.Tensor) -> torch
     return residual
 
 
+def _hetero_chunks_and_uniform_rank(
+    per_dp: list[int],
+    tp_sizes: list[int],
+    stream_padded: bool,
+) -> tuple[list[int], int]:
+    """Per-DP per-rank chunk sizes for the heterogeneous-TP pack/unpack walks.
+
+    When ``stream_padded`` is True (FlashComm1/2 active for this forward), the
+    residual stream of every DP rank is padded to ``padded_num_tokens``
+    (== padded_length, LCM-aligned across the DP-rank TP sizes), so each rank
+    holds ``padded_num_tokens // tp_dp`` rows.  Otherwise (decode, or no
+    FlashComm) the stream is only padded to the per-DP tp-aligned length
+    ``per_dp[i]`` and each rank holds ``per_dp[i] // tp_dp`` rows.
+
+    ``uniform_rank`` is the per-rank slot width every rank pads to before the
+    EP all_gather / reduce_scatter (all ranks must contribute equal sizes).
+    """
+    padded_num = int(getattr(_EXTRA_CTX, "padded_num_tokens", 0) or 0)
+    if padded_num <= 0:
+        padded_num = max(per_dp)
+    chunks = []
+    for i in range(len(tp_sizes)):
+        stream_len = padded_num if stream_padded else per_dp[i]
+        chunks.append(stream_len // tp_sizes[i])
+    return chunks, max(chunks)
+
+
 def _maybe_all_gather_and_maybe_unpad_impl(x: torch.Tensor, label: bool, is_ep_comm: bool = False) -> torch.Tensor:
     try:
         forward_context = get_forward_context()
     except AssertionError:
         return x
 
+    is_hetero = getattr(_EXTRA_CTX, 'per_dp_tp_sizes', None) is not None
     flash_comm_v1_enabled = _EXTRA_CTX.flash_comm_v1_enabled or (enable_sp_by_pass() and is_ep_comm)
-    if flash_comm_v1_enabled and label:
+    # Under heterogeneous TP the MoE EP gather must run for EVERY forward:
+    # the per-forward FlashComm1 flag is False for decode batches
+    # (num_tokens <= 1000), but the model-level sequence_parallel_chunk still
+    # shards the stream across TP ranks, so silently skipping the gather and
+    # falling back to the TP all_reduce in _maybe_pad_and_reduce would sum
+    # DIFFERENT chunks (garbage output in decode).
+    if (flash_comm_v1_enabled or (is_hetero and is_ep_comm)) and label:
         dp_metadata = forward_context.dp_metadata
         if dp_metadata is None or not is_ep_comm:
             x = tensor_model_parallel_all_gather(x, 0)
@@ -56,22 +90,25 @@ def _maybe_all_gather_and_maybe_unpad_impl(x: torch.Tensor, label: bool, is_ep_c
             per_dp = getattr(_EXTRA_CTX, 'per_dp_padded_lengths', None)
             tp_sizes = getattr(_EXTRA_CTX, 'per_dp_tp_sizes', None)
             if per_dp is not None and tp_sizes is not None:
-                # Heterogeneous TP: the residual stream per rank is chunked to
-                # padded_length / tp_dp rows (padded_length is aligned to the
-                # LCM of all DP-rank TP sizes), which differs across DP groups
-                # (e.g. tp3 -> 684 rows, tp4 -> 513 rows for N=2048).  The EP
-                # all_gather requires every rank to contribute the SAME number
-                # of rows, so pad each rank to a uniform per-rank size derived
-                # from padded_num_tokens (== padded_length, both equal the
-                # LCM-multiple >= max(per_dp)), then unpad rank-by-rank.
-                # NOTE: do NOT derive the block width from per_dp (tp-aligned
-                # N_dp) — per_dp[i]/tp_i is 683 while the real chunk is 684;
-                # that off-by-one makes the all_gather shapes unequal and the
-                # unpack walk misaligned for any N not divisible by the LCM.
-                padded_num = int(getattr(_EXTRA_CTX, "padded_num_tokens", 0) or 0)
-                if padded_num <= 0:
-                    padded_num = max(per_dp)
-                uniform_rank = max(padded_num // tp_i for tp_i in tp_sizes)
+                # Heterogeneous TP: the residual stream per rank is chunked,
+                # and the chunk width differs across DP groups (e.g. tp3 ->
+                # 684 rows vs tp4 -> 513 rows for N=2048).  The EP all_gather
+                # requires every rank to contribute the SAME number of rows,
+                # so pad each rank to a uniform per-rank slot, then unpad
+                # rank-by-rank.
+                # NOTE: the block width depends on how the stream was padded:
+                # with FlashComm1/2 the stream is padded to padded_num_tokens
+                # (LCM-aligned), otherwise only to the per-DP tp-aligned
+                # length per_dp[i].  Using padded_num_tokens for the latter
+                # case would be off-by-chunk for any batch whose padded_num
+                # exceeds max(per_dp) (e.g. decode).
+                stream_padded = bool(
+                    getattr(_EXTRA_CTX, "flash_comm_v1_enabled", False)
+                    or getattr(_EXTRA_CTX, "flashcomm_v2_enabled", False)
+                )
+                chunks, uniform_rank = _hetero_chunks_and_uniform_rank(
+                    per_dp, tp_sizes, stream_padded
+                )
                 if x.shape[0] < uniform_rank:
                     # Pad only dim 0 (token dim); tensors here may be 1-D
                     # (e.g. pertoken_scale) or 2-D+ (hidden states).
@@ -89,7 +126,7 @@ def _maybe_all_gather_and_maybe_unpad_impl(x: torch.Tensor, label: bool, is_ep_c
                 x_offset = 0
                 for i in range(len(tp_sizes)):
                     actual_i = int(num_tokens_across_dp_cpu[i].item())
-                    chunk = padded_num // tp_sizes[i]
+                    chunk = chunks[i]
                     for r in range(tp_sizes[i]):
                         start = r * chunk
                         if start < actual_i:
@@ -125,11 +162,20 @@ def _maybe_pad_and_reduce_impl(x: torch.Tensor, is_ep_comm: bool = False) -> tor
     except AssertionError:
         return tensor_model_parallel_all_reduce(x)
 
+    is_hetero = getattr(_EXTRA_CTX, 'per_dp_tp_sizes', None) is not None
     flash_comm_v1_enabled = getattr(forward_context, "flash_comm_v1_enabled", False) or (
         enable_sp_by_pass() and is_ep_comm
     )
 
-    if not flash_comm_v1_enabled or (forward_context.is_draft_model and is_vl_model() and not is_ep_comm):
+    # Under heterogeneous TP the MoE EP reduce_scatter must run for EVERY
+    # forward (see _maybe_all_gather_and_maybe_unpad_impl): the per-forward
+    # FlashComm1 flag is False for decode, but each rank still holds its own
+    # chunk of the stream, so the TP all_reduce fallback would sum DIFFERENT
+    # chunks (garbage output in decode).
+    if (
+        (not flash_comm_v1_enabled and not (is_hetero and is_ep_comm))
+        or (forward_context.is_draft_model and is_vl_model() and not is_ep_comm)
+    ):
         return tensor_model_parallel_all_reduce(x)
 
     dp_metadata = forward_context.dp_metadata
@@ -154,17 +200,18 @@ def _maybe_pad_and_reduce_impl(x: torch.Tensor, is_ep_comm: bool = False) -> tor
             if enable_sp_by_pass():
                 return get_ep_group().reduce_scatter(x.view(-1, *x.shape[1:]), 0)
             # Heterogeneous TP: reduce_scatter hands every rank the SAME
-            # number of rows, but each DP rank must receive its own
-            # padded_length / tp_dp share. Pack each rank's real share into a
-            # uniform per-rank slot, reduce_scatter, then slice the local
-            # share. The block width must match the residual-stream chunking
-            # (padded_num_tokens / tp_dp, LCM-aligned) — NOT per_dp / tp_dp
-            # (tp-aligned N), which is off by one whenever the LCM alignment
-            # bumps padded_length above max(per_dp).
-            padded_num = int(getattr(_EXTRA_CTX, "padded_num_tokens", 0) or 0)
-            if padded_num <= 0:
-                padded_num = max(per_dp)
-            uniform_rank = max(padded_num // tp_i for tp_i in tp_sizes)
+            # number of rows, but each DP rank must receive its own chunk
+            # share. Pack each rank's real share into a uniform per-rank
+            # slot, reduce_scatter, then slice the local share. The block
+            # width must match the residual-stream chunking of THIS forward
+            # (see _hetero_chunks_and_uniform_rank).
+            stream_padded = bool(
+                getattr(_EXTRA_CTX, "flash_comm_v1_enabled", False)
+                or getattr(_EXTRA_CTX, "flashcomm_v2_enabled", False)
+            )
+            chunks, uniform_rank = _hetero_chunks_and_uniform_rank(
+                per_dp, tp_sizes, stream_padded
+            )
             ep_world_size = get_ep_group().world_size
             padded_x = torch.empty(
                 (ep_world_size * uniform_rank, *x.shape[1:]),
@@ -175,7 +222,7 @@ def _maybe_pad_and_reduce_impl(x: torch.Tensor, is_ep_comm: bool = False) -> tor
             padded_offset = 0
             for i in range(len(tp_sizes)):
                 actual_i = int(num_tokens_across_dp_cpu[i].item())
-                chunk = padded_num // tp_sizes[i]
+                chunk = chunks[i]
                 for r in range(tp_sizes[i]):
                     start = r * chunk
                     if start < actual_i:
@@ -195,7 +242,7 @@ def _maybe_pad_and_reduce_impl(x: torch.Tensor, is_ep_comm: bool = False) -> tor
                 ep_rank -= tp_sizes[i]
                 i += 1
             local_dp, local_tp = i, ep_rank
-            chunk_local = padded_num // tp_sizes[local_dp]
+            chunk_local = chunks[local_dp]
             actual_local = int(num_tokens_across_dp_cpu[local_dp].item())
             n_local = min(chunk_local, actual_local - local_tp * chunk_local)
             return x[: max(n_local, 0)]
@@ -215,7 +262,8 @@ def _maybe_pad_and_reduce_impl(x: torch.Tensor, is_ep_comm: bool = False) -> tor
 
 
 def _maybe_all_gather_and_maybe_unpad_fake(x: torch.Tensor, label: bool, is_ep_comm: bool = False) -> torch.Tensor:
-    if _EXTRA_CTX.flash_comm_v1_enabled and label:
+    is_hetero = getattr(_EXTRA_CTX, 'per_dp_tp_sizes', None) is not None
+    if (_EXTRA_CTX.flash_comm_v1_enabled or (is_hetero and is_ep_comm)) and label:
         return torch.empty(
             (x.shape[0] * get_tensor_model_parallel_world_size(), *x.shape[1:]), device=x.device, dtype=x.dtype
         )
@@ -224,7 +272,8 @@ def _maybe_all_gather_and_maybe_unpad_fake(x: torch.Tensor, label: bool, is_ep_c
 
 
 def _maybe_pad_and_reduce_fake(x: torch.Tensor, is_ep_comm: bool = False) -> torch.Tensor:
-    if _EXTRA_CTX.flash_comm_v1_enabled or enable_sp_by_pass():
+    is_hetero = getattr(_EXTRA_CTX, 'per_dp_tp_sizes', None) is not None
+    if _EXTRA_CTX.flash_comm_v1_enabled or enable_sp_by_pass() or (is_hetero and is_ep_comm):
         return torch.empty(
             (x.shape[0] // get_tensor_model_parallel_world_size(), *x.shape[1:]), device=x.device, dtype=x.dtype
         )
@@ -256,9 +305,15 @@ def _prefetch_postprocess_impl_fake(stop_flag: torch.Tensor) -> None:
 
 def _maybe_all_reduce_tensor_model_parallel_impl(final_hidden_states: torch.Tensor) -> torch.Tensor:
     moe_comm_type = _EXTRA_CTX.moe_comm_type
+    # Under heterogeneous TP the routed output has already been reduced by the
+    # EP reduce_scatter in _maybe_pad_and_reduce_impl for EVERY forward
+    # (including decode, where flash_comm_v1_enabled is False).  A TP
+    # all_reduce here would sum the per-rank chunks of DIFFERENT tokens.
+    is_hetero = getattr(_EXTRA_CTX, 'per_dp_tp_sizes', None) is not None
     if (
         moe_comm_type in {MoECommType.ALLTOALL, MoECommType.MC2, MoECommType.FUSED_MC2}
         or _EXTRA_CTX.flash_comm_v1_enabled
+        or is_hetero
     ):
         return final_hidden_states
     else:

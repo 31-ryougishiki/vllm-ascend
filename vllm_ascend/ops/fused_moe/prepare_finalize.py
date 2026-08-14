@@ -375,7 +375,14 @@ class PrepareAndFinalizeWithAllGather(PrepareAndFinalize):
         Returns:
             MoEPrepareOutput with global tensors.
         """
-        if enable_sp() or enable_sp_by_pass():
+        # Heterogeneous TP always uses the EP group path: the DP groups are
+        # position-based ({0,3,7,11}, {1,4,8,12}, ...) so the DP-group gather
+        # below would mix tokens across DP replicas and drop expert
+        # contributions from orphaned ranks.  The per-forward FlashComm1 flag
+        # cannot be used here either — it is False for decode batches
+        # (num_tokens <= 1000), which would silently fall into the broken
+        # DP path.  The hetero-aware gates live in the custom ops.
+        if enable_sp() or enable_sp_by_pass() or getattr(_EXTRA_CTX, "per_dp_tp_sizes", None) is not None:
             return self._prepare_with_ep_group(hidden_states, router_logits, quant_type)
 
         return self._prepare_with_dp_group(hidden_states, router_logits, enable_shared_expert_dp, replace_allreduce)
@@ -512,21 +519,30 @@ class PrepareAndFinalizeWithAllGather(PrepareAndFinalize):
         true_dp_size = len(tp_sizes) if is_hetero else self.moe_config.dp_size
         if true_dp_size > 1:
             max_tokens_across_dp = _EXTRA_CTX.max_tokens_across_dp
-            pad_size = max_tokens_across_dp - self.num_tokens
+            # NOTE: pad against the LOCAL input_ids length, not self.num_tokens.
+            # In the EP-group prepare path self.num_tokens is set to the total
+            # (gathered) token count, so the old reference never padded and the
+            # EP all_gather below would receive unequal-sized contributions
+            # whenever the DP token counts differ.
+            pad_size = max_tokens_across_dp - input_ids.shape[0]
             if pad_size > 0:
                 input_ids = nn.functional.pad(input_ids, (0, pad_size))
 
             if is_hetero:
                 # All TP ranks within a DP rank hold identical input_ids.
-                # EP all_gather produces tp_size copies per DP rank.
-                # Take the first copy per DP rank.
+                # Every rank contributes exactly max_tokens_across_dp rows
+                # after the pad above, so the per-DP blocks sit at
+                # tp_i * max_tokens_across_dp strides.  Slice each DP's block
+                # by its OWN stream width (num_tokens_across_dp_cpu[i]) to
+                # match the hidden_states/topk streams produced by the
+                # unpad walk in _maybe_all_gather_and_maybe_unpad_impl.
+                num_tokens_across_dp_cpu = get_forward_context().dp_metadata.num_tokens_across_dp_cpu
                 all_gathered = get_ep_group().all_gather(input_ids, 0)
                 parts = []
                 offset = 0
-                for tp_i in tp_sizes:
-                    parts.append(
-                        all_gathered[offset : offset + max_tokens_across_dp]
-                    )
+                for i, tp_i in enumerate(tp_sizes):
+                    width = int(num_tokens_across_dp_cpu[i].item())
+                    parts.append(all_gathered[offset : offset + width])
                     offset += tp_i * max_tokens_across_dp
                 input_ids = torch.cat(parts, dim=0)
             else:
@@ -546,7 +562,7 @@ class PrepareAndFinalizeWithAllGather(PrepareAndFinalize):
         Returns:
             Tensor with shape [local_num_tokens, hidden_size]
         """
-        if enable_sp() or enable_sp_by_pass():
+        if enable_sp() or enable_sp_by_pass() or getattr(_EXTRA_CTX, "per_dp_tp_sizes", None) is not None:
             return self._finalize_with_ep_group(hidden_states)
 
         return self._finalize_with_dp_group(hidden_states, reduce_results)

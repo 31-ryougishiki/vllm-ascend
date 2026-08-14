@@ -3,7 +3,7 @@ from vllm.config import ParallelConfig, get_current_vllm_config
 from vllm.distributed.parallel_state import GroupCoordinator, get_tp_group, get_world_group, init_model_parallel_group
 
 from vllm_ascend.ascend_config import get_ascend_config
-from vllm_ascend.utils import enable_dsa_cp, enable_dsa_cp_with_layer_shard, enable_sp, flashcomm2_enable
+from vllm_ascend.utils import enable_dsa_cp, enable_dsa_cp_with_layer_shard, flashcomm2_enable
 
 # Currently, mc2 op need their own group coordinator.
 _MC2: GroupCoordinator | None = None
@@ -83,21 +83,13 @@ def init_ascend_model_parallel(
     # and prefill-TP groups are not supported.  MC2 and other groups needed by
     # the Ascend MoE runner are initialized as compatible fallbacks.
     if parallel_config.is_heterogeneous_tp:
-        # Under heterogeneous TP the no-SP MoE path is structurally broken:
-        # the DP groups are position-based ({0,3,7,11}, {1,4,8,12}, ...), so
-        # the no-SP DP-group prepare/finalize all_gathers and reduce_scatters
-        # mix tokens across DP replicas and silently drop the expert
-        # contributions hosted on ranks outside the position group.  The EP
-        # group path (FlashComm1 SP) is the only correct one; also the
-        # deterministic o_proj / replicated shared expert fixes assume SP.
-        # Reject the combination up front instead of emitting garbage.
-        if not enable_sp():
-            raise RuntimeError(
-                "heterogeneous TP requires FlashComm1 sequence parallelism "
-                "(the no-SP MoE DP-group path is not supported under "
-                "heterogeneous TP). Set VLLM_ASCEND_ENABLE_FLASHCOMM1=1 "
-                "or additional_config['enable_flashcomm1']=true."
-            )
+        # Under heterogeneous TP the MoE comm is always routed through the EP
+        # group (AllGather prepare / Reduce-Scatter finalize), regardless of
+        # the FlashComm1 flag: the no-SP DP-group path is structurally broken
+        # because the DP groups are position-based ({0,3,7,11}, {1,4,8,12},
+        # ...), so DP-group all_gathers/reduce_scatters would mix tokens
+        # across DP replicas.  See PrepareAndFinalizeWithAllGather and
+        # register_custom_ops for the hetero-aware gates.
         # DSA-CP assumes uniform per-rank head/token splits
         # (dsa_cp.py uses num_tokens_pad // tp_size) and constructs wq_b as
         # ReplicatedLinear while the metadata builder reports ratio-sharded

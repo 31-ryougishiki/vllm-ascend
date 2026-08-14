@@ -324,8 +324,14 @@ def _select_a3_moe_comm_method(
     num_experts = vllm_config.model_config.get_num_experts()
     ep_world_size = get_ep_group().world_size
     expert_divisible = (num_experts % ep_world_size) == 0
+    if not expert_divisible:
+        # Experts not evenly divisible across EP ranks: neither the MC2 kernel
+        # nor the prefill A3/ALLTOALL path can shard the experts evenly, so
+        # always use ALLGATHER (the A2 fallback path) regardless of token
+        # count.  E.g. 256 experts over 15 heterogeneous-TP ranks.
+        return MoECommType.ALLGATHER
 
-    if num_tokens <= mc2_tokens_capacity and expert_divisible:
+    if num_tokens <= mc2_tokens_capacity:
         fused_decode_enable = enable_fused_mc2
         if enable_fused_mc2 == 1:
             fused_decode_enable = enable_fused_mc2 and dispatch_ffn_combine_enable
@@ -336,11 +342,6 @@ def _select_a3_moe_comm_method(
                 and quant_type == "w8a8_dynamic"
             )
         return MoECommType.FUSED_MC2 if fused_decode_enable else MoECommType.MC2
-
-    if num_tokens <= mc2_tokens_capacity:
-        # Experts not evenly divisible across EP ranks: the MC2 kernel cannot
-        # be used. Fall back to ALLGATHER (the A2 fallback path).
-        return MoECommType.ALLGATHER
 
     fused_prefill_enable = enable_fused_mc2
     if enable_fused_mc2 == 1:
