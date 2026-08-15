@@ -52,21 +52,20 @@ from vllm.model_executor.layers.linear import (
     ReplicatedLinear,
     RowParallelLinear,
 )
+
+
 def _hetero_shared_exp_replicated() -> bool:
     """Replicate the shared expert (disable_tp) so every rank computes the
-    FULL shared-expert contribution instead of a TP shard.  Under the
-    ALLGATHER + FlashComm1 SP path the sharded shared output is never
-    cross-rank reduced (shared_expert_dp_enabled() is True whenever SP is on),
-    so DP0 (sharded [2,1,1]) and DP1 (sharded 4-way) would get different
-    shared partials for the same token — an O(1) divergence the MoE router
-    amplifies into garbage.
+    FULL shared-expert contribution instead of a TP shard.  A TP shard of the
+    shared expert would produce a partial contribution that is never
+    cross-rank reduced under the heterogeneous-TP MoE path (the MoE prepare /
+    finalize always goes through the EP group and the final TP all-reduce is
+    skipped), so DP0 (sharded [2,1,1]) and DP1 (sharded 4-way) would get
+    different shared partials for the same token — an O(1) divergence the MoE
+    router amplifies into garbage.
 
-    Always on under heterogeneous TP.
-
-    WARNING: replication assumes FlashComm1 SP stays enabled (it is, for MoE
-    models, in both prefill and decode).  If SP were disabled, the combined
-    MoE output TP all-reduce would sum a replicated shared tp_size times —
-    heterogeneous TP + disabled FlashComm1 is rejected at worker init."""
+    Always on under heterogeneous TP, both with and without FlashComm1 SP.
+    """
     try:
         from vllm.config import get_current_vllm_config
 
@@ -414,10 +413,22 @@ class DeepseekV4MoE(nn.Module):
         self.n_redundant_experts = eplb_config.num_redundant_experts
         self.n_logical_experts = self.n_routed_experts
         self.n_physical_experts = self.n_logical_experts + self.n_redundant_experts
-        self.n_local_physical_experts = self.n_physical_experts // self.ep_size
+        # Mirror determine_expert_map's remainder distribution: the first
+        # ``remainder`` EP ranks own one extra expert.  This matters under
+        # heterogeneous TP where the EP world size may not divide the expert
+        # count (e.g. 256 experts over 15 ranks).
+        physical_base = self.n_physical_experts // self.ep_size
+        physical_remainder = self.n_physical_experts % self.ep_size
+        self.n_local_physical_experts = physical_base + (
+            1 if self.ep_rank < physical_remainder else 0
+        )
 
-        self.physical_expert_start = self.ep_rank * self.n_local_physical_experts
-        self.physical_expert_end = self.physical_expert_start + self.n_local_physical_experts
+        self.physical_expert_start = (
+            self.ep_rank * physical_base + min(self.ep_rank, physical_remainder)
+        )
+        self.physical_expert_end = (
+            self.physical_expert_start + self.n_local_physical_experts
+        )
 
         self.is_rocm_aiter_moe_enabled = rocm_aiter_ops.is_fused_moe_enabled()
         self.is_fusion_moe_shared_experts_enabled = rocm_aiter_ops.is_fusion_moe_shared_experts_enabled()
@@ -430,20 +441,12 @@ class DeepseekV4MoE(nn.Module):
             # A single shared expert is applied to EVERY token, so under
             # heterogeneous TP its weights are replicated across TP ranks
             # (disable_tp) — a TP shard of a shared expert only produces a
-            # partial contribution that nothing ever cross-rank reduces under
-            # the ALLGATHER + FlashComm1 SP path.  shared_expert_dp_enabled()
-            # (True whenever enable_sp) is exactly the condition under which
-            # the MoE runner/combine skips the shared output all-reduce, so
-            # the construction must agree with it or the same token gets a
-            # DIFFERENT shared partial on DP0 (sharded [2,1,1]) vs DP1
-            # (sharded 4-way) — an O(1) divergence the MoE router amplifies
-            # into garbage.
-            #
-            # Replication is safe in decode too because FlashComm1 SP stays on
-            # for MoE models at any batch size; the no-SP combined-output
-            # all-reduce (which would sum a replicated shared tp_size times)
-            # is unreachable since heterogeneous TP + disabled FlashComm1 is
-            # rejected at worker init.
+            # partial contribution that nothing cross-rank reduces: the
+            # heterogeneous MoE path always reduces the routed output with an
+            # EP reduce-scatter and skips the final TP all-reduce.  Without
+            # replication the same token gets a DIFFERENT shared partial on
+            # DP0 (sharded [2,1,1]) vs DP1 (sharded 4-way), an O(1)
+            # divergence the MoE router amplifies into garbage.
             _repl_shared = _hetero_shared_exp_replicated()
             self.shared_experts = DeepseekV2MLP(
                 hidden_size=config.hidden_size,

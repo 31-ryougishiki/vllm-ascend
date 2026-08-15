@@ -64,6 +64,68 @@ def _hetero_chunks_and_uniform_rank(
     return chunks, max(chunks)
 
 
+def _hetero_fake_output_sizes(
+    is_ep_comm: bool,
+) -> tuple[int | None, int | None]:
+    """Return (gather_len, reduce_len) for the fake custom-op implementations.
+
+    The generic fake shapes (``x * tp_size`` for gather and ``x // tp_size``
+    for reduce-scatter) only match the homogeneous all-gather path.  Under
+    heterogeneous TP the EP gather output is ``sum(actual DP tokens)`` (or
+    ``ep_size * uniform_rank`` when ``sp_by_pass`` skips the unpad), and the
+    reduce-scatter output is this rank's real chunk share.  Recompute both from
+    the forward-context metadata so torch.compile/ACL graph shape inference
+    agrees with the real op.  Returns ``(None, None)`` when metadata is
+    unavailable, in which case callers keep the legacy shape fallback.
+    """
+    if not is_ep_comm:
+        return None, None
+    per_dp = getattr(_EXTRA_CTX, "per_dp_padded_lengths", None)
+    tp_sizes = getattr(_EXTRA_CTX, "per_dp_tp_sizes", None)
+    if per_dp is None or tp_sizes is None:
+        return None, None
+    try:
+        dp_metadata = get_forward_context().dp_metadata
+        if dp_metadata is None:
+            return None, None
+        actual_tokens = [
+            int(v) for v in dp_metadata.num_tokens_across_dp_cpu.tolist()
+        ]
+    except (AssertionError, AttributeError, IndexError, TypeError, ValueError):
+        return None, None
+
+    stream_padded = bool(
+        getattr(_EXTRA_CTX, "flash_comm_v1_enabled", False)
+        or getattr(_EXTRA_CTX, "flashcomm_v2_enabled", False)
+    )
+    chunks, uniform_rank = _hetero_chunks_and_uniform_rank(
+        per_dp, tp_sizes, stream_padded
+    )
+
+    try:
+        if enable_sp_by_pass():
+            gather_len = get_ep_group().world_size * uniform_rank
+            reduce_len = uniform_rank
+        else:
+            gather_len = sum(actual_tokens)
+            ep_rank = get_ep_group().rank_in_group
+            i = 0
+            while ep_rank >= tp_sizes[i]:
+                ep_rank -= tp_sizes[i]
+                i += 1
+            local_dp, local_tp = i, ep_rank
+            reduce_len = max(
+                min(
+                    chunks[local_dp],
+                    actual_tokens[local_dp] - local_tp * chunks[local_dp],
+                ),
+                0,
+            )
+    except (AssertionError, AttributeError, IndexError, TypeError, ValueError):
+        return None, None
+    return gather_len, reduce_len
+
+
 def _maybe_all_gather_and_maybe_unpad_impl(x: torch.Tensor, label: bool, is_ep_comm: bool = False) -> torch.Tensor:
     try:
         forward_context = get_forward_context()
@@ -264,8 +326,13 @@ def _maybe_pad_and_reduce_impl(x: torch.Tensor, is_ep_comm: bool = False) -> tor
 def _maybe_all_gather_and_maybe_unpad_fake(x: torch.Tensor, label: bool, is_ep_comm: bool = False) -> torch.Tensor:
     is_hetero = getattr(_EXTRA_CTX, 'per_dp_tp_sizes', None) is not None
     if (_EXTRA_CTX.flash_comm_v1_enabled or (is_hetero and is_ep_comm)) and label:
+        output_len = None
+        if is_hetero and is_ep_comm:
+            output_len, _ = _hetero_fake_output_sizes(is_ep_comm)
+        if output_len is None:
+            output_len = x.shape[0] * get_tensor_model_parallel_world_size()
         return torch.empty(
-            (x.shape[0] * get_tensor_model_parallel_world_size(), *x.shape[1:]), device=x.device, dtype=x.dtype
+            (output_len, *x.shape[1:]), device=x.device, dtype=x.dtype
         )
 
     return x
@@ -274,8 +341,13 @@ def _maybe_all_gather_and_maybe_unpad_fake(x: torch.Tensor, label: bool, is_ep_c
 def _maybe_pad_and_reduce_fake(x: torch.Tensor, is_ep_comm: bool = False) -> torch.Tensor:
     is_hetero = getattr(_EXTRA_CTX, 'per_dp_tp_sizes', None) is not None
     if _EXTRA_CTX.flash_comm_v1_enabled or enable_sp_by_pass() or (is_hetero and is_ep_comm):
+        output_len = None
+        if is_hetero and is_ep_comm:
+            _, output_len = _hetero_fake_output_sizes(is_ep_comm)
+        if output_len is None:
+            output_len = x.shape[0] // get_tensor_model_parallel_world_size()
         return torch.empty(
-            (x.shape[0] // get_tensor_model_parallel_world_size(), *x.shape[1:]), device=x.device, dtype=x.dtype
+            (output_len, *x.shape[1:]), device=x.device, dtype=x.dtype
         )
 
     return x

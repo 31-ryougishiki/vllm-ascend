@@ -253,7 +253,6 @@ def set_mc2_tokens_capacity(vllm_config, max_num_reqs, uniform_decode_query_len)
     else:
         max_num_tokens = max_num_reqs * uniform_decode_query_len
     pc = vllm_config.parallel_config
-    tp_size = pc.tensor_parallel_size
     # Under heterogeneous TP, `_mc2_tokens_capacity` is computed once (in the
     # API-server process) and inherited by every worker via fork. Since
     # different DP ranks have different tp_size, align the capacity to the LCM
@@ -261,15 +260,28 @@ def set_mc2_tokens_capacity(vllm_config, max_num_reqs, uniform_decode_query_len)
     if pc.is_heterogeneous_tp:
         from math import lcm
 
-        align = lcm(
-            *[pc.get_tp_size_for_dp(i) for i in range(pc.data_parallel_size)]
-        )
+        tp_sizes = [
+            pc.get_tp_size_for_dp(i) for i in range(pc.data_parallel_size)
+        ]
+        align = lcm(*tp_sizes)
     else:
-        align = tp_size
+        tp_sizes = None
+        align = pc.tensor_parallel_size
     # Use integer arithmetic for ceiling division.
     num_tokens_per_tp_rank = (max_num_tokens + align - 1) // align
-    # NOTE: To save memory, we cap the max number of tokens to 512.
-    num_tokens_per_tp_rank = min(num_tokens_per_tp_rank, 512)
+    # NOTE: To save memory, we cap the max number of tokens to 512 per TP
+    # rank.  Under heterogeneous TP the aligned total must also respect the
+    # cap for EVERY DP rank: a total of align * 512 could give the largest TP
+    # rank 512 rows but overflow the smallest TP rank.
+    if tp_sizes is not None:
+        max_safe_units = min(
+            (tp_i * 512) // align for tp_i in tp_sizes
+        )
+        num_tokens_per_tp_rank = min(
+            num_tokens_per_tp_rank, max_safe_units
+        )
+    else:
+        num_tokens_per_tp_rank = min(num_tokens_per_tp_rank, 512)
     _mc2_tokens_capacity = num_tokens_per_tp_rank * align
 
 

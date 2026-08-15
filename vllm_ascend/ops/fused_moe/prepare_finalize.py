@@ -27,9 +27,6 @@ from vllm.distributed.parallel_state import (
     get_tensor_model_parallel_rank,
     get_tensor_model_parallel_world_size,
 )
-from vllm.logger import init_logger
-
-logger = init_logger(__name__)
 from vllm.forward_context import get_forward_context
 from vllm.model_executor.layers.fused_moe import FusedMoEConfig
 
@@ -129,9 +126,26 @@ class PrepareAndFinalizeWithAll2All(PrepareAndFinalize):
         self._restore_tp_across_dp()
 
     def _restore_tp_across_dp(self):
-        """Restore original TP configuration (same as MC2)."""
-        self.tp_size = get_tensor_model_parallel_world_size()
-        self.tp_rank = get_tensor_model_parallel_rank()
+        """Restore original TP configuration (same as MC2).
+
+        Under heterogeneous TP the comm method may be constructed while the
+        draft model has temporarily patched the TP group to size-1, so read
+        the true per-DP-rank TP size/rank from the parallel config.
+        """
+        from vllm.config import get_current_vllm_config_or_none
+        from vllm.distributed.parallel_state import get_world_group
+
+        cfg = get_current_vllm_config_or_none()
+        if cfg is not None and cfg.parallel_config.is_heterogeneous_tp:
+            pc = cfg.parallel_config
+            self.tp_size = pc.tensor_parallel_size
+            self.tp_rank = (
+                get_world_group().rank
+                - pc.get_rank_offset_for_dp(pc.data_parallel_rank)
+            )
+        else:
+            self.tp_size = get_tensor_model_parallel_world_size()
+            self.tp_rank = get_tensor_model_parallel_rank()
 
     def prepare(
         self,
@@ -518,6 +532,34 @@ class PrepareAndFinalizeWithAllGather(PrepareAndFinalize):
         is_hetero = tp_sizes is not None
         true_dp_size = len(tp_sizes) if is_hetero else self.moe_config.dp_size
         if true_dp_size > 1:
+            if is_hetero and enable_sp_by_pass():
+                # sp_by_pass leaves the custom gather op un-unpadded: every
+                # rank pads its local stream to the same uniform per-rank slot
+                # and the EP all_gather output stays at
+                # ep_size * uniform_rank.  Match that layout here so input_ids
+                # stays aligned with hidden_states/router_logits.
+                per_dp = getattr(_EXTRA_CTX, "per_dp_padded_lengths", None)
+                if per_dp is not None:
+                    padded_num = int(
+                        getattr(_EXTRA_CTX, "padded_num_tokens", 0) or 0
+                    )
+                    if padded_num <= 0:
+                        padded_num = max(per_dp)
+                    stream_padded = bool(
+                        getattr(_EXTRA_CTX, "flash_comm_v1_enabled", False)
+                        or getattr(_EXTRA_CTX, "flashcomm_v2_enabled", False)
+                    )
+                    uniform_rank = max(
+                        (padded_num if stream_padded else per_dp[i])
+                        // tp_sizes[i]
+                        for i in range(len(tp_sizes))
+                    )
+                    if input_ids.shape[0] < uniform_rank:
+                        input_ids = nn.functional.pad(
+                            input_ids, (0, uniform_rank - input_ids.shape[0])
+                        )
+                return get_ep_group().all_gather(input_ids, 0)
+
             max_tokens_across_dp = _EXTRA_CTX.max_tokens_across_dp
             # NOTE: pad against the LOCAL input_ids length, not self.num_tokens.
             # In the EP-group prepare path self.num_tokens is set to the total
