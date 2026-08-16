@@ -113,14 +113,9 @@ def _hetero_fake_output_sizes(
             while ep_rank >= tp_sizes[i]:
                 ep_rank -= tp_sizes[i]
                 i += 1
-            local_dp, local_tp = i, ep_rank
-            reduce_len = max(
-                min(
-                    chunks[local_dp],
-                    actual_tokens[local_dp] - local_tp * chunks[local_dp],
-                ),
-                0,
-            )
+            # The real reduce path returns a FULL local chunk (pad tail
+            # zeroed) so DeepseekV4MoE can TP-all-gather equal-sized chunks.
+            reduce_len = chunks[i]
     except (AssertionError, AttributeError, IndexError, TypeError, ValueError):
         return None, None
     return gather_len, reduce_len
@@ -306,8 +301,19 @@ def _maybe_pad_and_reduce_impl(x: torch.Tensor, is_ep_comm: bool = False) -> tor
             local_dp, local_tp = i, ep_rank
             chunk_local = chunks[local_dp]
             actual_local = int(num_tokens_across_dp_cpu[local_dp].item())
-            n_local = min(chunk_local, actual_local - local_tp * chunk_local)
-            return x[: max(n_local, 0)]
+            n_local = max(
+                min(chunk_local, actual_local - local_tp * chunk_local), 0
+            )
+            # Return a FULL local chunk.  In the FlashComm1/2 path the
+            # residual stream is already padded to this chunk width, and in
+            # the no-SP hetero path DeepseekV4MoE.forward re-gathers the TP
+            # chunks before truncating to num_tokens.  The pad tail must be
+            # zero: reduce_scatter leaves those rows uninitialized, and they
+            # participate in the subsequent TP all-gather.
+            x = x[:chunk_local]
+            if n_local < chunk_local:
+                x[n_local:] = 0
+            return x
         if enable_sp_by_pass():
             return get_ep_group().reduce_scatter(x.view(-1, *x.shape[1:]), 0)
         # padding

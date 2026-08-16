@@ -43,6 +43,7 @@ from vllm.distributed import (
     get_tensor_model_parallel_world_size,
     tensor_model_parallel_all_gather,
 )
+from vllm.forward_context import get_forward_context
 from vllm.model_executor.layers.activation import SiluAndMul, SiluAndMulWithClamp
 from vllm.model_executor.layers.fused_moe import FusedMoE
 from vllm.model_executor.layers.layernorm import RMSNorm
@@ -397,6 +398,7 @@ class DeepseekV4MoE(nn.Module):
         self.n_shared_experts: int = config.n_shared_experts
 
         self.is_sequence_parallel = parallel_config.use_sequence_parallel_moe
+        self.is_heterogeneous_tp = parallel_config.is_heterogeneous_tp
 
         if config.hidden_act != "silu":
             raise ValueError(f"Unsupported activation: {config.hidden_act}. Only silu is supported for now.")
@@ -511,7 +513,23 @@ class DeepseekV4MoE(nn.Module):
         # This avoids duplicate computation in self.experts.
         # TODO: We can replace the all_reduce at the end of attn with a
         # reduce_scatter instead of chunking here.
-        if self.is_sequence_parallel:
+        #
+        # vllm-ascend flips all2all_backend to flashinfer_all2allv, which
+        # makes use_sequence_parallel_moe False.  With FlashComm1/2 enabled
+        # the attention output is already TP-chunked, so no chunking is
+        # needed here.  Without SP, attention returns the full replicated
+        # stream while the hetero MoE comm still uses the EP gather/RS path,
+        # which expects one chunk per TP rank: chunk here and all-gather
+        # after FusedMoE to restore the replicated stream.
+        forward_ctx = get_forward_context()
+        stream_is_chunked = bool(
+            getattr(forward_ctx, "flash_comm_v1_enabled", False)
+            or getattr(forward_ctx, "flashcomm_v2_enabled", False)
+        )
+        chunk_for_moe = self.is_sequence_parallel or (
+            self.is_heterogeneous_tp and not stream_is_chunked
+        )
+        if chunk_for_moe:
             hidden_states = sequence_parallel_chunk(hidden_states)
 
         if self.experts.is_internal_router:
@@ -545,7 +563,7 @@ class DeepseekV4MoE(nn.Module):
         else:
             final_hidden_states = fused_moe_out
 
-        if self.is_sequence_parallel:
+        if chunk_for_moe:
             final_hidden_states = tensor_model_parallel_all_gather(final_hidden_states, 0)
             final_hidden_states = final_hidden_states[:num_tokens]
         elif self.tp_size > 1 and fused_moe_out_is_tuple:
