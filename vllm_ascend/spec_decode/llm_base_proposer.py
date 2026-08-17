@@ -200,7 +200,20 @@ class AscendSpecDecodeBaseProposer(SpecDecodeBaseProposer):
         # or the same as target model.
         # TODO(zhaomingyu13): If we want to adapt to the case where draft model tp
         # is not 1 and differs from target model, this part should be rewritten.
-        if vllm_config.parallel_config.tensor_parallel_size != self.speculative_config.draft_tensor_parallel_size:
+        target_tp_size = vllm_config.parallel_config.tensor_parallel_size
+        draft_tp_size = self.speculative_config.draft_tensor_parallel_size
+        is_hetero_tp = vllm_config.parallel_config.is_heterogeneous_tp
+        if is_hetero_tp and draft_tp_size != 1:
+            # Under heterogeneous TP the speculative config is built once from
+            # the DP0 snapshot (draft_tensor_parallel_size is DP0's tp_size,
+            # e.g. 3).  EngineCore has already rewritten the target
+            # parallel_config to the current DP rank's tp_size (e.g. 4 for
+            # DP1..3), so the naive size comparison below would falsely think
+            # the draft model runs with TP=1 and patch the global TP group to a
+            # singleton.  MTP draft weights are sharded with the target model's
+            # per-DP TP group, so just reuse it.
+            self.tp_group_context = nullcontext()
+        elif target_tp_size != draft_tp_size:
             tp_group = init_model_parallel_group(
                 [[get_world_group().rank]],
                 get_world_group().rank,
