@@ -725,7 +725,23 @@ class AscendDSACPMetadataBuilder(AttentionMetadataBuilder[AscendDSAMetadata]):
         tp_rank = tp_group.rank_in_group
         # Split the flattened token stream evenly across TP ranks. Padding keeps
         # every rank's local slice the same length, which simplifies CP kernels.
-        num_tokens_pad = ((num_input_tokens + tp_size - 1) // tp_size) * tp_size
+        #
+        # Under heterogeneous TP the FlashComm1 SP stream is padded to the LCM
+        # of ALL per-DP tp sizes (e.g. lcm(3,4)=12), not just the local tp_size.
+        # num_input_tokens is already the max per-DP padded count, so aligning
+        # to lcm(tp_sizes) makes local_cos/local_sin exactly match the local
+        # hidden-state chunk consumed by the RoPE kernel.
+        parallel_config = self.vllm_config.parallel_config
+        if parallel_config.is_heterogeneous_tp:
+            align = math.lcm(
+                *[
+                    parallel_config.get_tp_size_for_dp(i)
+                    for i in range(parallel_config.data_parallel_size)
+                ]
+            )
+        else:
+            align = tp_size
+        num_tokens_pad = ((num_input_tokens + align - 1) // align) * align
         tokens_per_rank = num_tokens_pad // tp_size
         local_start = tp_rank * tokens_per_rank
         local_end = local_start + tokens_per_rank
