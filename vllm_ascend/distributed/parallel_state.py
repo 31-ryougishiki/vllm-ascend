@@ -3,7 +3,7 @@ from vllm.config import ParallelConfig, get_current_vllm_config
 from vllm.distributed.parallel_state import GroupCoordinator, get_tp_group, get_world_group, init_model_parallel_group
 
 from vllm_ascend.ascend_config import get_ascend_config
-from vllm_ascend.utils import enable_dsa_cp, enable_dsa_cp_with_layer_shard, flashcomm2_enable
+from vllm_ascend.utils import enable_dsa_cp_with_layer_shard, flashcomm2_enable
 
 # Currently, mc2 op need their own group coordinator.
 _MC2: GroupCoordinator | None = None
@@ -90,17 +90,11 @@ def init_ascend_model_parallel(
         # ...), so DP-group all_gathers/reduce_scatters would mix tokens
         # across DP replicas.  See PrepareAndFinalizeWithAllGather and
         # register_custom_ops for the hetero-aware gates.
-        # DSA-CP assumes uniform per-rank head/token splits
-        # (dsa_cp.py uses num_tokens_pad // tp_size) and constructs wq_b as
-        # ReplicatedLinear while the metadata builder reports ratio-sharded
-        # heads (32/16/16) — silently wrong under heterogeneous TP.  Reject
-        # it up front like the no-SP case instead of emitting garbage.
-        if enable_dsa_cp():
-            raise RuntimeError(
-                "DSA context parallelism (enable_dsa_cp) is not supported "
-                "under heterogeneous TP (uniform head/token splits do not "
-                "match the asymmetric per-DP sharding). Disable dsa_cp."
-            )
+        #
+        # DSA-CP is supported for DeepSeek V4: q/wq_b are intentionally
+        # replicated (full heads on every rank) and dsa_cp.py restores the
+        # ratio-sharded o_proj layout with an uneven all_to_all, so no
+        # fine-grained Ascend TP groups are required here.
         _init_ascend_heterogeneous_fallbacks()
         return
     assert torch.distributed.is_initialized()

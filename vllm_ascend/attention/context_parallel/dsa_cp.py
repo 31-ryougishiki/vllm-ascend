@@ -8,6 +8,7 @@ import torch.nn.functional as F
 import torch_npu
 from vllm.config import VllmConfig, get_current_vllm_config
 from vllm.distributed import get_tp_group
+from vllm.distributed.utils import get_tp_partition_offset, get_tp_partition_size
 from vllm.v1.attention.backend import AttentionCGSupport, AttentionMetadataBuilder
 from vllm.v1.kv_cache_interface import AttentionSpec
 
@@ -982,9 +983,7 @@ class AscendDSACPImpl(DSAAttentionImpl):
         self.wo_a = kwargs["wo_a"]
         self.wo_b = kwargs["wo_b"]
 
-        self.enable_dsa_cp_with_o_proj_tp = enable_dsa_cp_with_o_proj_tp() and (
-            get_ascend_device_type() == AscendDeviceType.A5
-        )
+        self.enable_dsa_cp_with_o_proj_tp = False
         self._wo_a_dynamic_quant = False
         self._wo_b_dynamic_quant = False
 
@@ -993,6 +992,27 @@ class AscendDSACPImpl(DSAAttentionImpl):
         self.attn_sink = kwargs["attn_sink"]
 
         self.vllm_config = get_current_vllm_config()
+
+        # Under heterogeneous TP the o_proj heads may be ratio-sharded
+        # (e.g. [32,16,16] for tp=3 with ratios [2,1,1]).  The restore step
+        # below then needs an uneven all_to_all instead of the uniform
+        # ``tp_size * n_local_heads`` split.
+        self._hetero_head_ratios: list[int] | None = None
+        parallel_config = self.vllm_config.parallel_config
+        if parallel_config.is_heterogeneous_tp:
+            ratios = parallel_config.get_sharding_ratios_for_dp(
+                parallel_config.data_parallel_rank
+            )
+            if ratios is not None:
+                self._hetero_head_ratios = list(ratios)
+
+        # A5-only o_proj full-gather assumes uniformly sharded heads on every
+        # rank; keep it disabled for ratio-sharded heterogeneous TP groups.
+        self.enable_dsa_cp_with_o_proj_tp = (
+            enable_dsa_cp_with_o_proj_tp()
+            and (get_ascend_device_type() == AscendDeviceType.A5)
+            and self._hetero_head_ratios is None
+        )
 
         # indexer param
         if self.indexer is not None:
@@ -1527,15 +1547,68 @@ class AscendDSACPImpl(DSAAttentionImpl):
         if self.tp_size == 1 or skip_all_to_all:
             return local_attn_output
 
-        send = (
-            local_attn_output.view(num_tokens, self.tp_size, self.n_local_heads, self.head_dim)
-            .permute(1, 0, 2, 3)
-            .contiguous()
-            .view(-1, self.n_local_heads, self.head_dim)
+        if self._hetero_head_ratios is None:
+            send = (
+                local_attn_output.view(
+                    num_tokens,
+                    self.tp_size,
+                    self.n_local_heads,
+                    self.head_dim,
+                )
+                .permute(1, 0, 2, 3)
+                .contiguous()
+                .view(-1, self.n_local_heads, self.head_dim)
+            )
+            recv = torch.empty_like(send)
+            dist.all_to_all_single(recv, send, group=self.tp_group.device_group)
+            return recv
+
+        # Heterogeneous TP with asymmetric head sharding (e.g. tp=3 with
+        # ratios [2,1,1] -> 32/16/16 local heads).  Every rank computed all
+        # ``num_heads`` locally, but the output shard width differs per rank,
+        # so a uniform all_to_all_single cannot split/assemble the tensor.
+        # Pack each destination's head partition into a contiguous chunk and
+        # exchange with explicit per-source/per-destination split sizes.
+        head_sizes = [
+            get_tp_partition_size(
+                self.num_heads, rank, self.tp_size, self._hetero_head_ratios
+            )
+            for rank in range(self.tp_size)
+        ]
+        head_offsets = [
+            get_tp_partition_offset(
+                self.num_heads, rank, self.tp_size, self._hetero_head_ratios
+            )
+            for rank in range(self.tp_size)
+        ]
+        send_chunks = []
+        for rank in range(self.tp_size):
+            head_start = head_offsets[rank]
+            head_end = head_start + head_sizes[rank]
+            send_chunks.append(
+                local_attn_output[:, head_start:head_end, :]
+                .contiguous()
+                .view(-1)
+            )
+        send = torch.cat(send_chunks, dim=0)
+        recv = torch.empty(
+            num_tokens * self.tp_size * self.n_local_heads * self.head_dim,
+            dtype=local_attn_output.dtype,
+            device=local_attn_output.device,
         )
-        recv = torch.empty_like(send)
-        dist.all_to_all_single(recv, send, group=self.tp_group.device_group)
-        return recv
+        dist.all_to_all_single(
+            recv,
+            send,
+            output_split_sizes=[
+                num_tokens * self.n_local_heads * self.head_dim
+            ] * self.tp_size,
+            input_split_sizes=[
+                num_tokens * head_sizes[rank] * self.head_dim
+                for rank in range(self.tp_size)
+            ],
+            group=self.tp_group.device_group,
+        )
+        return recv.view(-1, self.n_local_heads, self.head_dim)
 
     def _update_indexer_cache(
         self,
