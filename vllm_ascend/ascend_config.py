@@ -119,7 +119,21 @@ class AscendConfig:
         from vllm_ascend.utils import enable_sp
 
         if self.enable_shared_expert_dp:
-            assert enable_sp(vllm_config=vllm_config, enable_shared_expert_dp=True)
+            if vllm_config.parallel_config.is_heterogeneous_tp:
+                # Under heterogeneous TP the MoE AllGather path always goes
+                # through the EP group and DeepseekV4MoE replicates the shared
+                # expert per TP rank, which already gives shared-expert-DP
+                # semantics for both SP and no-SP forwards. Do not force SP on
+                # here: SP requires FlashComm1 padding and would change the
+                # tensor shapes for the whole model just because this option
+                # was set.
+                logger.info_once(
+                    "enable_shared_expert_dp is set under heterogeneous TP. "
+                    "The hetero EP MoE path already implements shared-expert "
+                    "data parallelism; FlashComm1 SP is not force-enabled."
+                )
+            else:
+                assert enable_sp(vllm_config=vllm_config, enable_shared_expert_dp=True)
 
         if vllm_config.parallel_config.prefill_context_parallel_size > 1 and enable_sp(vllm_config=vllm_config):
             tp_pcp_size = (
