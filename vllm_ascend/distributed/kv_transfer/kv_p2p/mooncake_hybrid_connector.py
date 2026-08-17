@@ -1191,18 +1191,31 @@ class MooncakeConnectorScheduler:
         self.pcp_size = vllm_config.parallel_config.prefill_context_parallel_size
         self.dcp_size = vllm_config.parallel_config.decode_context_parallel_size
         assert self.pcp_size * self.dcp_size == 1, "Mooncake Hybrid Connector only support cp_world_size == 1. "
-        self.max_device_id = (
-            vllm_config.parallel_config.tensor_parallel_size
-            * vllm_config.parallel_config.data_parallel_size
-            * vllm_config.parallel_config.pipeline_parallel_size
-        )
+        parallel_config = vllm_config.parallel_config
+        if parallel_config.is_heterogeneous_tp:
+            # The global DP rank layout is tp=[3,4,4,4] instead of the
+            # uniform dp_rank * tp_size stride.  ``world_size_across_dp``
+            # sums the per-DP tp sizes and ``get_rank_offset_for_dp`` is the
+            # cumulative device offset.
+            self.max_device_id = parallel_config.world_size_across_dp
+            dp_port_offset = parallel_config.get_rank_offset_for_dp(
+                parallel_config.data_parallel_rank
+            )
+        else:
+            self.max_device_id = (
+                parallel_config.tensor_parallel_size
+                * parallel_config.data_parallel_size
+                * parallel_config.pipeline_parallel_size
+            )
+            dp_port_offset = (
+                parallel_config.data_parallel_rank
+                * parallel_config.tensor_parallel_size
+                * parallel_config.pipeline_parallel_size
+            )
 
         # Handshake base port
         self.side_channel_port = (
-            vllm_config.kv_transfer_config.kv_port
-            + vllm_config.parallel_config.data_parallel_rank
-            * vllm_config.parallel_config.tensor_parallel_size
-            * vllm_config.parallel_config.pipeline_parallel_size
+            vllm_config.kv_transfer_config.kv_port + dp_port_offset
         )
         # Requests that need to start recv.
         # New requests are added by update_state_after_alloc in
@@ -1506,7 +1519,11 @@ class MooncakeConnectorWorker:
         self.kv_caches: dict[str, torch.Tensor] = {}
         self.side_channel_host = get_ip()
 
-        self.max_device_id = self.tp_size * self.dp_size * self.pp_size
+        parallel_config = vllm_config.parallel_config
+        if parallel_config.is_heterogeneous_tp:
+            self.max_device_id = parallel_config.world_size_across_dp
+        else:
+            self.max_device_id = self.tp_size * self.dp_size * self.pp_size
         self.kv_role = vllm_config.kv_transfer_config.kv_role
         self.num_key_value_heads = self.vllm_config.model_config.hf_text_config.num_key_value_heads
 
@@ -1547,12 +1564,21 @@ class MooncakeConnectorWorker:
         self._mamba_ssm_size = mamba_ssm_size
         self.use_compress = hasattr(self.vllm_config.model_config.hf_config, "compress_ratios")
 
-        # Handshake base port
+        # Handshake base port.  Under heterogeneous TP the DP ranks use the
+        # cumulative device offset (0/3/7/11 for tp=[3,4,4,4]), not the
+        # uniform dp_rank * local_tp_size stride.
+        if parallel_config.is_heterogeneous_tp:
+            dp_port_offset = parallel_config.get_rank_offset_for_dp(
+                parallel_config.data_parallel_rank
+            )
+        else:
+            dp_port_offset = (
+                parallel_config.data_parallel_rank
+                * parallel_config.tensor_parallel_size
+                * parallel_config.pipeline_parallel_size
+            )
         self.side_channel_port = (
-            vllm_config.kv_transfer_config.kv_port
-            + vllm_config.parallel_config.data_parallel_rank
-            * vllm_config.parallel_config.tensor_parallel_size
-            * vllm_config.parallel_config.pipeline_parallel_size
+            vllm_config.kv_transfer_config.kv_port + dp_port_offset
         )
         device_index = self.pp_rank * self.tp_size + self.tp_rank
         self.handshake_port = self.side_channel_port + device_index
@@ -1574,7 +1600,18 @@ class MooncakeConnectorWorker:
             self.tp_num_need_pulls = 1
         else:
             num_d_block_heads = max(1, self.num_key_value_heads // self.tp_size)
-            num_p_block_heads = max(1, self.num_key_value_heads // self._prefill_tp_size)
+            # On a kv_producer the ranks are selected from THIS instance's
+            # per-DP tp group (tp_size can differ per DP rank under
+            # heterogeneous TP).  ``_prefill_tp_size`` is only the remote
+            # pool descriptor and is only used by consumers.
+            producer_prefill_tp_size = (
+                self.tp_size
+                if self.kv_role == "kv_producer"
+                else self._prefill_tp_size
+            )
+            num_p_block_heads = max(
+                1, self.num_key_value_heads // producer_prefill_tp_size
+            )
             self.tp_num_need_pulls = num_d_block_heads // num_p_block_heads
         self.local_remote_block_port_mapping: dict[str, list[list[int]] | None] = {}
         self.remote_port_send_num: dict[str, dict[int, RemotePortInfo]] = {}
@@ -1851,7 +1888,14 @@ class MooncakeConnectorWorker:
         if prefill_tp_size is None:
             prefill_tp_size = self._prefill_tp_size
 
-        if prefill_tp_size == self._prefill_tp_size:
+        # On a heterogeneous kv_producer the rank set is built from this
+        # instance's per-DP tp_size (3 for DP0), while ``_prefill_tp_size``
+        # is the remote pool descriptor from the extra config (4).
+        parallel_config = self.vllm_config.parallel_config
+        expected_prefill_tp_size = self._prefill_tp_size
+        if self.kv_role == "kv_producer" and parallel_config.is_heterogeneous_tp:
+            expected_prefill_tp_size = self.tp_size
+        if prefill_tp_size == expected_prefill_tp_size:
             return self.tp_num_need_pulls
 
         if self.vllm_config.model_config.is_deepseek_mla:
@@ -1877,7 +1921,14 @@ class MooncakeConnectorWorker:
         return info.get("host", remote_host), info.get("engine_id", remote_engine_id)
 
     def _prefill_get_remote_rank(self, req_id: str) -> list[int]:
-        return sum(self._get_remote_ranks_for_req(req_id), [])
+        # This method is only used on the producer side (see start_load_kv).
+        # Select from the local per-DP TP group: under heterogeneous TP the
+        # extra-config prefill tp_size may be larger than the local tp_size
+        # (4 vs 3 for DP0), and hashing the wrong population would pick a
+        # nonexistent local rank or disagree with the consumer's
+        # remote_ptp_size-based selection.
+        prefill_tp_size = self.tp_size
+        return sum(self._get_remote_ranks_for_req(req_id, prefill_tp_size), [])
 
     def _get_remote_rank(self, req_id: str, prefill_tp_size: int | None = None) -> list[int]:
         return self._get_remote_ranks_for_req(req_id, prefill_tp_size)[self.tp_rank]

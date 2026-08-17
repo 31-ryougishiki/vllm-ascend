@@ -1427,20 +1427,42 @@ def dispose_layer(layer: Any):
 
 
 def check_kv_extra_config(vllm_config):
+    parallel_config = vllm_config.parallel_config
+
     def _check(name: str, config: dict):
         tp_key = "tp_size"
         dp_key = "dp_size"
         if tp_key in config:
             config_tp = config[tp_key]
-            vllm_tp = vllm_config.parallel_config.tensor_parallel_size
-            if config_tp != vllm_tp:
-                raise ValueError(
-                    f"KV transfer '{name}' config has a conflicting tensor parallel size. "
-                    f"Expected {vllm_tp}, but got {config_tp}."
+            if parallel_config.is_heterogeneous_tp:
+                # The extra config describes the logical remote pool layout
+                # (e.g. prefill dp4/tp4).  The local instance is heterogeneous
+                # (dp0 tp=3, dp1..3 tp=4), so accept the pool tp_size as long
+                # as it matches one of the per-DP tp sizes; rank selection and
+                # side-channel ports are derived from the real per-DP sizes.
+                local_tp_sizes = sorted(
+                    {
+                        parallel_config.get_tp_size_for_dp(i)
+                        for i in range(parallel_config.data_parallel_size)
+                    }
                 )
+                if config_tp not in local_tp_sizes:
+                    raise ValueError(
+                        f"KV transfer '{name}' config has an incompatible "
+                        f"tensor parallel size. Expected one of the "
+                        f"heterogeneous per-DP tp sizes {local_tp_sizes}, "
+                        f"but got {config_tp}."
+                    )
+            else:
+                vllm_tp = parallel_config.tensor_parallel_size
+                if config_tp != vllm_tp:
+                    raise ValueError(
+                        f"KV transfer '{name}' config has a conflicting tensor parallel size. "
+                        f"Expected {vllm_tp}, but got {config_tp}."
+                    )
         if dp_key in config:
             config_dp = config[dp_key]
-            vllm_dp = vllm_config.parallel_config.data_parallel_size
+            vllm_dp = parallel_config.data_parallel_size
             if config_dp != vllm_dp:
                 raise ValueError(
                     f"KV transfer '{name}' config has a conflicting data parallel size. "
