@@ -1595,6 +1595,17 @@ class MooncakeConnectorWorker:
         os.environ.setdefault(
             "ASCEND_CONNECT_TIMEOUT", str(get_transfer_timeout_value())
         )
+        # Mooncake's Python wrapper caps every sync batch at
+        # MC_TRANSFER_TIMEOUT seconds (default 30s), independent of the
+        # ASCEND_* timeouts.  The first cross-node ADXL connection can take
+        # longer than that (see ASCEND_CONNECT_TIMEOUT above), so keep the
+        # wrapper deadline above the link-establishment budget when the
+        # deployment has not set MC_TRANSFER_TIMEOUT itself.
+        connect_timeout_ms = int(os.environ["ASCEND_CONNECT_TIMEOUT"])
+        os.environ.setdefault(
+            "MC_TRANSFER_TIMEOUT",
+            str(max(60, connect_timeout_ms // 1000 + 60)),
+        )
         if self._prefill_tp_size < self._decode_tp_size:
             raise ValueError(
                 f"prefill_tp_size: {self._prefill_tp_size} must be greater than"
