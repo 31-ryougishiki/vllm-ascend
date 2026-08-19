@@ -393,6 +393,32 @@ class NPUWorker(WorkerBase):
         self.cache_config.num_cpu_blocks = num_cpu_blocks
 
     def _init_device(self):
+        # Heterogeneous DP/TP: the launcher may pass the global TP size as
+        # --tensor-parallel-size while only making tp_size(dp) devices
+        # visible to this process.  Re-derive the local TP size from
+        # heterogeneous_dp_config before the visible-device check so
+        # local_world_size always matches the per-DP card count.
+        parallel_config = self.parallel_config
+        if parallel_config.is_heterogeneous_tp:
+            dp_rank = parallel_config.data_parallel_rank
+            expected_tp = parallel_config.get_tp_size_for_dp(dp_rank)
+            if parallel_config.tensor_parallel_size != expected_tp:
+                logger.warning_once(
+                    "Correcting tensor_parallel_size from %s to %s for "
+                    "heterogeneous DP rank %d (visible devices were launched "
+                    "for tp_size=%s).",
+                    parallel_config.tensor_parallel_size,
+                    expected_tp,
+                    dp_rank,
+                    expected_tp,
+                )
+                parallel_config.tensor_parallel_size = expected_tp
+                parallel_config.world_size = (
+                    parallel_config.pipeline_parallel_size
+                    * expected_tp
+                    * parallel_config.prefill_context_parallel_size
+                )
+
         if not vllm_version_is("0.23.0"):
             # vLLM v0.24.0 (PR #45026) removed automatic per-process device
             # isolation for DP workers. Mirror gpu_worker.py::init_device:
@@ -490,7 +516,11 @@ class NPUWorker(WorkerBase):
             assert self.parallel_config.local_world_size <= visible_device_count, (
                 f"local_world_size ({self.parallel_config.local_world_size}) must "
                 f"be less than or equal to the number of visible devices "
-                f"({visible_device_count})."
+                f"({visible_device_count}). "
+                f"dp_rank={self.parallel_config.data_parallel_rank}, "
+                f"tp_size={self.parallel_config.tensor_parallel_size}, "
+                f"heterogeneous_tp="
+                f"{self.parallel_config.is_heterogeneous_tp}."
             )
 
         # Initialize the distributed environment.
