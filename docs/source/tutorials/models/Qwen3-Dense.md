@@ -1,4 +1,4 @@
-# Qwen3-Dense (Qwen3-0.6B/1.7B/4B/8B/14B/32B, W8A8, W4A8, W4A4, W8A8SC-310)
+# Qwen3-Dense (Qwen3-0.6B/1.7B/4B/8B/14B/32B)
 
 ## 1 Introduction
 
@@ -59,6 +59,8 @@ If you need to deploy a multi-node environment, verify the multi-node communicat
 
 You can use the official all-in-one Docker image for Qwen3 Dense models.
 
+For Atlas 300I DUO, use `vllm-ascend:nightly-releases-v0.23.0-310p` (or a later `-310p` image).
+
 **Docker Pull:**
 
 ```{code-block} bash
@@ -72,6 +74,7 @@ docker pull quay.io/ascend/vllm-ascend:|vllm_ascend_version|
 Start the docker image on each node.
 
 :::::{tab-set}
+
 ::::{tab-item} Atlas A3 inference products
 :sync: A3
 

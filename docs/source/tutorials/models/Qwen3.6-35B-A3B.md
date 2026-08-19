@@ -10,7 +10,7 @@ The `Qwen3.6-35B-A3B` model is first supported in `vllm-ascend:v0.18.0rc1`. Use 
 
 ## 2 Supported Features
 
-Refer to [supported features](../../user_guide/support_matrix/supported_models.md) to get the model's supported feature matrix, including BF16, W8A8 quantization, chunked prefill, automatic prefix caching, asynchronous scheduling, tensor parallelism, expert parallelism, and ACLGraph support.
+Refer to [supported features](../../user_guide/support_matrix/supported_features.md) to get the model's supported feature matrix, including BF16, W8A8 quantization, chunked prefill, automatic prefix caching, asynchronous scheduling, tensor parallelism, expert parallelism, and ACLGraph support.
 
 Refer to [feature guide](../../user_guide/feature_guide/index.md) to get feature configuration details.
 
@@ -29,9 +29,12 @@ It is recommended to download the model weight to `/root/.cache/`.
 
 Select an image based on your machine type. For example, use `quay.io/ascend/vllm-ascend:|vllm_ascend_version|` for Atlas A2 inference products, `quay.io/ascend/vllm-ascend:|vllm_ascend_version|-a3` for Atlas A3 inference products, and `quay.io/ascend/vllm-ascend:|vllm_ascend_version|-310p` for Atlas 300I DUO.
 
+For Atlas 300I DUO, use `vllm-ascend:nightly-releases-v0.23.0-310p` (or a later `-310p` image).
+
 Refer to [using docker](../../installation.md#set-up-using-docker) for the complete installation guide.
 
 :::::{tab-set}
+
 ::::{tab-item} Atlas A3 inference products
 :sync: A3
 
@@ -293,6 +296,11 @@ Here are two accuracy evaluation methods.
 ### 7.1 Using AISBench
 
 Refer to [Using AISBench](../../developer_guide/evaluation/using_ais_bench.md) for details. After execution, you can get the accuracy result of `Qwen3.6-35B-A3B-w8a8`.
+
+| dataset | version | metric | mode | vllm-api-general-chat |
+| ------- | ------- | ------ | ---- | --------------------- |
+| mmmu | - | accuracy | gen | 83.3 |
+| gpqa | - | accuracy | gen | 83.3 |
 
 ### 7.2 Using Language Model Evaluation Harness
 
