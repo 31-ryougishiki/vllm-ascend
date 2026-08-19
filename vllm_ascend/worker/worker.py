@@ -395,29 +395,35 @@ class NPUWorker(WorkerBase):
     def _init_device(self):
         # Heterogeneous DP/TP: the launcher may pass the global TP size as
         # --tensor-parallel-size while only making tp_size(dp) devices
-        # visible to this process.  Re-derive the local TP size from
-        # heterogeneous_dp_config before the visible-device check so
-        # local_world_size always matches the per-DP card count.
+        # visible to this process.  Re-derive BOTH tensor_parallel_size and
+        # world_size from heterogeneous_dp_config before the visible-device
+        # check.  Do not rely on ParallelConfig.__post_init__: the config may
+        # have been reconstructed/deserialized in the worker process with a
+        # stale world_size field.
         parallel_config = self.parallel_config
         if parallel_config.is_heterogeneous_tp:
             dp_rank = parallel_config.data_parallel_rank
             expected_tp = parallel_config.get_tp_size_for_dp(dp_rank)
-            if parallel_config.tensor_parallel_size != expected_tp:
+            expected_world_size = (
+                parallel_config.pipeline_parallel_size
+                * expected_tp
+                * parallel_config.prefill_context_parallel_size
+            )
+            if (
+                parallel_config.tensor_parallel_size != expected_tp
+                or parallel_config.world_size != expected_world_size
+            ):
                 logger.warning_once(
-                    "Correcting tensor_parallel_size from %s to %s for "
-                    "heterogeneous DP rank %d (visible devices were launched "
-                    "for tp_size=%s).",
+                    "Correcting heterogeneous parallel config for DP rank "
+                    "%d: tensor_parallel_size %s -> %s, world_size %s -> %s.",
+                    dp_rank,
                     parallel_config.tensor_parallel_size,
                     expected_tp,
-                    dp_rank,
-                    expected_tp,
+                    parallel_config.world_size,
+                    expected_world_size,
                 )
                 parallel_config.tensor_parallel_size = expected_tp
-                parallel_config.world_size = (
-                    parallel_config.pipeline_parallel_size
-                    * expected_tp
-                    * parallel_config.prefill_context_parallel_size
-                )
+                parallel_config.world_size = expected_world_size
 
         if not vllm_version_is("0.23.0"):
             # vLLM v0.24.0 (PR #45026) removed automatic per-process device
