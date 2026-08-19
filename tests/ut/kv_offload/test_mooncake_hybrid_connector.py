@@ -20,6 +20,7 @@ from vllm_ascend.distributed.kv_transfer.kv_p2p.mooncake_hybrid_connector import
     MAX_REQUESTS_PER_PEER_HANDLER,
     KVCacheRecvingThread,
     MooncakeConnectorScheduler,
+    get_dp_side_channel_port_offset,
 )
 
 
@@ -294,3 +295,126 @@ class TestMooncakeHybridConnectorScheduler(unittest.TestCase):
         self.assertIsNotNone(params)
         self.assertEqual(params["remote_block_ids"], ([0], [100, 101]))
         self.assertEqual(params["num_prompt_blocks"], 2)
+
+
+class TestHeterogeneousMooncakeHybridPorts(unittest.TestCase):
+    def _make_parallel_config(
+        self, *, hetero: bool, dp_rank: int, tp_size: int
+    ) -> types.SimpleNamespace:
+        if hetero:
+            offsets = [0, 3, 7, 11]
+
+            def get_rank_offset_for_dp(rank: int) -> int:
+                return offsets[rank]
+
+            return types.SimpleNamespace(
+                is_heterogeneous_tp=True,
+                data_parallel_rank=dp_rank,
+                tensor_parallel_size=tp_size,
+                pipeline_parallel_size=1,
+                get_rank_offset_for_dp=get_rank_offset_for_dp,
+            )
+        return types.SimpleNamespace(
+            is_heterogeneous_tp=False,
+            data_parallel_rank=dp_rank,
+            tensor_parallel_size=tp_size,
+            pipeline_parallel_size=1,
+        )
+
+    def test_heterogeneous_dp_port_offset_is_cumulative(self):
+        self.assertEqual(
+            get_dp_side_channel_port_offset(
+                self._make_parallel_config(hetero=True, dp_rank=0, tp_size=3)
+            ),
+            0,
+        )
+        self.assertEqual(
+            get_dp_side_channel_port_offset(
+                self._make_parallel_config(hetero=True, dp_rank=2, tp_size=4)
+            ),
+            7,
+        )
+
+    def test_homogeneous_dp_port_offset_uses_uniform_stride(self):
+        self.assertEqual(
+            get_dp_side_channel_port_offset(
+                self._make_parallel_config(hetero=False, dp_rank=3, tp_size=4)
+            ),
+            12,
+        )
+
+    def test_scheduler_handshake_mapping_uses_published_handshake_port(self):
+        kv_port = 36000
+        scheduler = object.__new__(MooncakeConnectorScheduler)
+        scheduler.vllm_config = types.SimpleNamespace(
+            kv_transfer_config=types.SimpleNamespace(kv_port=kv_port)
+        )
+        scheduler.multi_nodes_meta_mapping = {}
+
+        # Heterogeneous DP0 publishes global offsets 0, 1, 2 while the local
+        # worker keys are still 0, 1, 2.  DP1 would publish 3..6 instead.
+        metadata = {
+            local_rank: types.SimpleNamespace(
+                local_ip=f"10.0.0.{local_rank}",
+                engine_id=f"engine-{local_rank}",
+                handshake_port=kv_port + local_rank,
+            )
+            for local_rank in range(3)
+        }
+        scheduler.set_xfer_handshake_metadata(metadata)
+
+        self.assertEqual(
+            scheduler.multi_nodes_meta_mapping["2"],
+            {
+                "host": "10.0.0.2",
+                "engine_id": "engine-2",
+                "handshake_port": kv_port + 2,
+            },
+        )
+
+    def test_remote_host_lookup_falls_back_to_dp_local_offset(self):
+        worker = types.SimpleNamespace(
+            vllm_config=types.SimpleNamespace(
+                kv_transfer_config=types.SimpleNamespace(kv_port=36000)
+            )
+        )
+        # Old-style mapping keyed by DP-local rank.
+        mapping = {"2": {"host": "10.0.0.2", "engine_id": "engine-2"}}
+        self.assertEqual(
+            KVCacheRecvingThread._get_remote_host_info_by_port(
+                worker,
+                base_port=36003,
+                remote_handshake_port=36005,
+                remote_host="10.0.0.9",
+                remote_engine_id="engine-9",
+                remote_multi_nodes_meta_mapping=mapping,
+            ),
+            ("10.0.0.2", "engine-2"),
+        )
+
+    def test_remote_host_lookup_matches_absolute_handshake_port(self):
+        # Producer kv_port (36000) and consumer kv_port (36200) differ, and
+        # the producer DP1 worker publishes global offset 5.
+        worker = types.SimpleNamespace(
+            vllm_config=types.SimpleNamespace(
+                kv_transfer_config=types.SimpleNamespace(kv_port=36200)
+            )
+        )
+        mapping = {
+            "5": {
+                "host": "10.0.1.5",
+                "engine_id": "engine-5",
+                "handshake_port": 36005,
+            }
+        }
+        self.assertEqual(
+            KVCacheRecvingThread._get_remote_host_info_by_port(
+                worker,
+                base_port=36003,
+                remote_handshake_port=36005,
+                remote_host="10.0.1.9",
+                remote_engine_id="engine-9",
+                remote_multi_nodes_meta_mapping=mapping,
+            ),
+            ("10.0.1.5", "engine-5"),
+        )

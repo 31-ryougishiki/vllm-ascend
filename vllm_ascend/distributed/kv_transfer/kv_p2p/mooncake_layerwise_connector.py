@@ -1129,6 +1129,11 @@ class MooncakeLayerwiseConnectorWorker:
 
     def __init__(self, vllm_config: VllmConfig, kv_cache_config: KVCacheConfig, engine_id: str):
         os.environ["ASCEND_TRANSFER_TIMEOUT"] = str(get_transfer_timeout_value())
+        # Align ADXL link establishment with the transfer timeout unless the
+        # deployment already configured ASCEND_CONNECT_TIMEOUT explicitly.
+        os.environ.setdefault(
+            "ASCEND_CONNECT_TIMEOUT", str(get_transfer_timeout_value())
+        )
 
         if TransferEngine is None:
             raise RuntimeError("mooncake is not available")

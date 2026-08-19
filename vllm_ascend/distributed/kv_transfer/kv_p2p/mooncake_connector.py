@@ -1979,6 +1979,11 @@ class MooncakeConnectorWorker:
     def __init__(self, vllm_config: VllmConfig, engine_id: str, kv_cache_config: KVCacheConfig):
         self._get_prefill_decode_size(vllm_config)
         os.environ["ASCEND_TRANSFER_TIMEOUT"] = str(get_transfer_timeout_value())
+        # Align ADXL link establishment with the transfer timeout unless the
+        # deployment already configured ASCEND_CONNECT_TIMEOUT explicitly.
+        os.environ.setdefault(
+            "ASCEND_CONNECT_TIMEOUT", str(get_transfer_timeout_value())
+        )
         if self._prefill_tp_size < self._decode_tp_size:
             raise ValueError(
                 f"prefill_tp_size: {self._prefill_tp_size} must be greater than"
@@ -3500,6 +3505,18 @@ class MooncakeConnectorWorker:
     ):
         if remote_multi_nodes_meta_mapping is None:
             return remote_host, remote_engine_id
+
+        # Absolute handshake_port match is the only mapping that survives
+        # different P/D kv_port values and heterogeneous TP port offsets.
+        for info in remote_multi_nodes_meta_mapping.values():
+            if (
+                isinstance(info, dict)
+                and info.get("handshake_port") == remote_handshake_port
+            ):
+                return (
+                    info.get("host", remote_host),
+                    info.get("engine_id", remote_engine_id),
+                )
 
         kv_port = self.vllm_config.kv_transfer_config.kv_port
         rank = str(remote_handshake_port - kv_port)

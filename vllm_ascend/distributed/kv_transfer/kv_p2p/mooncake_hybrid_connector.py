@@ -22,7 +22,7 @@ import torch_npu
 import zmq
 from mooncake.engine import TransferEngine  # type: ignore
 from vllm import envs
-from vllm.config import VllmConfig
+from vllm.config import ParallelConfig, VllmConfig
 from vllm.distributed.kv_transfer.kv_connector.utils import BlockIds
 from vllm.distributed.kv_transfer.kv_connector.v1.base import (
     KVConnectorBase_V1,
@@ -74,6 +74,27 @@ DONE_RECVING_MSG = b"done_recving_msg"
 MAX_REQUESTS_PER_PEER_HANDLER = 5
 
 
+def get_dp_side_channel_port_offset(parallel_config: ParallelConfig) -> int:
+    """Return the DP-rank offset added to ``kv_port`` for side channels.
+
+    Under heterogeneous TP the DP ranks use the cumulative device offset
+    (0/3/7/11 for tp=[3,4,4,4]), not the uniform ``dp_rank * tp_size``
+    stride.  Both the scheduler and the workers must agree on this value,
+    otherwise the producer handshake ports advertised in
+    ``request_finished_all_groups`` point at a different DP rank than the
+    ports the workers actually bind.
+    """
+    if parallel_config.is_heterogeneous_tp:
+        return parallel_config.get_rank_offset_for_dp(
+            parallel_config.data_parallel_rank
+        )
+    return (
+        parallel_config.data_parallel_rank
+        * parallel_config.tensor_parallel_size
+        * parallel_config.pipeline_parallel_size
+    )
+
+
 class RemotePortInfo(TypedDict):
     num: int
     host: str
@@ -88,6 +109,8 @@ class MooncakeAgentMetadata(msgspec.Struct, omit_defaults=True, dict=True):
     block_lens: list[int]
     ssm_sizes: tuple[int, int]
     local_ip: str = ""
+    handshake_port: int = 0
+    block_strides: list[int] = msgspec.field(default_factory=list)
 
 
 @dataclass
@@ -405,6 +428,8 @@ class KVCacheRecvingThread(threading.Thread):
         self.hma_group_size = hma_group_size
         self.mamba_ssm_size = mamba_ssm_size
         self.remote_te_port: dict[str, dict[int, int]] = SizedDict()
+        self.remote_block_lens: dict[str, dict[int, list[int]]] = SizedDict()
+        self.remote_block_strides: dict[str, dict[int, list[int]]] = SizedDict()
         self.remote_metadata_lock = threading.Lock()
 
         self.request_queue: queue.Queue[Any] = queue.Queue()
@@ -668,7 +693,22 @@ class KVCacheRecvingThread(threading.Thread):
             remote_kv_caches_base_addrs = self.kv_caches_base_addr[remote_engine_id][remote_handshake_port]
             local_kv_caches_base_addrs = self.kv_caches_base_addr[self.local_engine_id][self.local_handshake_port]
             remote_transfer_port = self.remote_te_port[remote_engine_id][remote_handshake_port]
+            remote_block_lens = self.remote_block_lens[remote_engine_id][
+                remote_handshake_port
+            ]
+            remote_block_strides = self.remote_block_strides[remote_engine_id][
+                remote_handshake_port
+            ]
         session_id = f"{remote_host}:{remote_transfer_port}"
+
+        if len(local_kv_caches_base_addrs) != len(remote_kv_caches_base_addrs):
+            raise RuntimeError(
+                "Mooncake hybrid KV metadata mismatch: local KV cache address "
+                f"count {len(local_kv_caches_base_addrs)} != remote KV cache "
+                f"address count {len(remote_kv_caches_base_addrs)} for "
+                f"remote_engine_id={remote_engine_id} "
+                f"remote_handshake_port={remote_handshake_port}."
+            )
 
         req_start_time = time.perf_counter()
         src_list, dst_list, length_list = [], [], []
@@ -689,10 +729,27 @@ class KVCacheRecvingThread(threading.Thread):
             ):
                 if self.addr_group_idx and i not in self.addr_group_idx[k]:  # type: ignore[operator]
                     continue
-                block_len = self.block_len_per_addr[k]
-                block_stride = self.block_stride_per_addr[k]
+                # Prefer the producer's own block geometry.  Heterogeneous
+                # TP pools (tp=3 on one DP rank, tp=4 on another) may differ
+                # in tensor layout from the local decode cache, and the local
+                # stride/length must never be used to index a remote cache.
+                block_len = (
+                    remote_block_lens[k]
+                    if k < len(remote_block_lens)
+                    else self.block_len_per_addr[k]
+                )
+                block_stride = (
+                    remote_block_strides[k]
+                    if k < len(remote_block_strides)
+                    else self.block_stride_per_addr[k]
+                )
+                local_block_stride = (
+                    self.block_stride_per_addr[k]
+                    if k < len(self.block_stride_per_addr)
+                    else block_stride
+                )
                 for remote_block_id, local_block_id in zip(grouped_remote_block_ids, grouped_local_block_ids):
-                    src = src_layer_base_addr + local_block_id[0] * block_stride
+                    src = src_layer_base_addr + local_block_id[0] * local_block_stride
                     dst = dst_layer_base_addr + remote_block_id[0] * block_stride
                     length = block_len * len(local_block_id)
                     src_list.append(src)
@@ -968,6 +1025,12 @@ class KVCacheRecvingThread(threading.Thread):
             with self.remote_metadata_lock:
                 self.kv_caches_base_addr[engine_id][remote_handshake_port] = agent_meta.kv_caches_base_addr
                 self.remote_te_port[engine_id][remote_handshake_port] = agent_meta.te_rpc_port
+                self.remote_block_lens[engine_id][remote_handshake_port] = (
+                    agent_meta.block_lens
+                )
+                self.remote_block_strides[engine_id][remote_handshake_port] = (
+                    agent_meta.block_strides
+                )
         except Exception:
             if isinstance(sock, zmq.Socket):  # type: ignore
                 sock.close()
@@ -1193,29 +1256,28 @@ class MooncakeConnectorScheduler:
         assert self.pcp_size * self.dcp_size == 1, "Mooncake Hybrid Connector only support cp_world_size == 1. "
         parallel_config = vllm_config.parallel_config
         if parallel_config.is_heterogeneous_tp:
-            # The global DP rank layout is tp=[3,4,4,4] instead of the
-            # uniform dp_rank * tp_size stride.  ``world_size_across_dp``
-            # sums the per-DP tp sizes and ``get_rank_offset_for_dp`` is the
-            # cumulative device offset.
+            # ``world_size_across_dp`` sums the per-DP tp sizes (15 for
+            # tp=[3,4,4,4]) and is kept for diagnostics/limit checks.
             self.max_device_id = parallel_config.world_size_across_dp
-            dp_port_offset = parallel_config.get_rank_offset_for_dp(
-                parallel_config.data_parallel_rank
-            )
         else:
             self.max_device_id = (
                 parallel_config.tensor_parallel_size
                 * parallel_config.data_parallel_size
                 * parallel_config.pipeline_parallel_size
             )
-            dp_port_offset = (
-                parallel_config.data_parallel_rank
-                * parallel_config.tensor_parallel_size
-                * parallel_config.pipeline_parallel_size
-            )
 
-        # Handshake base port
+        # Handshake base port.  Must match the workers' calculation exactly.
+        dp_port_offset = get_dp_side_channel_port_offset(parallel_config)
         self.side_channel_port = (
             vllm_config.kv_transfer_config.kv_port + dp_port_offset
+        )
+        logger.debug(
+            "MooncakeHybridConnector scheduler dp_rank=%d kv_port=%d "
+            "dp_port_offset=%d side_channel_port=%d.",
+            parallel_config.data_parallel_rank,
+            vllm_config.kv_transfer_config.kv_port,
+            dp_port_offset,
+            self.side_channel_port,
         )
         # Requests that need to start recv.
         # New requests are added by update_state_after_alloc in
@@ -1480,14 +1542,41 @@ class MooncakeConnectorScheduler:
         """
         Set the KV connector handshake metadata for this connector.
 
+        The mapping is keyed by the worker's global port offset
+        (``handshake_port - kv_port``).  Under heterogeneous TP that offset
+        is cumulative (0/3/7/11 for tp=[3,4,4,4]) and can no longer be
+        reconstructed from the local TP rank alone.
+
         Args:
             metadata (dict): the handshake metadata to set.
         """
+        if not metadata:
+            return
+
+        kv_port = self.vllm_config.kv_transfer_config.kv_port
+        updated_mapping: dict[str, dict[str, Any]] = {}
         for local_rank, rank_metadata in metadata.items():
-            self.multi_nodes_meta_mapping[str(local_rank)] = {
+            handshake_port = getattr(rank_metadata, "handshake_port", 0)
+            if handshake_port > 0:
+                port_offset = handshake_port - kv_port
+            else:
+                # Backward compatibility with older producers that did not
+                # publish handshake_port in MooncakeAgentMetadata.
+                port_offset = int(local_rank)
+            updated_mapping[str(port_offset)] = {
                 "host": rank_metadata.local_ip,
                 "engine_id": rank_metadata.engine_id,
+                "handshake_port": kv_port + port_offset,
             }
+
+        self.multi_nodes_meta_mapping.update(updated_mapping)
+        logger.info(
+            "MooncakeHybridConnector set_xfer_handshake_metadata: "
+            "worker_count=%d, updated=%s, multi_nodes_meta_mapping=%s.",
+            len(metadata),
+            updated_mapping,
+            self.multi_nodes_meta_mapping,
+        )
 
 
 class MooncakeConnectorWorker:
@@ -1496,6 +1585,16 @@ class MooncakeConnectorWorker:
     def __init__(self, vllm_config: VllmConfig, engine_id: str, kv_cache_config: KVCacheConfig):
         self._get_prefill_decode_size(vllm_config)
         os.environ["ASCEND_TRANSFER_TIMEOUT"] = str(get_transfer_timeout_value())
+        # ADXL link establishment defaults to only 10s.  Heterogeneous P/D
+        # pools start many TransferEngines concurrently (15 producer + 16
+        # consumer workers), so the first cross-node HcclCommPrepare can
+        # exceed the default and surface as E19999/HCCL_E_TIMEOUT (ret 0x9)
+        # even though the peer is healthy.  Keep an explicit user-provided
+        # value, otherwise align the connect timeout with the transfer
+        # timeout.
+        os.environ.setdefault(
+            "ASCEND_CONNECT_TIMEOUT", str(get_transfer_timeout_value())
+        )
         if self._prefill_tp_size < self._decode_tp_size:
             raise ValueError(
                 f"prefill_tp_size: {self._prefill_tp_size} must be greater than"
@@ -1564,24 +1663,24 @@ class MooncakeConnectorWorker:
         self._mamba_ssm_size = mamba_ssm_size
         self.use_compress = hasattr(self.vllm_config.model_config.hf_config, "compress_ratios")
 
-        # Handshake base port.  Under heterogeneous TP the DP ranks use the
-        # cumulative device offset (0/3/7/11 for tp=[3,4,4,4]), not the
-        # uniform dp_rank * local_tp_size stride.
-        if parallel_config.is_heterogeneous_tp:
-            dp_port_offset = parallel_config.get_rank_offset_for_dp(
-                parallel_config.data_parallel_rank
-            )
-        else:
-            dp_port_offset = (
-                parallel_config.data_parallel_rank
-                * parallel_config.tensor_parallel_size
-                * parallel_config.pipeline_parallel_size
-            )
+        # Handshake base port.  Must match MooncakeConnectorScheduler
+        # exactly; under heterogeneous TP that is the cumulative device
+        # offset (0/3/7/11 for tp=[3,4,4,4]).
+        dp_port_offset = get_dp_side_channel_port_offset(parallel_config)
         self.side_channel_port = (
             vllm_config.kv_transfer_config.kv_port + dp_port_offset
         )
         device_index = self.pp_rank * self.tp_size + self.tp_rank
         self.handshake_port = self.side_channel_port + device_index
+        logger.debug(
+            "MooncakeHybridConnector worker dp_rank=%d tp_rank=%d "
+            "dp_port_offset=%d side_channel_port=%d handshake_port=%d.",
+            parallel_config.data_parallel_rank,
+            self.tp_rank,
+            dp_port_offset,
+            self.side_channel_port,
+            self.handshake_port,
+        )
         self.sockets: dict = {}
         self.engine = global_te.get_transfer_engine(self.side_channel_host, device_name=None)
         self.te_rpc_port = self.engine.get_rpc_port()
@@ -1729,8 +1828,10 @@ class MooncakeConnectorWorker:
             kv_caches_base_addr=self.kv_caches_base_addr,
             num_blocks=self.num_blocks,
             block_lens=self.block_len_per_addr,
+            block_strides=self.block_stride_per_addr,
             ssm_sizes=self._mamba_ssm_size,
             local_ip=get_ip(),
+            handshake_port=self.handshake_port,
         )
         self.xfer_handshake_metadata = metadata
 
@@ -1739,7 +1840,7 @@ class MooncakeConnectorWorker:
             self.kv_send_thread = KVCacheSendingThread(
                 self.vllm_config,
                 self.tp_rank,
-                self._prefill_tp_size,
+                self.tp_size,
                 self.engine_id,
                 self.side_channel_host,
                 self.side_channel_port,
@@ -1819,10 +1920,44 @@ class MooncakeConnectorWorker:
             prefill_tp_size = meta.remote_ptp_size if getattr(meta, "remote_ptp_size", None) else self._prefill_tp_size
             tp_num_need_pulls = self._get_tp_num_need_pulls(prefill_tp_size)
             remote_req_id = meta.remote_request_id
+            logger.debug(
+                "start_load_kv request %s: remote_ptp_size=%s "
+                "tp_num_need_pulls=%s remote_port=%s remote_host=%s.",
+                remote_req_id,
+                prefill_tp_size,
+                tp_num_need_pulls,
+                meta.remote_port,
+                meta.remote_host,
+            )
+
+            def _validate_chosen_ranks(chosen_rank_list: list[int]) -> None:
+                if any(
+                    rank < 0 or rank >= prefill_tp_size
+                    for rank in chosen_rank_list
+                ):
+                    raise RuntimeError(
+                        f"MooncakeHybridConnector selected invalid prefill TP "
+                        f"rank {chosen_rank_list} for prefill_tp_size="
+                        f"{prefill_tp_size}, request={remote_req_id}."
+                    )
+                expected_pulls = (
+                    1
+                    if self.use_mamba
+                    else tp_num_need_pulls * self._prefill_pp_size
+                )
+                if len(chosen_rank_list) < expected_pulls:
+                    raise RuntimeError(
+                        "MooncakeHybridConnector selected "
+                        f"{len(chosen_rank_list)} prefill TP ranks but "
+                        f"expected {expected_pulls} pulls for prefill_tp_size="
+                        f"{prefill_tp_size}, decode_tp_size={self.tp_size}, "
+                        f"request={remote_req_id}."
+                    )
 
             if self.use_mamba:
                 assert self.kv_recv_thread is not None
                 chosen_rank_list = self._get_remote_rank(remote_req_id, prefill_tp_size)
+                _validate_chosen_ranks(chosen_rank_list)
                 remote_handshake_port_list = [[x + meta.remote_port] for x in chosen_rank_list]
                 remote_host, remote_engine_id = self._get_remote_host_info_by_port(
                     meta.remote_port,
@@ -1845,6 +1980,7 @@ class MooncakeConnectorWorker:
                 )
             else:  # TODO: support prefill context parallel and pipeline parallel open at the same time
                 chosen_rank_list = self._get_remote_rank(remote_req_id, prefill_tp_size)
+                _validate_chosen_ranks(chosen_rank_list)
                 remote_handshake_port_list = [[x + meta.remote_port] for x in chosen_rank_list]
                 for i in range(tp_num_need_pulls * self._prefill_pp_size):
                     assert self.kv_recv_thread is not None
@@ -1914,11 +2050,38 @@ class MooncakeConnectorWorker:
         remote_engine_id: str,
         remote_multi_nodes_meta_mapping: dict,
     ):
-        rank = str(remote_handshake_port - base_port)
-        if remote_multi_nodes_meta_mapping is None or remote_multi_nodes_meta_mapping.get(rank) is None:
+        if remote_multi_nodes_meta_mapping is None:
             return remote_host, remote_engine_id
-        info = remote_multi_nodes_meta_mapping[rank]
-        return info.get("host", remote_host), info.get("engine_id", remote_engine_id)
+
+        # Producers publish the absolute handshake_port in their metadata.
+        # Match on it first: producer and consumer kv_port values are allowed
+        # to differ (e.g. prefill 36000 vs decode 36200), and under
+        # heterogeneous TP only the absolute port identifies a worker
+        # unambiguously across DP ranks.
+        for info in remote_multi_nodes_meta_mapping.values():
+            if (
+                isinstance(info, dict)
+                and info.get("handshake_port") == remote_handshake_port
+            ):
+                return (
+                    info.get("host", remote_host),
+                    info.get("engine_id", remote_engine_id),
+                )
+
+        # Legacy mappings are keyed by the producer's kv_port offset or by
+        # the DP-local rank.
+        kv_port = self.vllm_config.kv_transfer_config.kv_port
+        rank = str(remote_handshake_port - kv_port)
+        info = remote_multi_nodes_meta_mapping.get(rank)
+        if info is None:
+            rank = str(remote_handshake_port - base_port)
+            info = remote_multi_nodes_meta_mapping.get(rank)
+        if info is None:
+            return remote_host, remote_engine_id
+        return (
+            info.get("host", remote_host),
+            info.get("engine_id", remote_engine_id),
+        )
 
     def _prefill_get_remote_rank(self, req_id: str) -> list[int]:
         # This method is only used on the producer side (see start_load_kv).
