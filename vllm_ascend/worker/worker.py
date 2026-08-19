@@ -393,38 +393,6 @@ class NPUWorker(WorkerBase):
         self.cache_config.num_cpu_blocks = num_cpu_blocks
 
     def _init_device(self):
-        # Heterogeneous DP/TP: the launcher may pass the global TP size as
-        # --tensor-parallel-size while only making tp_size(dp) devices
-        # visible to this process.  Re-derive BOTH tensor_parallel_size and
-        # world_size from heterogeneous_dp_config before the visible-device
-        # check.  Do not rely on ParallelConfig.__post_init__: the config may
-        # have been reconstructed/deserialized in the worker process with a
-        # stale world_size field.
-        parallel_config = self.parallel_config
-        if parallel_config.is_heterogeneous_tp:
-            dp_rank = parallel_config.data_parallel_rank
-            expected_tp = parallel_config.get_tp_size_for_dp(dp_rank)
-            expected_world_size = (
-                parallel_config.pipeline_parallel_size
-                * expected_tp
-                * parallel_config.prefill_context_parallel_size
-            )
-            if (
-                parallel_config.tensor_parallel_size != expected_tp
-                or parallel_config.world_size != expected_world_size
-            ):
-                logger.warning_once(
-                    "Correcting heterogeneous parallel config for DP rank "
-                    "%d: tensor_parallel_size %s -> %s, world_size %s -> %s.",
-                    dp_rank,
-                    parallel_config.tensor_parallel_size,
-                    expected_tp,
-                    parallel_config.world_size,
-                    expected_world_size,
-                )
-                parallel_config.tensor_parallel_size = expected_tp
-                parallel_config.world_size = expected_world_size
-
         if not vllm_version_is("0.23.0"):
             # vLLM v0.24.0 (PR #45026) removed automatic per-process device
             # isolation for DP workers. Mirror gpu_worker.py::init_device:
@@ -522,11 +490,7 @@ class NPUWorker(WorkerBase):
             assert self.parallel_config.local_world_size <= visible_device_count, (
                 f"local_world_size ({self.parallel_config.local_world_size}) must "
                 f"be less than or equal to the number of visible devices "
-                f"({visible_device_count}). "
-                f"dp_rank={self.parallel_config.data_parallel_rank}, "
-                f"tp_size={self.parallel_config.tensor_parallel_size}, "
-                f"heterogeneous_tp="
-                f"{self.parallel_config.is_heterogeneous_tp}."
+                f"({visible_device_count})."
             )
 
         # Initialize the distributed environment.
