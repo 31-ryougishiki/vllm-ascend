@@ -1606,10 +1606,23 @@ class MooncakeConnectorWorker:
             "MC_TRANSFER_TIMEOUT",
             str(max(60, connect_timeout_ms // 1000 + 60)),
         )
-        if self._prefill_tp_size < self._decode_tp_size:
+        # DeepSeek V3.2/V4 DSA stores a full (replicated) KV cache on every
+        # prefill TP rank, so any supported prefill/decode TP ratio is legal
+        # there (including prefill_tp < decode_tp). Other attention layouts
+        # still require each decode rank to pull and concatenate prefill TP
+        # slices, i.e. prefill_tp >= decode_tp.
+        self._kv_replicated_across_prefill_tp = hasattr(
+            vllm_config.model_config.hf_text_config, "index_topk"
+        )
+        if (
+            self._prefill_tp_size < self._decode_tp_size
+            and not self._kv_replicated_across_prefill_tp
+        ):
             raise ValueError(
                 f"prefill_tp_size: {self._prefill_tp_size} must be greater than"
-                f" or equal to the decode_tp_size: {self._decode_tp_size}"
+                f" or equal to the decode_tp_size: {self._decode_tp_size} "
+                "(except for DeepSeek DSA models, whose KV cache is replicated "
+                "across prefill TP ranks)."
             )
 
         # Metadata.
@@ -2132,9 +2145,48 @@ class MooncakeConnectorWorker:
                 tp_sampled_nums.append(slice.tolist())
         return tp_sampled_nums
 
+    def _get_sparse_remote_ranks_for_req(
+        self, req_id: str, prefill_tp_size: int
+    ) -> list[list[int]]:
+        """Select one prefill TP rank for every local decode TP rank.
+
+        DeepSeek DSA-CP writes a full KV cache replica on every prefill TP
+        rank, so a decode rank can pull any single prefill rank for arbitrary
+        prefill/decode TP combinations (including prefill_tp < decode_tp).
+        ``random.Random(seed)`` keeps the choice identical on the producer
+        (used for delayed-free tracking) and on every consumer.
+        """
+        if self._prefill_pp_size != 1:
+            raise NotImplementedError(
+                "DeepSeek DSA sparse rank selection currently requires "
+                "prefill_pp_size=1."
+            )
+        if (
+            self.kv_role == "kv_consumer"
+            and self.tp_size != self._decode_tp_size
+        ):
+            raise NotImplementedError(
+                "DeepSeek DSA sparse rank selection currently requires a "
+                "uniform decode TP size (local tp_size must equal the "
+                "decode pool tp_size descriptor)."
+            )
+        rng = random.Random(string_to_int64_hash(req_id))
+        return [
+            [rng.randrange(prefill_tp_size)]
+            for _ in range(self._decode_tp_size)
+        ]
+
     def _get_remote_ranks_for_req(self, req_id: str, prefill_tp_size: int | None = None) -> list[list[int]]:
         if prefill_tp_size is None:
             prefill_tp_size = self._prefill_tp_size
+
+        if (
+            self._kv_replicated_across_prefill_tp
+            and prefill_tp_size != self._decode_tp_size
+        ):
+            return self._get_sparse_remote_ranks_for_req(
+                req_id, prefill_tp_size
+            )
 
         # Divide the ports according to the TP within the PP
         sampled_nums = []

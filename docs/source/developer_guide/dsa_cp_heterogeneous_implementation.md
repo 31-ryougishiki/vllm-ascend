@@ -658,6 +658,11 @@ rank0 recv:
   `_build_local_token_metadata` 会自动跟随 `parallel_config` 计算。
 - PD 场景下 `enable_reduce_sample` 按官方文档不支持，DSA-CP 与 PD
   同时开启时 rejection sampler 会走全量 logits fallback，属预期路径。
+- prefill/decode 的 dp、tp 可任意搭配（受 DSA-CP 原支持的 TP 范围约束）。
+  DeepSeek-V4 的 KV cache 在每个 prefill TP rank 上全量复制，
+  `MooncakeHybridConnector` 不再要求 `prefill_tp >= decode_tp`；
+  `prefill_tp < decode_tp` 时每个 decode rank 按请求哈希选择一个 prefill
+  TP rank。
 - A3 目标脚本使用 `--enforce-eager`，非均匀 `all_to_all_single` 使用
   eager 动态 shape；如需图模式，需要额外确认 ACL graph 对
   `output_split_sizes/input_split_sizes` 的静态化支持。
