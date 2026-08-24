@@ -1311,6 +1311,7 @@ class AscendDSACPImpl(DSAAttentionImpl):
         else:
             (swa_metadata,) = attn_metadata
         common_attn_metadata = attn_metadata[0]
+        has_prefill = _has_prefill(common_attn_metadata.attn_state)
 
         hidden_states = torch.ops.vllm.maybe_all_gather_and_maybe_unpad(hidden_states_local, need_gather_q_kv)
 
@@ -1334,7 +1335,6 @@ class AscendDSACPImpl(DSAAttentionImpl):
         actual_seq_lengths_query = req_metadata.query_start_loc
         local_seq_lengths_query = cp_metadata.local_query_start_loc
         local_seq_lengths_key = cp_metadata.local_seq_lens
-        has_prefill = _has_prefill(common_attn_metadata.attn_state)
         hidden_states_cache = hidden_states[: common_attn_metadata.num_actual_tokens]
 
         if (not isinstance(self.wq_b.quant_method, AscendUnquantizedLinearMethod)) and isinstance(
