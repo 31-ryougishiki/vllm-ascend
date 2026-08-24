@@ -17,6 +17,7 @@ from vllm.v1.kv_cache_interface import AttentionSpec
 from vllm_ascend.ascend_config import get_ascend_config
 from vllm_ascend.attention.abstract import DSAAttentionImpl
 from vllm_ascend.attention.attention_mask import AttentionMaskBuilder
+from vllm_ascend.attention.dsa_timing import dsa_timer, scenario_for_ratio
 from vllm_ascend.attention.attention_v1 import AscendAttentionState
 from vllm_ascend.attention.utils import (
     AscendCommonAttentionMetadata,
@@ -1722,6 +1723,14 @@ class AscendDSAImpl(DSAAttentionImpl):
         cos = attn_metadata[0].cos[layer_name]
         sin = attn_metadata[0].sin[layer_name]
 
+        if has_prefill:
+            dsa_timer.mark_start(
+                layer_name,
+                "output",
+                scenario_for_ratio(self.compress_ratio),
+                actual_tokens,
+                attn_metadata[0].attn_state,
+            )
         torch.ops._C_ascend.inplace_partial_rotary_mul(
             o_proj_input.unsqueeze(1),
             cos,
@@ -1732,6 +1741,8 @@ class AscendDSAImpl(DSAAttentionImpl):
 
         # o
         self._forward_o_proj(o_proj_input, output)
+        if has_prefill:
+            dsa_timer.mark_end(layer_name, "output")
 
         maybe_save_kv_layer_to_connector(layer_name, list(kv_cache))
 
@@ -1867,6 +1878,13 @@ class AscendDSAImpl(DSAAttentionImpl):
         sin = common_prefill_metadata.sin[layer_name]
         actual_seq_lengths_query = common_prefill_metadata.query_start_loc
         actual_seq_lengths_key = common_prefill_metadata.seq_lens
+        dsa_timer.mark_start(
+            layer_name,
+            "prolog",
+            scenario_for_ratio(self.compress_ratio),
+            attn_metadata[0].num_actual_tokens,
+            attn_metadata[0].attn_state,
+        )
 
         if self.multistream_dsv4_dsa_overlap:
             # mla prolog: q + kv dual-stream parallel
@@ -1945,11 +1963,19 @@ class AscendDSAImpl(DSAAttentionImpl):
         attn_op = DeviceOperator.get_dsa_sparse_attn_op()
         extra_attn_kwargs: dict = DeviceOperator.get_dsa_sparse_attn_base_kwargs()
         DeviceOperator.add_dsa_sparse_attn_extra_kwargs(extra_attn_kwargs, cu_seqlens_ori_kv=actual_seq_lengths_query)
+        dsa_timer.mark_end(layer_name, "prolog")
 
         if self.compress_ratio <= 1:
             notify_kv_cache_written(layer_name)
             record_attention_compute_start()
-            return attn_op(
+            dsa_timer.mark_start(
+                layer_name,
+                "attention",
+                scenario_for_ratio(self.compress_ratio),
+                attn_metadata[0].num_actual_tokens,
+                attn_metadata[0].attn_state,
+            )
+            attn_output = attn_op(
                 q,
                 ori_kv=swa_kv_cache,
                 ori_block_table=swa_prefill_metadata.block_table,
@@ -1966,6 +1992,8 @@ class AscendDSAImpl(DSAAttentionImpl):
                 layout_kv="PA_ND",
                 **extra_attn_kwargs,
             )[0]
+            dsa_timer.mark_end(layer_name, "attention")
+            return attn_output
 
         if self.compress_ratio > 1:
             compressor_prefill_metadata = _require_prefill_metadata(compressor_attn_metadata)
@@ -1981,6 +2009,13 @@ class AscendDSAImpl(DSAAttentionImpl):
                 if self.skip_topk:
                     compress_topk_idxs = self._get_indexcache_topk_indices(prefill_num_tokens, offset=prefill_offset)
                 else:
+                    dsa_timer.mark_start(
+                        layer_name,
+                        "indexer",
+                        scenario_for_ratio(self.compress_ratio),
+                        attn_metadata[0].num_actual_tokens,
+                        attn_metadata[0].attn_state,
+                    )
                     if self.multistream_dsv4_dsa_overlap:
                         indexer_q = self.cv_indexer_select_qli(  # multistream version
                             x=hidden_states,
@@ -2005,7 +2040,15 @@ class AscendDSAImpl(DSAAttentionImpl):
                             with_prefill=True,
                             qr_pertoken_scale=qr_pertoken_scale,
                         )
+                        dsa_timer.mark_end(layer_name, "indexer")
 
+            dsa_timer.mark_start(
+                layer_name,
+                "compressor",
+                scenario_for_ratio(self.compress_ratio),
+                attn_metadata[0].num_actual_tokens,
+                attn_metadata[0].attn_state,
+            )
             coff = 2 if self.compressor_overlap else 1
             compress_cos, compress_sin, compress_slot_mapping = self._compute_compressor_metadata(
                 compressor_prefill_metadata,
@@ -2050,6 +2093,7 @@ class AscendDSAImpl(DSAAttentionImpl):
             # instead of passing None; A5 scatter dereferences x.view().
             if compressed_kv.shape[0] > 0:
                 DeviceOperator.dsa_kv_compress_scatter(compress_kv_cache, compressed_kv, compress_slot_mapping)
+            dsa_timer.mark_end(layer_name, "compressor")
 
             if self.multistream_dsv4_dsa_overlap and self.compress_ratio == 4 and not self.skip_topk:
                 # Wait aux_stream weights_proj done, then compute dot
@@ -2082,6 +2126,7 @@ class AscendDSAImpl(DSAAttentionImpl):
                     cmp_ratio=4,
                     return_value=False,
                 )
+                dsa_timer.mark_end(layer_name, "indexer")
 
             if self.compress_ratio == 4 and self.use_index_cache:
                 self._update_indexcache_topk_indices(compress_topk_idxs, offset=prefill_offset)
@@ -2092,6 +2137,13 @@ class AscendDSAImpl(DSAAttentionImpl):
             if self.compress_ratio == 4:
                 DeviceOperator.add_dsa_sparse_attn_extra_kwargs(
                     extra_attn_kwargs, cu_seqlens_cmp_kv=common_prefill_metadata.cu_c4_cmp_seqlen_list
+                )
+                dsa_timer.mark_start(
+                    layer_name,
+                    "attention",
+                    scenario_for_ratio(self.compress_ratio),
+                    attn_metadata[0].num_actual_tokens,
+                    attn_metadata[0].attn_state,
                 )
                 attn_output = attn_op(
                     q,
@@ -2114,9 +2166,17 @@ class AscendDSAImpl(DSAAttentionImpl):
                     layout_kv="PA_ND",
                     **extra_attn_kwargs,
                 )[0]
+                dsa_timer.mark_end(layer_name, "attention")
             else:
                 DeviceOperator.add_dsa_sparse_attn_extra_kwargs(
                     extra_attn_kwargs, cu_seqlens_cmp_kv=common_prefill_metadata.cu_c128_cmp_seqlen_list
+                )
+                dsa_timer.mark_start(
+                    layer_name,
+                    "attention",
+                    scenario_for_ratio(self.compress_ratio),
+                    attn_metadata[0].num_actual_tokens,
+                    attn_metadata[0].attn_state,
                 )
                 attn_output = attn_op(
                     q,
@@ -2138,6 +2198,7 @@ class AscendDSAImpl(DSAAttentionImpl):
                     layout_kv="PA_ND",
                     **extra_attn_kwargs,
                 )[0]
+                dsa_timer.mark_end(layer_name, "attention")
         return attn_output
 
     def _forward_decode(

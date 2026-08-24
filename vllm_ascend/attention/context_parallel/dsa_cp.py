@@ -13,6 +13,7 @@ from vllm.v1.kv_cache_interface import AttentionSpec
 
 from vllm_ascend.attention.abstract import DSAAttentionImpl
 from vllm_ascend.attention.attention_v1 import AscendAttentionState
+from vllm_ascend.attention.dsa_timing import dsa_timer, scenario_for_ratio
 from vllm_ascend.attention.utils import (
     AscendCommonAttentionMetadata,
     maybe_save_kv_layer_to_connector,
@@ -1205,6 +1206,7 @@ class AscendDSACPImpl(DSAAttentionImpl):
         if not isinstance(attn_metadata, list):
             attn_metadata = [attn_metadata]
         wait_for_kv_layer_from_connector(layer_name)
+        has_prefill = _has_prefill(attn_metadata[0].attn_state)
         full_gather_wo_a_enabled = (
             self.tp_size > 1
             and self.enable_dsa_cp_with_o_proj_tp
@@ -1222,6 +1224,14 @@ class AscendDSACPImpl(DSAAttentionImpl):
             need_gather_q_kv,
             full_gather_wo_a_enabled,
         )
+        if has_prefill:
+            dsa_timer.mark_start(
+                layer_name,
+                "output",
+                scenario_for_ratio(self.compress_ratio),
+                attn_metadata[0].num_actual_tokens,
+                attn_metadata[0].attn_state,
+            )
         o_proj_input = self._restore_tp_head_layout(
             local_attn_output,
             layer_name,
@@ -1274,6 +1284,8 @@ class AscendDSACPImpl(DSAAttentionImpl):
         finally:
             if full_gather_wo_a_enabled:
                 self._switch_o_proj_to_tp_weight()
+        if has_prefill:
+            dsa_timer.mark_end(layer_name, "output")
 
         maybe_save_kv_layer_to_connector(layer_name, list(kv_cache))
 
@@ -1301,6 +1313,15 @@ class AscendDSACPImpl(DSAAttentionImpl):
         common_attn_metadata = attn_metadata[0]
 
         hidden_states = torch.ops.vllm.maybe_all_gather_and_maybe_unpad(hidden_states_local, need_gather_q_kv)
+
+        if has_prefill:
+            dsa_timer.mark_start(
+                layer_name,
+                "prolog",
+                scenario_for_ratio(self.compress_ratio),
+                common_attn_metadata.num_actual_tokens,
+                common_attn_metadata.attn_state,
+            )
 
         assert common_attn_metadata.req_metadata is not None
         assert swa_metadata.req_metadata is not None
@@ -1388,12 +1409,22 @@ class AscendDSACPImpl(DSAAttentionImpl):
             partial_slice=[self.nope_head_dim, self.head_dim],
         )
         DeviceOperator.dsa_kv_compress_scatter(swa_kv_cache, kv, swa_metadata.req_metadata.slot_mapping)
+        if has_prefill:
+            dsa_timer.mark_end(layer_name, "prolog")
 
         compress_topk_idxs = None
         if self.compress_ratio > 1:
             assert compressor_attn_metadata.req_metadata is not None
             assert compressor_kv_state_metadata.req_metadata is not None
             if self.compress_ratio == 4:
+                if has_prefill:
+                    dsa_timer.mark_start(
+                        layer_name,
+                        "indexer",
+                        scenario_for_ratio(self.compress_ratio),
+                        common_attn_metadata.num_actual_tokens,
+                        common_attn_metadata.attn_state,
+                    )
                 self._update_indexer_cache(
                     x=hidden_states_cache,
                     kv_cache=kv_cache,
@@ -1411,7 +1442,17 @@ class AscendDSACPImpl(DSAAttentionImpl):
                     actual_seq_lengths_key=local_seq_lengths_key,
                     qr_pertoken_scale=qr_pertoken_scale_local,
                 )
+                if has_prefill:
+                    dsa_timer.mark_end(layer_name, "indexer")
 
+            if has_prefill:
+                dsa_timer.mark_start(
+                    layer_name,
+                    "compressor",
+                    scenario_for_ratio(self.compress_ratio),
+                    common_attn_metadata.num_actual_tokens,
+                    common_attn_metadata.attn_state,
+                )
             coff = 2 if self.compressor_overlap else 1
             compress_cos, compress_sin, compress_slot_mapping = self._compute_compressor_metadata(
                 compressor_attn_metadata.req_metadata,
@@ -1440,6 +1481,8 @@ class AscendDSACPImpl(DSAAttentionImpl):
             if compressed_kv.numel() == 0:
                 compressed_kv = None
             DeviceOperator.dsa_kv_compress_scatter(compress_kv_cache, compressed_kv, compress_slot_mapping)
+            if has_prefill:
+                dsa_timer.mark_end(layer_name, "compressor")
 
         notify_kv_cache_written(layer_name)
         record_attention_compute_start()
@@ -1465,6 +1508,14 @@ class AscendDSACPImpl(DSAAttentionImpl):
         )
 
         if self.compress_ratio <= 1:
+            if has_prefill:
+                dsa_timer.mark_start(
+                    layer_name,
+                    "attention",
+                    scenario_for_ratio(self.compress_ratio),
+                    common_attn_metadata.num_actual_tokens,
+                    common_attn_metadata.attn_state,
+                )
             attn_output = attn_op(
                 q,
                 ori_kv=swa_kv_cache,
@@ -1472,11 +1523,21 @@ class AscendDSACPImpl(DSAAttentionImpl):
                 metadata=swa_metadata.req_metadata.sas_metadata,
                 **common_attn_kwargs,
             )[0]
+            if has_prefill:
+                dsa_timer.mark_end(layer_name, "attention")
         elif self.compress_ratio == 4:
             assert compressor_attn_metadata.req_metadata is not None
             DeviceOperator.add_dsa_sparse_attn_extra_kwargs(
                 common_attn_kwargs, cu_seqlens_cmp_kv=req_metadata.cu_cmp_seqlen_list
             )
+            if has_prefill:
+                dsa_timer.mark_start(
+                    layer_name,
+                    "attention",
+                    scenario_for_ratio(self.compress_ratio),
+                    common_attn_metadata.num_actual_tokens,
+                    common_attn_metadata.attn_state,
+                )
             attn_output = attn_op(
                 q,
                 ori_kv=swa_kv_cache,
@@ -1488,11 +1549,21 @@ class AscendDSACPImpl(DSAAttentionImpl):
                 cmp_mask_mode=3,
                 **common_attn_kwargs,
             )[0]
+            if has_prefill:
+                dsa_timer.mark_end(layer_name, "attention")
         else:
             assert compressor_attn_metadata.req_metadata is not None
             DeviceOperator.add_dsa_sparse_attn_extra_kwargs(
                 common_attn_kwargs, cu_seqlens_cmp_kv=req_metadata.cu_cmp_seqlen_list
             )
+            if has_prefill:
+                dsa_timer.mark_start(
+                    layer_name,
+                    "attention",
+                    scenario_for_ratio(self.compress_ratio),
+                    common_attn_metadata.num_actual_tokens,
+                    common_attn_metadata.attn_state,
+                )
             attn_output = attn_op(
                 q,
                 ori_kv=swa_kv_cache,
@@ -1503,6 +1574,8 @@ class AscendDSACPImpl(DSAAttentionImpl):
                 cmp_mask_mode=3,
                 **common_attn_kwargs,
             )[0]
+            if has_prefill:
+                dsa_timer.mark_end(layer_name, "attention")
         return attn_output, o_proj_full_handles
 
     def _restore_tp_head_layout(

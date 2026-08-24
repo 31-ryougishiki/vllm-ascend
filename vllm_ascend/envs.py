@@ -110,6 +110,27 @@ env_variables: dict[str, Callable[[], Any]] = {
     # Control the aclrtMemcpyBatchAsync compile path for KV cache offloading.
     # "1": force enable, "0": force disable, None: auto-detect from CANN headers.
     "VLLM_ASCEND_ENABLE_BATCH_MEMCPY": lambda: os.getenv("VLLM_ASCEND_ENABLE_BATCH_MEMCPY", None),
+    # Whether to enable low-overhead NPU-event timing for DeepSeek V4 DSA
+    # attention phases. Intended for prefill performance comparison with
+    # additional_config.enable_dsa_cp on/off. The timer synchronizes once per
+    # VLLM_ASCEND_DSA_TIMING_WINDOW model forwards instead of once per layer.
+    "VLLM_ASCEND_DSA_TIMING": lambda: bool(int(os.getenv("VLLM_ASCEND_DSA_TIMING", "0"))),
+    # Number of model forwards collected before one torch.npu.synchronize()
+    # call. Larger values reduce measurement overhead; smaller values bound
+    # data loss if the process is killed early.
+    "VLLM_ASCEND_DSA_TIMING_WINDOW": lambda: int(os.getenv("VLLM_ASCEND_DSA_TIMING_WINDOW", "10")),
+    # Log a timing summary every this many flushed steps.
+    "VLLM_ASCEND_DSA_TIMING_LOG_INTERVAL": lambda: int(
+        os.getenv("VLLM_ASCEND_DSA_TIMING_LOG_INTERVAL", "50")
+    ),
+    # Directory where per-rank dsa_timing_raw_*.csv / dsa_timing_summary_*.csv
+    # files are written.
+    "VLLM_ASCEND_DSA_TIMING_OUTPUT_DIR": lambda: os.getenv(
+        "VLLM_ASCEND_DSA_TIMING_OUTPUT_DIR", "./dsa_timing"
+    ),
+    # Optional suffix for timing CSV file names, used to distinguish DP/TP
+    # ranks. The auto-exp launcher sets it to dp<rank>_tp<tp>.
+    "VLLM_ASCEND_DSA_TIMING_TAG": lambda: os.getenv("VLLM_ASCEND_DSA_TIMING_TAG", ""),
 }
 
 # end-env-vars-definition

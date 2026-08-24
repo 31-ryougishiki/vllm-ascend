@@ -73,6 +73,7 @@ from vllm.v1.attention.backends.mla.sparse_swa import DeepseekV4SWACache as Vllm
 from vllm.v1.kv_cache_interface import KVCacheSpec
 
 from vllm_ascend.ascend_config import get_ascend_config
+from vllm_ascend.attention.dsa_timing import dsa_timer
 from vllm_ascend.core.kv_cache_interface import AscendSlidingWindowMLASpec
 from vllm_ascend.ops.dsa import AscendDeepseekSparseAttention, DSAModules
 from vllm_ascend.ops.rope_dsv4 import ComplexExpRotaryEmbedding
@@ -1130,8 +1131,18 @@ class DeepseekV4Model(nn.Module):
 
         if get_pp_group().is_first_rank:
             hidden_states = hidden_states.unsqueeze(1).repeat(1, self.hc_mult, 1)  # (b, s, h) -> (b, s, c, h)
-        for layer in islice(self.layers, self.start_layer, self.end_layer):
-            hidden_states, residual = layer(positions, hidden_states, residual, llama_4_scaling)
+        timing_enabled = dsa_timer.enabled
+        if timing_enabled:
+            # One window starts here; every attention layer records NPU-event
+            # markers.  end_step() below performs at most one synchronization
+            # per VLLM_ASCEND_DSA_TIMING_WINDOW model forwards.
+            dsa_timer.begin_step()
+        try:
+            for layer in islice(self.layers, self.start_layer, self.end_layer):
+                hidden_states, residual = layer(positions, hidden_states, residual, llama_4_scaling)
+        finally:
+            if timing_enabled:
+                dsa_timer.end_step()
 
         # Stash pre-hc_head residual for the MTP draft (captured copy_).
         # When FlashComm1 (sequence parallelism) is enabled, tokens are
