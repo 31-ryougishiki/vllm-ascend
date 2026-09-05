@@ -183,6 +183,69 @@ class DSACPContext:
     slot_mapping_cp: torch.Tensor
     actual_seq_lengths_query: torch.Tensor
     actual_seq_lengths_key: torch.Tensor
+    # ---- zigzag CP balance（仅 prefill + C8 + 单序列可整分时启用）----
+    zigzag_index: torch.Tensor | None = None
+    inv_zigzag_index: torch.Tensor | None = None
+    zigzag_gather_index: torch.Tensor | None = None
+    q_half: int = 0
+    q_len_prev: torch.Tensor | None = None
+    q_len_next: torch.Tensor | None = None
+    kv_len_prev: torch.Tensor | None = None
+    kv_len_next: torch.Tensor | None = None
+
+
+def _can_zigzag(
+    attn_state: AscendAttentionState,
+    num_tokens: int,
+    num_tokens_pad: int,
+    cp_size: int,
+    num_reqs: int,
+    seq_len: int,
+) -> bool:
+    """最简 zigzag 条件：纯 prefill、单序列、无 pad/前缀、可被 2*cp 整除。"""
+    return (
+        cp_size > 1
+        and num_reqs == 1
+        and attn_state == AscendAttentionState.ChunkedPrefill
+        and num_tokens == num_tokens_pad
+        and num_tokens % (2 * cp_size) == 0
+        and seq_len == num_tokens
+    )
+
+
+def _build_zigzag_meta(
+    num_tokens: int, cp_size: int, cp_rank: int, device: torch.device
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, int, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    """单序列头尾配对：rank r 拿块 r（头）与块 2c-1-r（尾）。"""
+    half = num_tokens // (2 * cp_size)
+    prev_s = cp_rank * half
+    next_s = (2 * cp_size - 1 - cp_rank) * half
+    idx = torch.arange(num_tokens, device=device)
+
+    # 本地 Q 顺序：prev | next
+    zigzag_index = torch.cat([idx[prev_s : prev_s + half], idx[next_s : next_s + half]])
+    inv_zigzag_index = torch.argsort(zigzag_index)
+
+    # all_gather 后的全局顺序：[rank0_prev, rank0_next, rank1_prev, rank1_next, ...]
+    gather_parts = []
+    for r in range(cp_size):
+        p = r * half
+        n = (2 * cp_size - 1 - r) * half
+        gather_parts.append(idx[p : p + half])
+        gather_parts.append(idx[n : n + half])
+    zigzag_gather_index = torch.cat(gather_parts)
+
+    one = torch.tensor([half], device=device, dtype=torch.int32)
+    return (
+        zigzag_index,
+        inv_zigzag_index,
+        zigzag_gather_index,
+        half,
+        one,
+        one,
+        torch.tensor([prev_s + half], device=device, dtype=torch.int32),
+        torch.tensor([next_s + half], device=device, dtype=torch.int32),
+    )
 
 
 @dataclass
@@ -401,6 +464,40 @@ class AscendSFAMetadataBuilder(MLACommonMetadataBuilder[AscendSFAMetadata]):
             cos = cos[local_start:local_end_with_pad]
             sin = sin[local_start:local_end_with_pad]
 
+            zigzag_index = inv_zigzag_index = zigzag_gather_index = None
+            q_half = 0
+            q_len_prev = q_len_next = kv_len_prev = kv_len_next = None
+            if (
+                get_ascend_config().enable_sparse_sfa_c8
+                and _can_zigzag(
+                    common_attn_metadata.attn_state,
+                    num_tokens,
+                    num_tokens_pad,
+                    global_tp_size,
+                    num_reqs,
+                    int(seq_lens_cpu[0].item()) if num_reqs == 1 else -1,
+                )
+            ):
+                (
+                    zigzag_index,
+                    inv_zigzag_index,
+                    zigzag_gather_index,
+                    q_half,
+                    q_len_prev,
+                    q_len_next,
+                    kv_len_prev,
+                    kv_len_next,
+                ) = _build_zigzag_meta(
+                    num_tokens_pad,
+                    global_tp_size,
+                    get_tp_group().rank_in_group,
+                    slot_mapping.device,
+                )
+                # 本地 Q/KV 写地址改为头+尾两块
+                slot_mapping_cp = slot_mapping[zigzag_index]
+                cos = cos[zigzag_index]
+                sin = sin[zigzag_index]
+
             assert cos.shape[0] == num_tokens_per_device, (
                 f"cos.shape[0] must be equal to num_tokens_per_device, \
                     got {cos.shape[0]} and {num_tokens_per_device}"
@@ -460,6 +557,14 @@ class AscendSFAMetadataBuilder(MLACommonMetadataBuilder[AscendSFAMetadata]):
                 slot_mapping_cp=slot_mapping_cp,
                 actual_seq_lengths_query=actual_seq_lengths_query,
                 actual_seq_lengths_key=actual_seq_lengths_key,
+                zigzag_index=zigzag_index,
+                inv_zigzag_index=inv_zigzag_index if zigzag_index is not None else None,
+                zigzag_gather_index=zigzag_gather_index if zigzag_index is not None else None,
+                q_half=q_half if zigzag_index is not None else 0,
+                q_len_prev=q_len_prev if zigzag_index is not None else None,
+                q_len_next=q_len_next if zigzag_index is not None else None,
+                kv_len_prev=kv_len_prev if zigzag_index is not None else None,
+                kv_len_next=kv_len_next if zigzag_index is not None else None,
             )
 
         if get_ascend_config().c8_enable_reshape_optim:
@@ -1557,6 +1662,31 @@ class AscendSFAImpl(MLAAttentionImpl):
                 f"indexer_select_post_process should not be called when indexer is None. layer_name={self.layer_name}."
             )
 
+        q_li, q_li_scale, q_li_shape_ori, weights = self._indexer_qk_proj(x, q_c, cos, sin)
+
+        record_attention_compute_start()
+        return DeviceOperator.indexer_select_post_process(
+            self,
+            q_li,
+            q_li_scale,
+            q_li_shape_ori,
+            weights,
+            kv_cache,
+            attn_metadata,
+            actual_seq_lengths_query,
+            actual_seq_lengths_key,
+            self.enable_sparse_li_c8,
+            self.use_torch_npu_lightning_indexer,
+        )
+
+    def _indexer_qk_proj(
+        self,
+        x: torch.Tensor,
+        q_c: torch.Tensor | tuple[torch.Tensor, torch.Tensor],
+        cos: torch.Tensor,
+        sin: torch.Tensor,
+    ):
+        """Indexer 的 q/weights/k 投影与 RoPE（供单次/zigzag 两次调用复用）。"""
         assert self.wk_weights_proj is not None
         assert self.wq_b is not None
 
@@ -1611,20 +1741,52 @@ class AscendSFAImpl(MLAAttentionImpl):
             q_li, q_li_scale = torch_npu.npu_dynamic_quant(q_li.view(-1, self.head_dim), dst_type=self.c8_k_cache_dtype)
             q_li_scale = q_li_scale.to(self.c8_k_scale_cache_dtype)  # [b*s,]
 
-        record_attention_compute_start()
-        return DeviceOperator.indexer_select_post_process(
-            self,
-            q_li,
-            q_li_scale,
-            q_li_shape_ori,
-            weights,
-            kv_cache,
-            attn_metadata,
-            actual_seq_lengths_query,
-            actual_seq_lengths_key,
-            self.enable_sparse_li_c8,
-            self.use_torch_npu_lightning_indexer,
-        )
+        return q_li, q_li_scale, q_li_shape_ori, weights
+
+    def _indexer_select_post_process_zigzag(
+        self,
+        x: torch.Tensor,
+        q_c: torch.Tensor | tuple[torch.Tensor, torch.Tensor],
+        kv_cache: tuple[torch.Tensor, ...],
+        attn_metadata: M,
+        cos: torch.Tensor,
+        sin: torch.Tensor,
+    ) -> torch.Tensor:
+        """zigzag CP：q_li/weights 按 q_half 劈半，prev/next 各调一次 LightningIndexer。"""
+        ctx = attn_metadata.dsa_cp_context
+        assert ctx is not None and ctx.zigzag_index is not None
+        half = ctx.q_half
+
+        q_li, q_li_scale, q_li_shape_ori, weights = self._indexer_qk_proj(x, q_c, cos, sin)
+
+        parts = []
+        for h in range(2):
+            if q_li_shape_ori is None:
+                q_li_h = q_li[h * half : (h + 1) * half]
+            else:
+                # LI-C8 下 q_li 已展平为 [T*n_head, head_dim]
+                q_li_h = q_li[h * half * self.n_head : (h + 1) * half * self.n_head]
+            shape_h = (half, *q_li_shape_ori[1:]) if q_li_shape_ori is not None else None
+            scale_h = None
+            if q_li_scale is not None:
+                scale_h = q_li_scale[h * half * self.n_head : (h + 1) * half * self.n_head]
+            weights_h = weights[h * half : (h + 1) * half]
+            parts.append(
+                DeviceOperator.indexer_select_post_process(
+                    self,
+                    q_li_h,
+                    scale_h,
+                    shape_h,
+                    weights_h,
+                    kv_cache,
+                    attn_metadata,
+                    ctx.q_len_prev if h == 0 else ctx.q_len_next,
+                    ctx.kv_len_prev if h == 0 else ctx.kv_len_next,
+                    self.enable_sparse_li_c8,
+                    self.use_torch_npu_lightning_indexer,
+                )
+            )
+        return torch.cat(parts, dim=0)
 
     def _get_indexcache_topk_indices(self, num_tokens: int) -> torch.Tensor:
         if self.topk_indices_buffer is None:
@@ -1808,9 +1970,16 @@ class AscendSFAImpl(MLAAttentionImpl):
             if kv_cache is not None:
                 assert fused_kv_no_split is not None
                 if self.enable_sparse_sfa_c8:
+                    scatter_slots = slot_mapping_sfa[: attn_metadata.num_actual_tokens]
+                    if (
+                        attn_metadata.dsa_cp_context is not None
+                        and attn_metadata.dsa_cp_context.zigzag_gather_index is not None
+                    ):
+                        # all_gather 后的 fused_kv 是 [rank0_prev, rank0_next, rank1_prev, ...] 顺序
+                        scatter_slots = scatter_slots[attn_metadata.dsa_cp_context.zigzag_gather_index]
                     torch_npu.npu_scatter_nd_update_(
                         kv_cache[0].view(-1, fused_kv_no_split.shape[-1]),
-                        slot_mapping_sfa[: attn_metadata.num_actual_tokens].view(-1, 1),
+                        scatter_slots.view(-1, 1),
                         fused_kv_no_split[: attn_metadata.num_actual_tokens],
                     )
                     k_pe = None
@@ -2013,6 +2182,16 @@ class AscendSFAImpl(MLAAttentionImpl):
                 hidden_states = torch.ops.vllm.maybe_all_gather_and_maybe_unpad(
                     hidden_states.contiguous(), need_gather_q_kv
                 )
+            elif (
+                self.enable_dsa_cp
+                and attn_metadata.dsa_cp_context is not None
+                and attn_metadata.dsa_cp_context.zigzag_index is not None
+            ):
+                # zigzag CP balance：先 all-gather 全量 hidden，再取本 rank 的头+尾两块
+                hidden_states = torch.ops.vllm.maybe_all_gather_and_maybe_unpad(
+                    hidden_states.contiguous(), True
+                )
+                hidden_states = hidden_states[attn_metadata.dsa_cp_context.zigzag_index]
             qkv_lora = self.fused_qkv_a_proj(hidden_states)[0]
             q_c, kv_no_split = qkv_lora.split(
                 [self.q_lora_rank, self.kv_lora_rank + self.qk_rope_head_dim],
@@ -2099,9 +2278,15 @@ class AscendSFAImpl(MLAAttentionImpl):
                     attn_metadata.block_size,
                 )
             else:
+                idx_slots = slot_mapping
+                if (
+                    attn_metadata.dsa_cp_context is not None
+                    and attn_metadata.dsa_cp_context.zigzag_gather_index is not None
+                ):
+                    idx_slots = slot_mapping[attn_metadata.dsa_cp_context.zigzag_gather_index]
                 torch_npu.npu_scatter_nd_update_(
                     kv_cache[dsa_k_cache_idx].view(-1, k_li.shape[-1]),
-                    slot_mapping.view(-1, 1),
+                    idx_slots.view(-1, 1),
                     k_li.view(-1, k_li.shape[-1]),
                 )  # b, s, n, d
             if self.enable_sparse_li_c8:
@@ -2119,7 +2304,7 @@ class AscendSFAImpl(MLAAttentionImpl):
                     else:
                         torch_npu.npu_scatter_nd_update_(
                             kv_cache[dsa_k_scale_cache_idx].view(-1, k_li_scale.shape[-1]),
-                            slot_mapping.view(-1, 1),
+                            idx_slots.view(-1, 1),
                             k_li_scale.view(-1, k_li_scale.shape[-1]),
                         )
             notify_kv_cache_written(self.layer_name or "")
@@ -2138,28 +2323,62 @@ class AscendSFAImpl(MLAAttentionImpl):
             if not self.has_indexer:
                 raise RuntimeError(f"skip_topk is False but indexer is None. layer_name={self.layer_name}.")
             assert q_c is not None
-            topk_indices = self.indexer_select_post_process(
-                x=hidden_states,
-                q_c=q_c,
-                kv_cache=kv_cache,
-                attn_metadata=attn_metadata,
-                cos=cos,
-                sin=sin,
-                actual_seq_lengths_query=actual_seq_lengths_query,
-                actual_seq_lengths_key=actual_seq_lengths_key,
-            )
+            ctx = attn_metadata.dsa_cp_context
+            if ctx is not None and ctx.zigzag_index is not None:
+                topk_indices = self._indexer_select_post_process_zigzag(
+                    x=hidden_states,
+                    q_c=q_c,
+                    kv_cache=kv_cache,
+                    attn_metadata=attn_metadata,
+                    cos=cos,
+                    sin=sin,
+                )
+            else:
+                topk_indices = self.indexer_select_post_process(
+                    x=hidden_states,
+                    q_c=q_c,
+                    kv_cache=kv_cache,
+                    attn_metadata=attn_metadata,
+                    cos=cos,
+                    sin=sin,
+                    actual_seq_lengths_query=actual_seq_lengths_query,
+                    actual_seq_lengths_key=actual_seq_lengths_key,
+                )
             if self.use_index_cache:
                 self._update_indexcache_topk_indices(topk_indices)
 
-        attn_output = self._execute_sparse_flash_attention_process(
-            ql_nope,
-            q_pe,
-            kv_cache,
-            topk_indices,
-            attn_metadata,
-            actual_seq_lengths_query,
-            actual_seq_lengths_key,
-        )
+        ctx = attn_metadata.dsa_cp_context
+        if ctx is not None and ctx.zigzag_index is not None:
+            half = ctx.q_half
+            attn_prev = self._execute_sparse_flash_attention_process(
+                ql_nope[:half],
+                q_pe[:half],
+                kv_cache,
+                topk_indices[:half],
+                attn_metadata,
+                ctx.q_len_prev,
+                ctx.kv_len_prev,
+            )
+            attn_next = self._execute_sparse_flash_attention_process(
+                ql_nope[half:],
+                q_pe[half:],
+                kv_cache,
+                topk_indices[half:],
+                attn_metadata,
+                ctx.q_len_next,
+                ctx.kv_len_next,
+            )
+            attn_output = torch.cat([attn_prev, attn_next], dim=0)
+        else:
+            attn_output = self._execute_sparse_flash_attention_process(
+                ql_nope,
+                q_pe,
+                kv_cache,
+                topk_indices,
+                attn_metadata,
+                actual_seq_lengths_query,
+                actual_seq_lengths_key,
+            )
 
         attn_output = self._v_up_proj(attn_output)
 
@@ -2189,6 +2408,11 @@ class AscendSFAImpl(MLAAttentionImpl):
             self._forward_o_proj_tp(attn_output, output)
         else:
             output[...] = self.o_proj(attn_output)[0]
+
+        ctx = attn_metadata.dsa_cp_context
+        if ctx is not None and ctx.zigzag_index is not None:
+            # zigzag Q 顺序（prev|next）恢复为连续段顺序，层外无感知
+            output[...] = output[ctx.inv_zigzag_index]
 
         maybe_save_kv_layer_to_connector(layer_name, list(kv_cache))
 
