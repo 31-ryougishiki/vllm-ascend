@@ -79,6 +79,21 @@ if TYPE_CHECKING:
 # token count limits within bmm_transpose operator
 BMM_TRANS_MAX_SUPPORTED_TOKENS = 1024
 
+# Ascend NPU aclnnIndex does not implement float8 advanced indexing. The
+# zigzag KV/indexer paths therefore avoid tensor[index_tensor] for these
+# dtypes and reorder only the (int) slot mapping instead, letting the scatter
+# op skip padding rows through their -1 slots.
+_NPU_INDEX_UNSUPPORTED_FP8_DTYPES = tuple(
+    dtype
+    for dtype in (getattr(torch, "float8_e4m3fn", None), getattr(torch, "float8_e5m2", None))
+    if dtype is not None
+)
+
+
+def _supports_npu_advanced_index(dtype: torch.dtype) -> bool:
+    """Whether aclnnIndex supports ``tensor[index_tensor]`` for ``dtype``."""
+    return dtype not in _NPU_INDEX_UNSUPPORTED_FP8_DTYPES
+
 
 def _sfa_5_3_scope(name: str) -> Callable[[Callable[..., Any]], Callable[..., Any]]:
     """Add an optional profiler scope for the SFA-5.3 module regions.
@@ -2132,17 +2147,35 @@ class AscendSFAImpl(MLAAttentionImpl):
                     and dsa_cp_context.zigzag_gather_index is not None
                 ):
                     # all-gather order is [r0_prev, r0_next, r1_prev, ...].
-                    # Only write the real (non-padding) rows, in the order the
-                    # gathered tensor actually holds them.
-                    actual_gather_index = dsa_cp_context.zigzag_actual_gather_index
-                    actual_rows = dsa_cp_context.zigzag_actual_rows
-                    assert actual_gather_index is not None
-                    scatter_slots = slot_mapping_sfa[actual_gather_index]
-                    if dsa_cp_context.num_tokens != attn_metadata.num_actual_tokens:
-                        assert actual_rows is not None
-                        fused_kv_actual = fused_kv_no_split[actual_rows]
+                    if not _supports_npu_advanced_index(
+                        fused_kv_no_split.dtype
+                    ):
+                        # NPU advanced indexing does not support FP8: scatter
+                        # the full padded gather with reordered slots and let
+                        # padding rows be skipped via their -1 slot.
+                        scatter_slots = slot_mapping_sfa[
+                            dsa_cp_context.zigzag_gather_index
+                        ]
+                        fused_kv_actual = fused_kv_no_split
                     else:
-                        fused_kv_actual = fused_kv_no_split[: attn_metadata.num_actual_tokens]
+                        # Only write the real (non-padding) rows, in the order
+                        # the gathered tensor actually holds them.
+                        actual_gather_index = (
+                            dsa_cp_context.zigzag_actual_gather_index
+                        )
+                        actual_rows = dsa_cp_context.zigzag_actual_rows
+                        assert actual_gather_index is not None
+                        scatter_slots = slot_mapping_sfa[actual_gather_index]
+                        if (
+                            dsa_cp_context.num_tokens
+                            != attn_metadata.num_actual_tokens
+                        ):
+                            assert actual_rows is not None
+                            fused_kv_actual = fused_kv_no_split[actual_rows]
+                        else:
+                            fused_kv_actual = fused_kv_no_split[
+                                : attn_metadata.num_actual_tokens
+                            ]
                 else:
                     scatter_slots = slot_mapping_sfa[: attn_metadata.num_actual_tokens]
                     fused_kv_actual = fused_kv_no_split[: attn_metadata.num_actual_tokens]
@@ -2459,19 +2492,30 @@ class AscendSFAImpl(MLAAttentionImpl):
                     attn_metadata.dsa_cp_context is not None
                     and attn_metadata.dsa_cp_context.zigzag_gather_index is not None
                 ):
-                    actual_gather_index = attn_metadata.dsa_cp_context.zigzag_actual_gather_index
-                    actual_rows = attn_metadata.dsa_cp_context.zigzag_actual_rows
-                    assert actual_gather_index is not None
-                    idx_slots = slot_mapping[actual_gather_index]
-                    if k_li_to_write.shape[0] != attn_metadata.num_actual_tokens:
-                        assert actual_rows is not None
-                        k_li_to_write = k_li_to_write[actual_rows]
-                    if (
-                        k_li_scale_to_write is not None
-                        and k_li_scale_to_write.shape[0] != attn_metadata.num_actual_tokens
-                    ):
-                        assert actual_rows is not None
-                        k_li_scale_to_write = k_li_scale_to_write[actual_rows]
+                    if not _supports_npu_advanced_index(k_li_to_write.dtype):
+                        # FP8 advanced indexing is unsupported on NPU: write
+                        # the full padded gather with reordered slots; padding
+                        # rows are skipped through their -1 slot.
+                        idx_slots = slot_mapping[
+                            attn_metadata.dsa_cp_context.zigzag_gather_index
+                        ]
+                    else:
+                        actual_gather_index = (
+                            attn_metadata.dsa_cp_context.zigzag_actual_gather_index
+                        )
+                        actual_rows = attn_metadata.dsa_cp_context.zigzag_actual_rows
+                        assert actual_gather_index is not None
+                        idx_slots = slot_mapping[actual_gather_index]
+                        if k_li_to_write.shape[0] != attn_metadata.num_actual_tokens:
+                            assert actual_rows is not None
+                            k_li_to_write = k_li_to_write[actual_rows]
+                        if (
+                            k_li_scale_to_write is not None
+                            and k_li_scale_to_write.shape[0]
+                            != attn_metadata.num_actual_tokens
+                        ):
+                            assert actual_rows is not None
+                            k_li_scale_to_write = k_li_scale_to_write[actual_rows]
 
                 if use_li_c8_reshape_optim:
                     torch.ops._C_ascend.store_kv_block(

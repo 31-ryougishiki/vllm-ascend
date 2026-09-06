@@ -11,12 +11,25 @@ from vllm_ascend.attention.sfa_v1 import (
     AscendSFAImpl,
     _build_zigzag_meta,
     _can_zigzag,
+    _supports_npu_advanced_index,
 )
 from vllm_ascend.attention.sfa_v1 import ascend_envs
 from vllm_ascend.ascend_forward_context import (
     _disable_zigzag_metadata_for_fallback,
 )
 from vllm_ascend.layers import cp_zigzag as zigzag_cp
+
+
+def test_fp8_dtypes_are_not_advanced_indexed_on_npu():
+    # aclnnIndex does not implement float8; the zigzag KV/indexer writers
+    # detect these dtypes and fall back to full padded slot reordering.
+    if hasattr(torch, "float8_e4m3fn"):
+        assert not _supports_npu_advanced_index(torch.float8_e4m3fn)
+    if hasattr(torch, "float8_e5m2"):
+        assert not _supports_npu_advanced_index(torch.float8_e5m2)
+    assert _supports_npu_advanced_index(torch.bfloat16)
+    assert _supports_npu_advanced_index(torch.float16)
+    assert _supports_npu_advanced_index(torch.int8)
 
 
 def test_can_zigzag_requires_env_threshold_and_single_full_prefill():
