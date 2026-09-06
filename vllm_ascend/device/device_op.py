@@ -15,6 +15,7 @@
 # limitations under the License.
 # This file is a part of the vllm-ascend project.
 #
+import functools
 import os
 from typing import Any
 
@@ -23,6 +24,7 @@ import torch.nn.functional as F
 import torch_npu
 from vllm.logger import logger
 from vllm.triton_utils import HAS_TRITON
+from vllm.v1.utils import record_function_or_nullcontext
 
 from vllm_ascend.device import utils as device_utils
 from vllm_ascend.device.mxfp_compat import (
@@ -43,6 +45,20 @@ if HAS_TRITON:
     from vllm_ascend.ops.triton.rms_norm import triton_q_rms  # noqa: F811
 else:
     triton_q_rms = None  # type: ignore
+
+
+def _sfa_5_3_scope(name: str):
+    """Add an optional profiler scope for SFA-5.3 device modules."""
+
+    def decorator(func):
+        @functools.wraps(func)
+        def wrapper(*args: Any, **kwargs: Any) -> Any:
+            with record_function_or_nullcontext(name):
+                return func(*args, **kwargs)
+
+        return wrapper
+
+    return decorator
 
 
 class BaseDeviceAdaptor:
@@ -457,6 +473,7 @@ class BaseDeviceAdaptor:
         return hidden_states, ql_nope, q_pe, q_c
 
     @staticmethod
+    @_sfa_5_3_scope("SFA-5.3/07_device_indexer_post")
     def indexer_select_post_process(
         sfa_impl,
         q_li: torch.Tensor,
@@ -549,6 +566,7 @@ class BaseDeviceAdaptor:
         return topk_indices
 
     @classmethod
+    @_sfa_5_3_scope("SFA-5.3/08_device_sfa_process")
     def execute_sparse_flash_attention_process(
         cls,
         sfa_impl,
@@ -631,6 +649,7 @@ class BaseDeviceAdaptor:
             return result[0]
 
     @staticmethod
+    @_sfa_5_3_scope("SFA-5.3/08_device_kv_quant_sfa")
     def _execute_kv_quant_sparse_flash_attention(
         sfa_impl,
         ql_nope: torch.Tensor,
@@ -1041,6 +1060,7 @@ class A5DeviceAdaptor(BaseDeviceAdaptor):
         )
 
     @staticmethod
+    @_sfa_5_3_scope("SFA-5.3/08_a5_kv_quant_sfa")
     def _execute_kv_quant_sparse_flash_attention(
         sfa_impl,
         ql_nope: torch.Tensor,
@@ -1703,6 +1723,7 @@ class A5DeviceAdaptor(BaseDeviceAdaptor):
         return [8, 16, 128]
 
     @staticmethod
+    @_sfa_5_3_scope("SFA-5.3/07_a5_indexer_post")
     def indexer_select_post_process(
         sfa_impl,
         q_li: torch.Tensor,
