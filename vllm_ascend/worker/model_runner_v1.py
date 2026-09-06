@@ -149,11 +149,13 @@ from vllm_ascend.spec_decode.utils import (
     correct_optimistic_seq_lens_cpu,
     update_num_computed_tokens_for_batch_change,
 )
+from vllm_ascend import envs as ascend_envs
 from vllm_ascend.utils import (
     AscendDeviceType,
     calc_split_factor,
     check_gdn_layer,
     embedding_tp_enable,
+    enable_dsa_cp,
     enable_sfa_dcp_replicated_indexer,
     enable_sp,
     enable_sp_by_pass,
@@ -182,6 +184,7 @@ from vllm_ascend.ascend_forward_context import (  # isort: skip
 
 from vllm.model_executor.models.interfaces import supports_multimodal_pruning
 
+from vllm_ascend.layers.cp_zigzag import zigzag_gather_hidden_states_and_aux
 from vllm_ascend.sample.rejection_sampler import AscendRejectionSampler
 
 if TYPE_CHECKING:
@@ -2599,15 +2602,26 @@ class NPUModelRunner(GPUModelRunner):
             self._update_full_graph_params_if_needed(forward_context, num_tokens_padded)
 
         if forward_context.flash_comm_v1_enabled and not isinstance(hidden_states, IntermediateTensors):
-            hidden_states = self._all_gather_hidden_states_and_aux(hidden_states)
+            if getattr(forward_context, "zigzag_cp_active", False):
+                hidden_states = zigzag_gather_hidden_states_and_aux(hidden_states)
+            else:
+                hidden_states = self._all_gather_hidden_states_and_aux(hidden_states)
         return hidden_states
 
     def _pad_for_sequence_parallelism(self, num_scheduled_tokens: int) -> int:
-        # Pad tokens to multiple of tensor_parallel_size when
-        # enabled collective fusion for SP
+        # Pad tokens to a multiple of tensor_parallel_size when
+        # enabled collective fusion for SP. Zigzag CP splits each rank-local
+        # slice into a prev/next pair, so eligible prefills additionally pad
+        # to 2 * tp_size.
         tp_size = self.vllm_config.parallel_config.tensor_parallel_size
         if enable_sp(self.vllm_config) or enable_sp_by_pass():
-            return round_up(num_scheduled_tokens, tp_size)
+            align_size = tp_size
+            if (
+                enable_dsa_cp()
+                and num_scheduled_tokens >= ascend_envs.VLLM_ASCEND_CP_BALANCE_MIN_TOKENS
+            ):
+                align_size *= 2
+            return round_up(num_scheduled_tokens, align_size)
         return num_scheduled_tokens
 
     # These functions from upstream vllm handle PP+SP. Ascend's flashcomm1 SP

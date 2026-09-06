@@ -12,6 +12,7 @@ from vllm_ascend.attention.sfa_v1 import (
     _can_zigzag,
 )
 from vllm_ascend.attention.sfa_v1 import ascend_envs
+from vllm_ascend.layers import cp_zigzag as zigzag_cp
 
 
 def test_can_zigzag_requires_env_threshold_and_single_full_prefill():
@@ -48,77 +49,50 @@ def test_build_zigzag_meta_matches_sglang_zigzag_layout():
     torch.testing.assert_close(rank1["kv_len_next"], torch.tensor([12], dtype=torch.int32))
 
 
-def _make_impl(cp_size: int, rank: int) -> AscendSFAImpl:
+def test_zigzag_gather_index_reranges_to_natural_order():
+    meta = _build_zigzag_meta(16, 2, 0, torch.device("cpu"))
+    gather_index = meta["zigzag_gather_index"]
+    # rank-concatenating order: r0 [b0|b3], r1 [b1|b2]
+    torch.testing.assert_close(
+        gather_index,
+        torch.tensor([0, 1, 2, 3, 12, 13, 14, 15, 4, 5, 6, 7, 8, 9, 10, 11]),
+    )
+    torch.testing.assert_close(
+        gather_index[meta["inv_gather_index"]], torch.arange(16)
+    )
+
+
+def _make_impl() -> AscendSFAImpl:
     impl = AscendSFAImpl.__new__(AscendSFAImpl)
     impl.q_lora_rank = 2
     impl.n_head = 2
     impl.head_dim = 4
     impl.enable_sparse_li_c8 = False
+    impl.wk_weights_proj = MagicMock()
     return impl
 
 
-def _check_p2p_op(op, kind, peer):
-    assert op.op is kind
-    assert op.peer == peer
-
-
-def test_start_zigzag_q_exchange_posts_receives_before_sends():
-    impl = _make_impl(4, 0)
-    q_c_packed = torch.arange(8, dtype=torch.float32).view(4, 2)
-
-    group = MagicMock()
-    batch_mock = MagicMock()
-    with (
-        patch(
-            "vllm_ascend.attention.sfa_v1.get_tp_group",
-            return_value=SimpleNamespace(
-                world_size=4, rank_in_group=0, device_group=group, ranks=[0, 1, 2, 3]
-            ),
-        ),
-        patch("torch.distributed.batch_isend_irecv", batch_mock),
-    ):
-        recv, reqs = impl._start_zigzag_q_exchange(q_c_packed)
-
-    assert recv.shape == q_c_packed.shape
-    # Desired blocks: 0 (local copy from slot 0) and 7 (remote from rank 3).
-    torch.testing.assert_close(recv[:2], q_c_packed[:2])
-    assert reqs is not None
-    ops = batch_mock.call_args.args[0]
-    assert len(ops) == 2
-    _check_p2p_op(ops[0], torch.distributed.irecv, 3)
-    _check_p2p_op(ops[1], torch.distributed.isend, 1)
-
-
-def test_restore_zigzag_output_layout_for_rank0_cp4():
-    impl = _make_impl(4, 0)
-    output = torch.arange(4, dtype=torch.float32).view(4, 1)
-    attn_metadata = SimpleNamespace(
-        dsa_cp_context=SimpleNamespace(zigzag_index=torch.tensor([0, 1, 6, 7]), q_half=2)
+def _zigzag_ctx():
+    return SimpleNamespace(
+        zigzag_index=torch.tensor([0, 1, 6, 7]),
+        inv_gather_index=torch.tensor([0, 4, 1, 5, 2, 6, 3, 7]),
     )
 
-    group = MagicMock()
-    batch_mock = MagicMock()
-    with (
-        patch(
-            "vllm_ascend.attention.sfa_v1.get_tp_group",
-            return_value=SimpleNamespace(
-                world_size=4, rank_in_group=0, device_group=group, ranks=[0, 1, 2, 3]
-            ),
-        ),
-        patch("torch.distributed.batch_isend_irecv", batch_mock),
-    ):
-        impl._restore_zigzag_output(output, attn_metadata)
 
-    ops = batch_mock.call_args.args[0]
-    assert len(ops) == 2
-    _check_p2p_op(ops[0], torch.distributed.irecv, 1)
-    _check_p2p_op(ops[1], torch.distributed.isend, 3)
+def test_model_boundary_shard_matches_local_zigzag_order():
+    x = torch.arange(8, dtype=torch.float32).view(8, 1)
+    ctx = _zigzag_ctx()
+    with patch.object(zigzag_cp, "get_zigzag_cp_context", return_value=ctx):
+        sharded = zigzag_cp.zigzag_shard_tensor(x)
+    torch.testing.assert_close(sharded[:, 0], torch.tensor([0.0, 1.0, 6.0, 7.0]))
 
 
 def test_indexer_zigzag_splits_halves_and_concats():
-    impl = _make_impl(4, 0)
+    impl = _make_impl()
+    x = torch.zeros(4, 6)
+    kw = torch.zeros(4, 6)
+    impl.wk_weights_proj.return_value = (kw, None)
     q_c = torch.zeros(4, 2)
-    weights = torch.zeros(4, 3)
     attn_metadata = SimpleNamespace(
         dsa_cp_context=SimpleNamespace(
             zigzag_index=torch.tensor([0, 1, 6, 7]),
@@ -131,7 +105,6 @@ def test_indexer_zigzag_splits_halves_and_concats():
     )
 
     q_li = torch.arange(32, dtype=torch.float32).view(4, 2, 4)
-    fake_q_li = q_li
     call_shapes = []
     fake_returns = []
 
@@ -143,13 +116,16 @@ def test_indexer_zigzag_splits_halves_and_concats():
         return result
 
     with (
-        patch.object(impl, "_indexer_qk_proj", return_value=(fake_q_li, None, None)),
-        patch("vllm_ascend.attention.sfa_v1.DeviceOperator.indexer_select_post_process", side_effect=fake_device),
+        patch.object(impl, "_indexer_qk_proj", return_value=(q_li, None, None)),
+        patch(
+            "vllm_ascend.attention.sfa_v1.DeviceOperator.indexer_select_post_process",
+            side_effect=fake_device,
+        ),
         patch("vllm_ascend.attention.sfa_v1.record_attention_compute_start"),
     ):
         result = impl._indexer_select_post_process_zigzag(
+            x=x,
             q_c=q_c,
-            weights=weights,
             kv_cache=(),
             attn_metadata=attn_metadata,
             cos=torch.zeros(4, 2),

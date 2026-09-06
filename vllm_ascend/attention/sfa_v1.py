@@ -24,6 +24,7 @@ from vllm.v1.worker.utils import select_common_block_size
 
 from vllm_ascend import envs as ascend_envs
 from vllm_ascend.ascend_config import get_ascend_config
+from vllm_ascend.ascend_forward_context import _EXTRA_CTX
 from vllm_ascend.attention.attention_mask import AttentionMaskBuilder
 from vllm_ascend.attention.attention_v1 import AscendAttentionState
 from vllm_ascend.attention.mla_v1 import MLAPO_MAX_SUPPORTED_TOKENS
@@ -184,21 +185,20 @@ class DSACPContext:
     slot_mapping_cp: torch.Tensor
     actual_seq_lengths_query: torch.Tensor
     actual_seq_lengths_key: torch.Tensor
-    # ---- zigzag CP balance fields (only set when the path is active) ----
-    # zigzag_index selects the Q-side RoPE rows for this rank's
-    # [prev_block, next_block] query order. KV cache writes intentionally keep
-    # the original continuous local-slice layout, so no zigzag_gather_index is
-    # needed for scatter slots.
+    # ---- model-level zigzag CP fields (only set when the path is active) ----
+    # zigzag_index: global token positions owned by this rank, in
+    # [prev_block, next_block] order. Q and KV are both computed on this local
+    # order, so attention needs no per-layer Q exchange.
+    # zigzag_gather_index / inv_gather_index describe the rank-concatenating
+    # all-gather order and how to rerange it back to natural token order.
     zigzag_index: torch.Tensor | None = None
+    zigzag_gather_index: torch.Tensor | None = None
+    inv_gather_index: torch.Tensor | None = None
     q_half: int = 0
     q_len_prev: torch.Tensor | None = None
     q_len_next: torch.Tensor | None = None
     kv_len_prev: torch.Tensor | None = None
     kv_len_next: torch.Tensor | None = None
-    # Q-side RoPE positions follow the zigzag query order while KV-side RoPE
-    # keeps consuming the continuous local positions.
-    cos_q: torch.Tensor | None = None
-    sin_q: torch.Tensor | None = None
 
 
 def _can_zigzag(
@@ -209,11 +209,11 @@ def _can_zigzag(
     num_reqs: int,
     seq_len: int,
 ) -> bool:
-    """Gate zigzag CP balance to cases where it can win.
+    """Gate model-level zigzag CP to prefill cases it can support.
 
-    The gather + double-kernel overhead is fixed per layer, while the saved
-    indexer/attention work grows with sequence length, so short prefills keep
-    the original continuous-slice path.
+    The per-layer cost is now just one extra indexer/SFA kernel launch pair;
+    the benefit grows with sequence length, so short prefills still keep the
+    original continuous-slice path.
     """
     if not ascend_envs.VLLM_ASCEND_CP_BALANCE:
         return False
@@ -246,11 +246,30 @@ def _build_zigzag_meta(
         range(next_s, next_s + half)
     )
 
+    # Rank-concatenating all-gather order: rank0's zigzag rows, rank1's, ...
+    gather_positions: list[int] = []
+    for rank in range(cp_size):
+        p = rank * half
+        n = (2 * cp_size - 1 - rank) * half
+        gather_positions.extend(range(p, p + half))
+        gather_positions.extend(range(n, n + half))
+
+    # inv_gather_index[p] is the row of gathered tensor holding global token p.
+    inv_positions = [0] * num_tokens
+    for row, global_pos in enumerate(gather_positions):
+        inv_positions[global_pos] = row
+
     zigzag_index = torch.tensor(zigzag_positions, dtype=torch.int64, device=device)
+    zigzag_gather_index = torch.tensor(
+        gather_positions, dtype=torch.int64, device=device
+    )
+    inv_gather_index = torch.tensor(inv_positions, dtype=torch.int64, device=device)
 
     one = torch.tensor([half], device=device, dtype=torch.int32)
     return {
         "zigzag_index": zigzag_index,
+        "zigzag_gather_index": zigzag_gather_index,
+        "inv_gather_index": inv_gather_index,
         "q_half": half,
         "q_len_prev": one,
         "q_len_next": one,
@@ -475,7 +494,6 @@ class AscendSFAMetadataBuilder(MLACommonMetadataBuilder[AscendSFAMetadata]):
             # Decide zigzag while cos/sin still cover the full padded token
             # range: zigzag_index uses global token positions.
             zigzag = None
-            cos_q = sin_q = None
             if (
                 get_ascend_config().enable_sparse_sfa_c8
                 and _can_zigzag(
@@ -493,14 +511,15 @@ class AscendSFAMetadataBuilder(MLACommonMetadataBuilder[AscendSFAMetadata]):
                     get_tp_group().rank_in_group,
                     slot_mapping.device,
                 )
-                # Q projection runs on the zigzag-selected low-rank q_c, so the
-                # Q-side RoPE tables must follow the same token order.
-                cos_q = cos[zigzag["zigzag_index"]]
-                sin_q = sin[zigzag["zigzag_index"]]
-
-            # KV-side RoPE keeps the continuous local slice.
-            cos = cos[local_start:local_end_with_pad]
-            sin = sin[local_start:local_end_with_pad]
+                # The whole layer now runs on the rank-local
+                # [prev_block, next_block] order: Q and KV projections, KV
+                # write slots and RoPE tables all follow the same order.
+                slot_mapping_cp = slot_mapping[zigzag["zigzag_index"]]
+                cos = cos[zigzag["zigzag_index"]]
+                sin = sin[zigzag["zigzag_index"]]
+            else:
+                cos = cos[local_start:local_end_with_pad]
+                sin = sin[local_start:local_end_with_pad]
 
             assert cos.shape[0] == num_tokens_per_device, (
                 f"cos.shape[0] must be equal to num_tokens_per_device, \
@@ -562,13 +581,17 @@ class AscendSFAMetadataBuilder(MLACommonMetadataBuilder[AscendSFAMetadata]):
                 actual_seq_lengths_query=actual_seq_lengths_query,
                 actual_seq_lengths_key=actual_seq_lengths_key,
                 zigzag_index=zigzag["zigzag_index"] if zigzag is not None else None,
+                zigzag_gather_index=(
+                    zigzag["zigzag_gather_index"] if zigzag is not None else None
+                ),
+                inv_gather_index=(
+                    zigzag["inv_gather_index"] if zigzag is not None else None
+                ),
                 q_half=zigzag["q_half"] if zigzag is not None else 0,
                 q_len_prev=zigzag["q_len_prev"] if zigzag is not None else None,
                 q_len_next=zigzag["q_len_next"] if zigzag is not None else None,
                 kv_len_prev=zigzag["kv_len_prev"] if zigzag is not None else None,
                 kv_len_next=zigzag["kv_len_next"] if zigzag is not None else None,
-                cos_q=cos_q,
-                sin_q=sin_q,
             )
 
         if get_ascend_config().c8_enable_reshape_optim:
@@ -625,14 +648,6 @@ class AscendSFAImpl(MLAAttentionImpl):
 
     # Reusable full-weight gather buffers for DSA-CP prefill/mixed requests.
     o_proj_full_pools: dict[tuple[str, int | None, torch.dtype, int, tuple[int, ...]], torch.Tensor] = {}
-
-    # Reusable receive buffers for the zigzag output exchange. Every layer of a
-    # model forward shares one buffer per (device, dtype, shape).
-    zigzag_output_pools: dict[tuple[str, torch.dtype, int, int], torch.Tensor] = {}
-
-    # Reusable receive buffers for the zigzag low-rank q_c (+indexer weights)
-    # block exchange; one buffer per (device, dtype, shape) as well.
-    zigzag_q_pools: dict[tuple[str, torch.dtype, int, int], torch.Tensor] = {}
 
     # q_hadamard and k_hadamard tensor shared when dsa c8 enabled
     q_hadamard: torch.Tensor | None = None
@@ -1614,7 +1629,6 @@ class AscendSFAImpl(MLAAttentionImpl):
         x: torch.Tensor,
         cos: torch.Tensor,
         sin: torch.Tensor,
-        return_weights: bool = False,
     ):
         if not self.has_indexer:
             raise RuntimeError(
@@ -1625,7 +1639,6 @@ class AscendSFAImpl(MLAAttentionImpl):
         assert self.k_norm is not None
 
         kw, _ = self.wk_weights_proj(x)
-        weights = kw[:, self.head_dim :].contiguous() if return_weights else None
         k_li = kw[:, : self.head_dim]
         k_li = self.k_norm(k_li).unsqueeze(1)
         k_li = k_li.view(-1, 1, self.head_dim)
@@ -1658,9 +1671,6 @@ class AscendSFAImpl(MLAAttentionImpl):
         else:
             k_li_scale = None
 
-        if return_weights:
-            assert weights is not None
-            return k_li, k_li_scale, weights
         return k_li, k_li_scale
 
     def _indexer_qk_proj(
@@ -1766,8 +1776,8 @@ class AscendSFAImpl(MLAAttentionImpl):
 
     def _indexer_select_post_process_zigzag(
         self,
+        x: torch.Tensor,
         q_c: torch.Tensor | tuple[torch.Tensor, torch.Tensor],
-        weights: torch.Tensor,
         kv_cache: tuple[torch.Tensor, ...],
         attn_metadata: M,
         cos: torch.Tensor,
@@ -1775,13 +1785,16 @@ class AscendSFAImpl(MLAAttentionImpl):
     ) -> torch.Tensor:
         """Run the LightningIndexer twice over the prev/next zigzag halves.
 
-        ``q_c`` and ``weights`` are already in [prev_block, next_block] order;
-        this method only splits them and supplies the per-half causal lengths.
+        ``x``, ``q_c`` and the derived weights are already in
+        [prev_block, next_block] local order; only the causal lengths differ.
         """
         ctx = attn_metadata.dsa_cp_context
         assert ctx is not None and ctx.zigzag_index is not None
         half = ctx.q_half
 
+        assert self.wk_weights_proj is not None
+        kw, _ = self.wk_weights_proj(x)
+        weights = kw[:, self.head_dim :]
         q_li, q_li_scale, q_li_shape_ori = self._indexer_qk_proj(q_c, cos, sin)
         record_attention_compute_start()
 
@@ -1865,138 +1878,6 @@ class AscendSFAImpl(MLAAttentionImpl):
         attn_metadata: M,
     ) -> None:
         return
-
-    def _start_zigzag_q_exchange(
-        self,
-        q_c_packed: torch.Tensor,
-    ) -> tuple[torch.Tensor, list[Any] | None]:
-        """Exchange SP-owned low-rank q_c blocks for the two zigzag blocks.
-
-        Rank ``r`` owns half-blocks ``2r`` and ``2r+1`` after the local qkv-a
-        projection and needs blocks ``r`` (prev) and ``2c-1-r`` (next). Each
-        half-block has exactly one consumer, so up to two point-to-point sends
-        and two receives complete the redistribution without an all-gather.
-        """
-        tp_group = get_tp_group()
-        cp_size = tp_group.world_size
-        rank = tp_group.rank_in_group
-        half = q_c_packed.shape[0] // 2
-        assert half * 2 == q_c_packed.shape[0]
-
-        pool_key = (str(q_c_packed.device), q_c_packed.dtype, q_c_packed.shape[0], q_c_packed.shape[1])
-        recv = AscendSFAImpl.zigzag_q_pools.get(pool_key)
-        if recv is None:
-            recv = torch.empty_like(q_c_packed)
-            AscendSFAImpl.zigzag_q_pools[pool_key] = recv
-
-        group = tp_group.device_group
-        ops: list[torch.distributed.P2POp] = []
-
-        # Receives first: recv slot 0 is the prev block, slot 1 is the next block.
-        for desired_slot, desired_block in enumerate((rank, 2 * cp_size - 1 - rank)):
-            src_rank = desired_block // 2
-            src_slot = desired_block % 2
-            dst_view = recv[desired_slot * half : (desired_slot + 1) * half]
-            if src_rank == rank:
-                dst_view.copy_(q_c_packed[src_slot * half : (src_slot + 1) * half])
-            else:
-                ops.append(
-                    torch.distributed.P2POp(
-                        torch.distributed.irecv,
-                        dst_view,
-                        tp_group.ranks[src_rank],
-                        group=group,
-                    )
-                )
-
-        # Sends: SP-owned half-blocks go to the rank that consumes them.
-        for owned_slot, block in enumerate((q_c_packed[:half], q_c_packed[half:])):
-            owned_block = 2 * rank + owned_slot
-            dst_rank = owned_block if owned_block < cp_size else 2 * cp_size - 1 - owned_block
-            if dst_rank == rank:
-                continue
-            ops.append(
-                torch.distributed.P2POp(
-                    torch.distributed.isend,
-                    block.contiguous(),
-                    tp_group.ranks[dst_rank],
-                    group=group,
-                )
-            )
-
-        reqs = torch.distributed.batch_isend_irecv(ops) if ops else None
-        return recv, reqs
-
-    def _restore_zigzag_output(
-        self,
-        output: torch.Tensor,
-        attn_metadata: M,
-    ) -> None:
-        """Exchange zigzag-computed output blocks back to SP continuous slices.
-
-        Each rank computed blocks ``r`` and ``2*cp-1-r``, but the model outside
-        expects the continuous slice made of blocks ``2*r`` and ``2*r+1``. The
-        mapping is a fixed permutation of block-sized chunks, so two point-to-
-        point sends/receives per rank are enough (a local copy covers self
-        blocks).
-        """
-        ctx = attn_metadata.dsa_cp_context
-        assert ctx is not None and ctx.zigzag_index is not None
-        tp_group = get_tp_group()
-        cp_size = tp_group.world_size
-        half = ctx.q_half
-        rank = tp_group.rank_in_group
-        hidden_size = output.shape[1]
-
-        pool_key = (str(output.device), output.dtype, output.shape[0], hidden_size)
-        recv = AscendSFAImpl.zigzag_output_pools.get(pool_key)
-        if recv is None:
-            recv = torch.empty_like(output)
-            AscendSFAImpl.zigzag_output_pools[pool_key] = recv
-
-        group = tp_group.device_group
-        ops: list[torch.distributed.P2POp] = []
-
-        # Post receives for the two SP-owned blocks first.
-        for dst_slot, desired_block in enumerate((2 * rank, 2 * rank + 1)):
-            dst_view = recv[dst_slot * half : (dst_slot + 1) * half]
-            if desired_block == rank:
-                dst_view.copy_(output[:half])
-                continue
-            if desired_block == 2 * cp_size - 1 - rank:
-                dst_view.copy_(output[half:])
-                continue
-            src_rank = desired_block if desired_block < cp_size else 2 * cp_size - 1 - desired_block
-            ops.append(
-                torch.distributed.P2POp(
-                    torch.distributed.irecv,
-                    dst_view,
-                    tp_group.ranks[src_rank],
-                    group=group,
-                )
-            )
-
-        # Send the two zigzag-computed blocks to their SP owners.
-        for block, block_id in (
-            (output[:half], rank),
-            (output[half:], 2 * cp_size - 1 - rank),
-        ):
-            dst_rank = block_id // 2
-            if dst_rank == rank:
-                continue
-            ops.append(
-                torch.distributed.P2POp(
-                    torch.distributed.isend,
-                    block.contiguous(),
-                    tp_group.ranks[dst_rank],
-                    group=group,
-                )
-            )
-
-        if ops:
-            for req in torch.distributed.batch_isend_irecv(ops):
-                req.wait()
-        output.copy_(recv)
 
     def _maybe_gather_kv_for_dsacp(
         self,
@@ -2133,10 +2014,20 @@ class AscendSFAImpl(MLAAttentionImpl):
 
             if kv_cache is not None:
                 assert fused_kv_no_split is not None
+                scatter_slots = slot_mapping_sfa[: attn_metadata.num_actual_tokens]
+                if (
+                    attn_metadata.dsa_cp_context is not None
+                    and attn_metadata.dsa_cp_context.zigzag_gather_index is not None
+                ):
+                    # all-gather order is [r0_prev, r0_next, r1_prev, ...];
+                    # zigzag_gather_index maps each row back to its natural slot.
+                    scatter_slots = scatter_slots[
+                        attn_metadata.dsa_cp_context.zigzag_gather_index
+                    ]
                 if self.enable_sparse_sfa_c8:
                     torch_npu.npu_scatter_nd_update_(
                         kv_cache[0].view(-1, fused_kv_no_split.shape[-1]),
-                        slot_mapping_sfa[: attn_metadata.num_actual_tokens].view(-1, 1),
+                        scatter_slots.view(-1, 1),
                         fused_kv_no_split[: attn_metadata.num_actual_tokens],
                     )
                     k_pe = None
@@ -2166,7 +2057,7 @@ class AscendSFAImpl(MLAAttentionImpl):
                         value=k_pe[: attn_metadata.num_actual_tokens],
                         key_cache=kv_cache[0],
                         value_cache=kv_cache[1],
-                        slot_mapping=slot_mapping_sfa[: attn_metadata.num_actual_tokens],
+                        slot_mapping=scatter_slots,
                     )
 
         return k_pe, k_nope, k_li, o_proj_full_handle, o_proj_full_param_handles
@@ -2280,7 +2171,6 @@ class AscendSFAImpl(MLAAttentionImpl):
         num_input_tokens = attn_metadata.num_input_tokens
         output_padded = output
         zigzag_active = False
-        zigzag_weights = None
 
         # Asynchronously all-gather o_proj for DSA-CP prefill. This applies to
         # both a mixed-role instance and a PD-disaggregated P node.
@@ -2349,35 +2239,18 @@ class AscendSFAImpl(MLAAttentionImpl):
             assert self.q_a_layernorm is not None, "q_a_layernorm must be initialized"
             q_c = self.q_a_layernorm(q_c)
 
-            # Zigzag CP balance only rebalances the Q-side work. hidden_states,
-            # KV projections and all KV cache writes stay on the original
-            # continuous local slice, so the existing KV all-gather/scatter path
-            # is untouched. Instead of all-gathering full hidden states, exchange
-            # only the low-rank q_c (+ tiny indexer weights) half-blocks between
-            # the ranks that consume them.
+            # Model-level zigzag CP: hidden_states is already the rank-local
+            # [prev_block, next_block] slice produced by the model boundary
+            # shard. Q and KV projections therefore run directly on zigzag
+            # order and attention needs no per-layer Q exchange.
             zigzag_active = (
                 self.enable_dsa_cp
                 and attn_metadata.dsa_cp_context is not None
                 and attn_metadata.dsa_cp_context.zigzag_index is not None
+                and bool(_EXTRA_CTX.zigzag_cp_active)
             )
-            q_c_reqs = None
-            zigzag_weights = None
-            if zigzag_active:
-                if self.runtime_has_indexer:
-                    k_li, k_li_scale, zigzag_weights = self.indexer_select_pre_process(
-                        x=hidden_states,
-                        cos=cos,
-                        sin=sin,
-                        return_weights=True,
-                    )
-                    q_c_packed = torch.cat([q_c, zigzag_weights], dim=-1)
-                else:
-                    k_li, k_li_scale = None, None
-                    q_c_packed = q_c
-                q_c_packed, q_c_reqs = self._start_zigzag_q_exchange(
-                    q_c_packed.contiguous()
-                )
-            elif self.runtime_has_indexer:
+
+            if self.runtime_has_indexer:
                 k_li, k_li_scale = self.indexer_select_pre_process(
                     x=hidden_states,
                     cos=cos,
@@ -2405,23 +2278,8 @@ class AscendSFAImpl(MLAAttentionImpl):
                 full_gather_o_proj_enabled,
             )
 
-            if zigzag_active:
-                assert attn_metadata.dsa_cp_context is not None
-                if q_c_reqs is not None:
-                    for req in q_c_reqs:
-                        req.wait()
-                q_c = q_c_packed[:, : self.q_lora_rank].contiguous()
-                if zigzag_weights is not None:
-                    zigzag_weights = q_c_packed[:, self.q_lora_rank :].contiguous()
-                cos_q = attn_metadata.dsa_cp_context.cos_q
-                sin_q = attn_metadata.dsa_cp_context.sin_q
-                assert cos_q is not None and sin_q is not None
-            else:
-                cos_q = cos
-                sin_q = sin
-
             ql_nope, q_pe = self._q_proj_and_k_up_proj(q_c)
-            q_pe = self.rope_single(q_pe, cos_q, sin_q)
+            q_pe = self.rope_single(q_pe, cos, sin)
             self._record_query_gather_context(
                 ql_nope,
                 q_pe,
@@ -2456,9 +2314,18 @@ class AscendSFAImpl(MLAAttentionImpl):
 
         if kv_cache is not None and self.runtime_has_indexer:
             assert k_li is not None
-            use_li_c8_reshape_optim = self._use_li_c8_reshape_optim()
+            # zigzag all-gather reorders rows; the reshape-optimized block
+            # writer assumes natural token order, so fall back to scatter.
+            use_li_c8_reshape_optim = self._use_li_c8_reshape_optim() and not zigzag_active
             dsa_k_cache_idx = self.kv_cache_indexer_k_idx
             dsa_k_scale_cache_idx = self.kv_cache_indexer_scale_idx
+
+            idx_slots = slot_mapping
+            if (
+                attn_metadata.dsa_cp_context is not None
+                and attn_metadata.dsa_cp_context.zigzag_gather_index is not None
+            ):
+                idx_slots = slot_mapping[attn_metadata.dsa_cp_context.zigzag_gather_index]
 
             if use_li_c8_reshape_optim:
                 torch.ops._C_ascend.store_kv_block(
@@ -2472,7 +2339,7 @@ class AscendSFAImpl(MLAAttentionImpl):
             else:
                 torch_npu.npu_scatter_nd_update_(
                     kv_cache[dsa_k_cache_idx].view(-1, k_li.shape[-1]),
-                    slot_mapping.view(-1, 1),
+                    idx_slots.view(-1, 1),
                     k_li.view(-1, k_li.shape[-1]),
                 )  # b, s, n, d
             if self.enable_sparse_li_c8:
@@ -2490,7 +2357,7 @@ class AscendSFAImpl(MLAAttentionImpl):
                     else:
                         torch_npu.npu_scatter_nd_update_(
                             kv_cache[dsa_k_scale_cache_idx].view(-1, k_li_scale.shape[-1]),
-                            slot_mapping.view(-1, 1),
+                            idx_slots.view(-1, 1),
                             k_li_scale.view(-1, k_li_scale.shape[-1]),
                         )
             notify_kv_cache_written(self.layer_name or "")
@@ -2509,15 +2376,14 @@ class AscendSFAImpl(MLAAttentionImpl):
             if not self.has_indexer:
                 raise RuntimeError(f"skip_topk is False but indexer is None. layer_name={self.layer_name}.")
             assert q_c is not None
-            assert zigzag_weights is not None
             assert attn_metadata.dsa_cp_context is not None
             topk_indices = self._indexer_select_post_process_zigzag(
+                x=hidden_states,
                 q_c=q_c,
-                weights=zigzag_weights,
                 kv_cache=kv_cache,
                 attn_metadata=attn_metadata,
-                cos=attn_metadata.dsa_cp_context.cos_q,
-                sin=attn_metadata.dsa_cp_context.sin_q,
+                cos=cos,
+                sin=sin,
             )
             if self.use_index_cache:
                 self._update_indexcache_topk_indices(topk_indices)
@@ -2588,8 +2454,8 @@ class AscendSFAImpl(MLAAttentionImpl):
             if not require_o_proj_forward:
                 # The full-weight prefill path completes o_proj internally,
                 # but a pure P node must still publish this layer's KV cache.
-                if zigzag_active:
-                    self._restore_zigzag_output(result, attn_metadata)
+                # Output rows stay in the rank-local zigzag order; the model
+                # boundary gathers and reranges them after the layer loop.
                 maybe_save_kv_layer_to_connector(layer_name, list(kv_cache))
                 return result
             attn_output = result
@@ -2603,10 +2469,8 @@ class AscendSFAImpl(MLAAttentionImpl):
         else:
             output[...] = self.o_proj(attn_output)[0]
 
-        if zigzag_active:
-            # Q rows were computed for blocks [r, 2c-1-r]; exchange them back
-            # to the SP continuous slices expected by residual/MoE outside.
-            self._restore_zigzag_output(output, attn_metadata)
+        # zigzag output is NOT locally reranged here: the model boundary
+        # performs the single gather + rerange after the layer loop.
 
         maybe_save_kv_layer_to_connector(layer_name, list(kv_cache))
 
