@@ -1348,18 +1348,23 @@ class AscendSFAImpl(MLAAttentionImpl):
             "[SFA-5.3][q_view_split] layer=%s q_nope=%s q_pe=%s", self.layer_name, tuple(q_nope.shape), tuple(q_pe.shape)
         )
 
-        # Convert from (B, N, P) to (N, B, P)
-        q_nope = q_nope.transpose(0, 1)
-        # Multiply (N, B, P) x (N, P, L) -> (N, B, L)
-        logger.info(
-            "[SFA-5.3][q_up_bmm] layer=%s op=torch.bmm q_nope=%s W_UK_T=%s",
-            self.layer_name,
-            tuple(q_nope.shape),
-            tuple(self.W_UK_T.shape),
-        )
-        ql_nope = torch.bmm(q_nope, self.W_UK_T)
-        # Convert from (N, B, L) to (B, N, L)
-        ql_nope = ql_nope.transpose(0, 1)
+        if hasattr(torch_npu, "npu_transpose_batchmatmul"):
+            # Convert from (B, N, P) to (N, B, P) and multiply
+            # (N, B, P) x (N, P, L) -> (B, N, L)
+            ql_nope = torch_npu.npu_transpose_batchmatmul(
+                q_nope,
+                self.W_UK_T,
+                perm_x1=(1, 0, 2),
+                perm_x2=(0, 1, 2),
+                perm_y=(1, 0, 2),
+            )
+        else:
+            # Convert from (B, N, P) to (N, B, P)
+            q_nope = q_nope.transpose(0, 1)
+            # Multiply (N, B, P) x (N, P, L) -> (N, B, L)
+            ql_nope = torch.bmm(q_nope, self.W_UK_T)
+            # Convert from (N, B, L) to (B, N, L)
+            ql_nope = ql_nope.transpose(0, 1)
         logger.info("[SFA-5.3][q_up_bmm_out] layer=%s ql_nope=%s q_pe=%s", self.layer_name, tuple(ql_nope.shape), tuple(q_pe.shape))
         return ql_nope, q_pe
 
