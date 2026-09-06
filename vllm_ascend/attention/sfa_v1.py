@@ -1,4 +1,5 @@
 import enum
+import functools
 from collections.abc import Callable
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any, TypeVar
@@ -20,6 +21,7 @@ from vllm.v1.attention.backend import (
     MLAAttentionImpl,
 )
 from vllm.v1.kv_cache_interface import AttentionSpec
+from vllm.v1.utils import record_function_or_nullcontext
 from vllm.v1.worker.utils import select_common_block_size
 
 from vllm_ascend import envs as ascend_envs
@@ -76,6 +78,24 @@ if TYPE_CHECKING:
 
 # token count limits within bmm_transpose operator
 BMM_TRANS_MAX_SUPPORTED_TOKENS = 1024
+
+
+def _sfa_5_3_scope(name: str) -> Callable[[Callable[..., Any]], Callable[..., Any]]:
+    """Add an optional profiler scope for the SFA-5.3 module regions.
+
+    Enable with VLLM_CUSTOM_SCOPES_FOR_PROFILING=1 so the scope is recorded by
+    torch.profiler.record_function; otherwise it degrades to nullcontext.
+    """
+
+    def decorator(func: Callable[..., Any]) -> Callable[..., Any]:
+        @functools.wraps(func)
+        def wrapper(*args: Any, **kwargs: Any) -> Any:
+            with record_function_or_nullcontext(name):
+                return func(*args, **kwargs)
+
+        return wrapper
+
+    return decorator
 
 
 class PreprocessType(enum.Enum):
@@ -1218,6 +1238,7 @@ class AscendSFAImpl(MLAAttentionImpl):
     ) -> tuple[torch.Tensor, torch.Tensor | None]:
         raise NotImplementedError("forward_mqa is not supported for SFA attention. Use forward() instead.")
 
+    @_sfa_5_3_scope("SFA-5.3/02_rope_single")
     def rope_single(
         self,
         x: torch.Tensor,
@@ -1323,6 +1344,7 @@ class AscendSFAImpl(MLAAttentionImpl):
     def _apply_o_proj_full_weight(self, attn_output: torch.Tensor) -> torch.Tensor:
         return self._get_o_proj_linear_method().apply(self.o_proj, attn_output)
 
+    @_sfa_5_3_scope("SFA-5.3/09_o_proj_weight_switch")
     def _handle_o_proj_weight_switch_and_forward(
         self,
         attn_output: torch.Tensor,
@@ -1369,6 +1391,7 @@ class AscendSFAImpl(MLAAttentionImpl):
 
             return attn_output, True
 
+    @_sfa_5_3_scope("SFA-5.3/09_o_proj_tp")
     def _forward_o_proj_tp(self, attn_output: torch.Tensor, output: torch.Tensor) -> torch.Tensor:
         # o_proj with oproj_tp: cross-DP sharded attention output projection.
         num_tokens = attn_output.shape[0]
@@ -1423,6 +1446,7 @@ class AscendSFAImpl(MLAAttentionImpl):
     def _get_full_kv(self, k, attn_metadata):
         return k
 
+    @_sfa_5_3_scope("SFA-5.3/03_exec_kv")
     def exec_kv(
         self,
         kv_no_split: torch.Tensor,
@@ -1484,6 +1508,7 @@ class AscendSFAImpl(MLAAttentionImpl):
             return None, None
 
     # Return `ql_nope`, `q_pe`
+    @_sfa_5_3_scope("SFA-5.3/02_q_b_proj_view_split_bmm")
     def _q_proj_and_k_up_proj(self, x):
         q_nope, q_pe = (
             self.q_proj(x)[0]
@@ -1498,6 +1523,7 @@ class AscendSFAImpl(MLAAttentionImpl):
         # Convert from (N, B, L) to (B, N, L)
         return ql_nope.transpose(0, 1), q_pe
 
+    @_sfa_5_3_scope("SFA-5.3/09_v_up_proj")
     def _v_up_proj(self, x):
         num_input_tokens, _, _ = x.shape
         if (
@@ -1705,6 +1731,7 @@ class AscendSFAImpl(MLAAttentionImpl):
         )
         return hidden_states, ql_nope, q_pe, q_c
 
+    @_sfa_5_3_scope("SFA-5.3/04_indexer_pre")
     def indexer_select_pre_process(
         self,
         x: torch.Tensor,
@@ -1816,6 +1843,7 @@ class AscendSFAImpl(MLAAttentionImpl):
 
         return q_li, q_li_scale, q_li_shape_ori
 
+    @_sfa_5_3_scope("SFA-5.3/07_indexer_post")
     def indexer_select_post_process(
         self,
         x: torch.Tensor,
@@ -1938,6 +1966,7 @@ class AscendSFAImpl(MLAAttentionImpl):
         """Whether this layer can use the LI C8 cache-write operator."""
         return self.enable_sparse_li_c8 and get_ascend_config().c8_enable_reshape_optim
 
+    @_sfa_5_3_scope("SFA-5.3/08_sfa_process")
     def _execute_sparse_flash_attention_process(
         self, ql_nope, q_pe, kv_cache, topk_indices, attn_metadata, actual_seq_lengths_query, actual_seq_lengths_key
     ):
@@ -1960,6 +1989,7 @@ class AscendSFAImpl(MLAAttentionImpl):
     ) -> None:
         return
 
+    @_sfa_5_3_scope("SFA-5.3/05_dsacp_kv_gather")
     def _maybe_gather_kv_for_dsacp(
         self,
         k_pe: torch.Tensor | None,
@@ -2030,6 +2060,7 @@ class AscendSFAImpl(MLAAttentionImpl):
 
         return k_li, k_li_scale, fused_kv_no_split, kv_ag_handles
 
+    @_sfa_5_3_scope("SFA-5.3/06_store_kvcache")
     def _maybe_store_kvcache_for_c8_n_dsacp(
         self,
         k_pe: torch.Tensor | None,
@@ -2220,6 +2251,7 @@ class AscendSFAImpl(MLAAttentionImpl):
             )
         return (*main_cache, *indexer_cache)
 
+    @_sfa_5_3_scope("SFA-5.3/00_forward")
     def forward(
         self,
         layer_name,
@@ -2329,13 +2361,14 @@ class AscendSFAImpl(MLAAttentionImpl):
                 hidden_states = torch.ops.vllm.maybe_all_gather_and_maybe_unpad(
                     hidden_states.contiguous(), need_gather_q_kv
                 )
-            qkv_lora = self.fused_qkv_a_proj(hidden_states)[0]
-            q_c, kv_no_split = qkv_lora.split(
-                [self.q_lora_rank, self.kv_lora_rank + self.qk_rope_head_dim],
-                dim=-1,
-            )
-            assert self.q_a_layernorm is not None, "q_a_layernorm must be initialized"
-            q_c = self.q_a_layernorm(q_c)
+            with record_function_or_nullcontext("SFA-5.3/01_fused_qkv_a_proj_split_qnorm"):
+                qkv_lora = self.fused_qkv_a_proj(hidden_states)[0]
+                q_c, kv_no_split = qkv_lora.split(
+                    [self.q_lora_rank, self.kv_lora_rank + self.qk_rope_head_dim],
+                    dim=-1,
+                )
+                assert self.q_a_layernorm is not None, "q_a_layernorm must be initialized"
+                q_c = self.q_a_layernorm(q_c)
 
             # Model-level zigzag CP: hidden_states is already the rank-local
             # [prev_block, next_block] slice produced by the model boundary
@@ -2411,68 +2444,69 @@ class AscendSFAImpl(MLAAttentionImpl):
             attn_metadata.reshape_cache_event = torch.npu.Event()
 
         if kv_cache is not None and self.runtime_has_indexer:
-            assert k_li is not None
-            # zigzag all-gather reorders rows; the reshape-optimized block
-            # writer assumes natural token order, so fall back to scatter.
-            use_li_c8_reshape_optim = self._use_li_c8_reshape_optim() and not zigzag_active
-            dsa_k_cache_idx = self.kv_cache_indexer_k_idx
-            dsa_k_scale_cache_idx = self.kv_cache_indexer_scale_idx
+            with record_function_or_nullcontext("SFA-5.3/06_indexer_cache_write"):
+                assert k_li is not None
+                # zigzag all-gather reorders rows; the reshape-optimized block
+                # writer assumes natural token order, so fall back to scatter.
+                use_li_c8_reshape_optim = self._use_li_c8_reshape_optim() and not zigzag_active
+                dsa_k_cache_idx = self.kv_cache_indexer_k_idx
+                dsa_k_scale_cache_idx = self.kv_cache_indexer_scale_idx
 
-            idx_slots = slot_mapping
-            k_li_to_write = k_li
-            k_li_scale_to_write = k_li_scale
-            if (
-                attn_metadata.dsa_cp_context is not None
-                and attn_metadata.dsa_cp_context.zigzag_gather_index is not None
-            ):
-                actual_gather_index = attn_metadata.dsa_cp_context.zigzag_actual_gather_index
-                actual_rows = attn_metadata.dsa_cp_context.zigzag_actual_rows
-                assert actual_gather_index is not None
-                idx_slots = slot_mapping[actual_gather_index]
-                if k_li_to_write.shape[0] != attn_metadata.num_actual_tokens:
-                    assert actual_rows is not None
-                    k_li_to_write = k_li_to_write[actual_rows]
+                idx_slots = slot_mapping
+                k_li_to_write = k_li
+                k_li_scale_to_write = k_li_scale
                 if (
-                    k_li_scale_to_write is not None
-                    and k_li_scale_to_write.shape[0] != attn_metadata.num_actual_tokens
+                    attn_metadata.dsa_cp_context is not None
+                    and attn_metadata.dsa_cp_context.zigzag_gather_index is not None
                 ):
-                    assert actual_rows is not None
-                    k_li_scale_to_write = k_li_scale_to_write[actual_rows]
+                    actual_gather_index = attn_metadata.dsa_cp_context.zigzag_actual_gather_index
+                    actual_rows = attn_metadata.dsa_cp_context.zigzag_actual_rows
+                    assert actual_gather_index is not None
+                    idx_slots = slot_mapping[actual_gather_index]
+                    if k_li_to_write.shape[0] != attn_metadata.num_actual_tokens:
+                        assert actual_rows is not None
+                        k_li_to_write = k_li_to_write[actual_rows]
+                    if (
+                        k_li_scale_to_write is not None
+                        and k_li_scale_to_write.shape[0] != attn_metadata.num_actual_tokens
+                    ):
+                        assert actual_rows is not None
+                        k_li_scale_to_write = k_li_scale_to_write[actual_rows]
 
-            if use_li_c8_reshape_optim:
-                torch.ops._C_ascend.store_kv_block(
-                    k_li_to_write,
-                    kv_cache[dsa_k_cache_idx],
-                    attn_metadata.group_len,
-                    attn_metadata.group_key_idx,
-                    attn_metadata.group_key_cache_idx,
-                    attn_metadata.block_size,
-                )
-            else:
-                torch_npu.npu_scatter_nd_update_(
-                    kv_cache[dsa_k_cache_idx].view(-1, k_li_to_write.shape[-1]),
-                    idx_slots.view(-1, 1),
-                    k_li_to_write.view(-1, k_li_to_write.shape[-1]),
-                )  # b, s, n, d
-            if self.enable_sparse_li_c8:
-                assert len(kv_cache) == (3 if self.enable_sparse_sfa_c8 else 4)
-                if k_li_scale_to_write is not None:
-                    if use_li_c8_reshape_optim:
-                        torch.ops._C_ascend.store_kv_block(
-                            k_li_scale_to_write,
-                            kv_cache[dsa_k_scale_cache_idx],
-                            attn_metadata.group_len,
-                            attn_metadata.group_key_idx,
-                            attn_metadata.group_key_cache_idx,
-                            attn_metadata.block_size,
-                        )
-                    else:
-                        torch_npu.npu_scatter_nd_update_(
-                            kv_cache[dsa_k_scale_cache_idx].view(-1, k_li_scale_to_write.shape[-1]),
-                            idx_slots.view(-1, 1),
-                            k_li_scale_to_write.view(-1, k_li_scale_to_write.shape[-1]),
-                        )
-            notify_kv_cache_written(self.layer_name or "")
+                if use_li_c8_reshape_optim:
+                    torch.ops._C_ascend.store_kv_block(
+                        k_li_to_write,
+                        kv_cache[dsa_k_cache_idx],
+                        attn_metadata.group_len,
+                        attn_metadata.group_key_idx,
+                        attn_metadata.group_key_cache_idx,
+                        attn_metadata.block_size,
+                    )
+                else:
+                    torch_npu.npu_scatter_nd_update_(
+                        kv_cache[dsa_k_cache_idx].view(-1, k_li_to_write.shape[-1]),
+                        idx_slots.view(-1, 1),
+                        k_li_to_write.view(-1, k_li_to_write.shape[-1]),
+                    )  # b, s, n, d
+                if self.enable_sparse_li_c8:
+                    assert len(kv_cache) == (3 if self.enable_sparse_sfa_c8 else 4)
+                    if k_li_scale_to_write is not None:
+                        if use_li_c8_reshape_optim:
+                            torch.ops._C_ascend.store_kv_block(
+                                k_li_scale_to_write,
+                                kv_cache[dsa_k_scale_cache_idx],
+                                attn_metadata.group_len,
+                                attn_metadata.group_key_idx,
+                                attn_metadata.group_key_cache_idx,
+                                attn_metadata.block_size,
+                            )
+                        else:
+                            torch_npu.npu_scatter_nd_update_(
+                                kv_cache[dsa_k_scale_cache_idx].view(-1, k_li_scale_to_write.shape[-1]),
+                                idx_slots.view(-1, 1),
+                                k_li_scale_to_write.view(-1, k_li_scale_to_write.shape[-1]),
+                            )
+                notify_kv_cache_written(self.layer_name or "")
         elif kv_cache is not None and self.has_indexer and self.skip_indexer_pre_process:
             # Static IndexCache S layers still write the main MLA KV cache;
             # only the per-layer indexer KV cache is intentionally skipped.
@@ -2482,39 +2516,40 @@ class AscendSFAImpl(MLAAttentionImpl):
             topk_num_tokens = attn_metadata.dsa_cp_context.local_end_with_pad - attn_metadata.dsa_cp_context.local_start
         else:
             topk_num_tokens = num_input_tokens or hidden_states.shape[0]
-        if self.skip_topk:
-            topk_indices = self._get_indexcache_topk_indices(topk_num_tokens)
-        elif zigzag_active:
-            if not self.has_indexer:
-                raise RuntimeError(f"skip_topk is False but indexer is None. layer_name={self.layer_name}.")
-            assert q_c is not None
-            assert attn_metadata.dsa_cp_context is not None
-            topk_indices = self._indexer_select_post_process_zigzag(
-                x=hidden_states,
-                q_c=q_c,
-                kv_cache=kv_cache,
-                attn_metadata=attn_metadata,
-                cos=cos,
-                sin=sin,
-            )
-            if self.use_index_cache:
-                self._update_indexcache_topk_indices(topk_indices)
-        else:
-            if not self.has_indexer:
-                raise RuntimeError(f"skip_topk is False but indexer is None. layer_name={self.layer_name}.")
-            assert q_c is not None
-            topk_indices = self.indexer_select_post_process(
-                x=hidden_states,
-                q_c=q_c,
-                kv_cache=kv_cache,
-                attn_metadata=attn_metadata,
-                cos=cos,
-                sin=sin,
-                actual_seq_lengths_query=actual_seq_lengths_query,
-                actual_seq_lengths_key=actual_seq_lengths_key,
-            )
-            if self.use_index_cache:
-                self._update_indexcache_topk_indices(topk_indices)
+        with record_function_or_nullcontext("SFA-5.3/07_topk"):
+            if self.skip_topk:
+                topk_indices = self._get_indexcache_topk_indices(topk_num_tokens)
+            elif zigzag_active:
+                if not self.has_indexer:
+                    raise RuntimeError(f"skip_topk is False but indexer is None. layer_name={self.layer_name}.")
+                assert q_c is not None
+                assert attn_metadata.dsa_cp_context is not None
+                topk_indices = self._indexer_select_post_process_zigzag(
+                    x=hidden_states,
+                    q_c=q_c,
+                    kv_cache=kv_cache,
+                    attn_metadata=attn_metadata,
+                    cos=cos,
+                    sin=sin,
+                )
+                if self.use_index_cache:
+                    self._update_indexcache_topk_indices(topk_indices)
+            else:
+                if not self.has_indexer:
+                    raise RuntimeError(f"skip_topk is False but indexer is None. layer_name={self.layer_name}.")
+                assert q_c is not None
+                topk_indices = self.indexer_select_post_process(
+                    x=hidden_states,
+                    q_c=q_c,
+                    kv_cache=kv_cache,
+                    attn_metadata=attn_metadata,
+                    cos=cos,
+                    sin=sin,
+                    actual_seq_lengths_query=actual_seq_lengths_query,
+                    actual_seq_lengths_key=actual_seq_lengths_key,
+                )
+                if self.use_index_cache:
+                    self._update_indexcache_topk_indices(topk_indices)
 
         if zigzag_active:
             assert attn_metadata.dsa_cp_context is not None
@@ -2579,7 +2614,8 @@ class AscendSFAImpl(MLAAttentionImpl):
             # this is the non-CP path.
             self._forward_o_proj_tp(attn_output, output)
         else:
-            output[...] = self.o_proj(attn_output)[0]
+            with record_function_or_nullcontext("SFA-5.3/09_o_proj_default"):
+                output[...] = self.o_proj(attn_output)[0]
 
         # zigzag output is NOT locally reranged here: the model boundary
         # performs the single gather + rerange after the layer loop.
@@ -2589,6 +2625,7 @@ class AscendSFAImpl(MLAAttentionImpl):
         return output_padded
 
 
+@_sfa_5_3_scope("SFA-5.3/03_custom_kv_rmsnorm_rope")
 def custom_kv_rmsnorm_rope(
     kv: torch.Tensor,
     gamma: torch.Tensor,
