@@ -248,6 +248,15 @@ def _select_experts_with_fusion_ops(
         if tid2eid is not None:
             forward_context = get_forward_context()
             input_ids = forward_context.input_ids.to(torch.int64)
+            zigzag_cp_context = getattr(forward_context, "zigzag_cp_context", None)
+            if (
+                getattr(forward_context, "zigzag_cp_active", False)
+                and zigzag_cp_context is not None
+                and zigzag_cp_context.zigzag_gather_index is not None
+            ):
+                # MoE prepare all-gathers rank-local zigzag tensors in
+                # rank-concatenating order; align the routing input ids.
+                input_ids = input_ids[zigzag_cp_context.zigzag_gather_index]
             # tid2eid_ones = torch.ones(tid2eid.shape[0],tid2eid.shape[1],device=router_logits.device,dtype=torch.int32)
             tid2eid_ones = tid2eid.to(torch.int32)
             if forward_context.moe_comm_type == MoECommType.ALLGATHER:

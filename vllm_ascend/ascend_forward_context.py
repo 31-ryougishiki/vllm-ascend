@@ -66,6 +66,27 @@ def get_mrv2_in_profile_run() -> bool:
     return _MRV2_IN_PROFILE_RUN.get()
 
 
+def _find_zigzag_cp_context(attn_metadata: Any):
+    """Find the DSA-CP zigzag context from attention metadata.
+
+    ``attn_metadata`` may be a per-layer dict (vLLM v1) or a single object.
+    All layers of one forward share the same token layout, so returning the
+    first non-None context is enough.
+    """
+    candidates: list[Any] = []
+    if isinstance(attn_metadata, dict):
+        candidates.extend(attn_metadata.values())
+    else:
+        candidates.append(attn_metadata)
+    for meta in candidates:
+        if meta is None:
+            continue
+        ctx = getattr(meta, "dsa_cp_context", None)
+        if ctx is not None and getattr(ctx, "zigzag_index", None) is not None:
+            return ctx
+    return None
+
+
 def _cann_megamoe_supported_by_config(vllm_config: VllmConfig) -> bool:
     hf_text_config = vllm_config.model_config.hf_text_config
     hidden_size = getattr(hf_text_config, "hidden_size", None)
@@ -130,6 +151,19 @@ def set_ascend_forward_context(
         forward_context.draft_attn_metadatas = draft_attn_metadatas
 
         forward_context.input_ids = input_ids
+
+        zigzag_cp_context = _find_zigzag_cp_context(attn_metadata)
+        zigzag_cp_active = (
+            zigzag_cp_context is not None
+            and not is_draft_model
+            and not envs_vllm.VLLM_USE_V2_MODEL_RUNNER
+        )
+        if envs_vllm.VLLM_USE_V2_MODEL_RUNNER:
+            forward_context.additional_kwargs["zigzag_cp_context"] = zigzag_cp_context
+            forward_context.additional_kwargs["zigzag_cp_active"] = zigzag_cp_active
+        else:
+            forward_context.zigzag_cp_context = zigzag_cp_context
+            forward_context.zigzag_cp_active = zigzag_cp_active
 
         from vllm_ascend.ops.fused_moe.moe_comm_method import get_moe_comm_method
 
@@ -202,6 +236,8 @@ def set_ascend_forward_context(
             num_tokens = attn_metadata.num_actual_tokens
 
         dp_world_size = get_dp_group().world_size
+        if dp_world_size > 1:
+            forward_context.zigzag_cp_active = False
         if dp_world_size > 1 and forward_context.dp_metadata is not None:
             dp_meta = forward_context.dp_metadata
             max_tokens_across_dp = dp_meta.num_tokens_across_dp_cpu.max().item()
@@ -228,6 +264,14 @@ def set_ascend_forward_context(
                 mc2_mask = reserved_mc2_mask[: forward_context.padded_num_tokens]
                 mc2_mask[:num_actual_tokens] = True
                 mc2_mask[num_actual_tokens:] = False
+                if (
+                    zigzag_cp_active
+                    and zigzag_cp_context is not None
+                    and zigzag_cp_context.zigzag_gather_index is not None
+                    and mc2_mask.shape[0] == zigzag_cp_context.zigzag_gather_index.shape[0]
+                ):
+                    # MoE consumes rank-concatenating zigzag order.
+                    mc2_mask = mc2_mask[zigzag_cp_context.zigzag_gather_index]
                 forward_context.mc2_mask = mc2_mask
         try:
             yield
@@ -433,6 +477,8 @@ class _ExtraForwardContextProxy:
         "padded_num_tokens",
         "sinks",
         "eplb_heat_collection_status",
+        "zigzag_cp_active",
+        "zigzag_cp_context",
     )
 
     def check_extra_attr(self, name: str):
