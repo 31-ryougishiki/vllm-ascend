@@ -1032,9 +1032,6 @@ class AscendSFAImpl(MLAAttentionImpl):
         cos: torch.Tensor,
         sin: torch.Tensor,
     ) -> torch.Tensor:
-        logger.info(
-            "[SFA-5.3][rope_single] layer=%s input=%s op=npu_interleave_rope", self.layer_name, tuple(x.shape)
-        )
         B, N, D = x.shape
         S = 1
         x = x.view(B, N, S, D)
@@ -1146,12 +1143,6 @@ class AscendSFAImpl(MLAAttentionImpl):
         """
         Handle o_proj weight switching between TP-mode and Full-mode, and execute forward computation.
         """
-        logger.info(
-            "[SFA-5.3][_handle_o_proj] layer=%s should_shard_weight=%s attn_output=%s",
-            self.layer_name,
-            should_shard_weight,
-            tuple(attn_output.shape),
-        )
         # Gather o_proj weight from all TP ranks for Full-mode computation
         if should_shard_weight:
             # Wait for the completion of o_proj weight all-gather operation
@@ -1161,11 +1152,6 @@ class AscendSFAImpl(MLAAttentionImpl):
                 if handle is not None:
                     handle.wait()
 
-            logger.info(
-                "[SFA-5.3][_handle_o_proj] layer=%s path=full_weight_pool pool=%s",
-                self.layer_name,
-                tuple(self.o_proj_full_pool.shape),
-            )
             # Temporarily switch o_proj to the gathered full-weight view for
             # prefill/mixed DSA-CP, whose attention output is not TP-sharded.
             self.o_proj.weight.set_(self.o_proj_full_pool)
@@ -1179,11 +1165,6 @@ class AscendSFAImpl(MLAAttentionImpl):
 
             return output, False
         else:
-            logger.info(
-                "[SFA-5.3][_handle_o_proj] layer=%s path=decode_all_to_all tp_size=%s",
-                self.layer_name,
-                self.tp_size,
-            )
             # For decode scenario: perform all-to-all communication on o_proj input activations
             # Reshape for all-to-all: [batch * seq, tp_size, head_dim] -> [tp_size, batch * seq, head_dim]
             send = (
@@ -1271,16 +1252,8 @@ class AscendSFAImpl(MLAAttentionImpl):
 
         # npu_kv_rmsnorm_rope_cache doesn't support C8 fp8 block quant;
         # all sparse-C8-SFA layers use custom_kv_rmsnorm_rope instead.
-        logger.info(
-            "[SFA-5.3][exec_kv] layer=%s kv_no_split=%s enable_sparse_sfa_c8=%s enable_dsa_cp=%s",
-            self.layer_name,
-            tuple(kv_no_split.shape),
-            self.enable_sparse_sfa_c8,
-            self.enable_dsa_cp,
-        )
         if self.enable_sparse_sfa_c8:
             assert self.kv_a_layernorm is not None
-            logger.info("[SFA-5.3][exec_kv] layer=%s path=sparse_sfa_c8 custom_kv_rmsnorm_rope", self.layer_name)
             return custom_kv_rmsnorm_rope(
                 kv_no_split,
                 self.kv_a_layernorm.weight,
@@ -1294,10 +1267,6 @@ class AscendSFAImpl(MLAAttentionImpl):
             )
 
         if self.enable_dsa_cp:
-            logger.info(
-                "[SFA-5.3][exec_kv] layer=%s path=dsa_cp op=npu_kv_rmsnorm_rope_cache is_output_kv=True",
-                self.layer_name,
-            )
             _, _, k_pe, k_nope = torch_npu.npu_kv_rmsnorm_rope_cache(
                 kv_no_split,
                 self.kv_a_layernorm.weight,  # type: ignore[union-attr]
@@ -1312,10 +1281,6 @@ class AscendSFAImpl(MLAAttentionImpl):
             )
             return k_pe, k_nope, None
         else:
-            logger.info(
-                "[SFA-5.3][exec_kv] layer=%s path=non_c8 op=npu_kv_rmsnorm_rope_cache is_output_kv=False",
-                self.layer_name,
-            )
             torch_npu.npu_kv_rmsnorm_rope_cache(
                 kv_no_split,
                 self.kv_a_layernorm.weight,  # type: ignore[union-attr]
@@ -1332,20 +1297,10 @@ class AscendSFAImpl(MLAAttentionImpl):
     # Return `ql_nope`, `q_pe`
     @_sfa_5_3_scope("SFA-5.3/02_q_b_proj_view_split_bmm")
     def _q_proj_and_k_up_proj(self, x):
-        logger.info(
-            "[SFA-5.3][_q_proj_and_k_up_proj] layer=%s input=%s q_proj_path=ShardedCP/TP local_heads=%s",
-            self.layer_name,
-            tuple(x.shape),
-            self.local_num_heads,
-        )
         q_proj_out = self.q_proj(x)[0]
-        logger.info("[SFA-5.3][q_b_proj] layer=%s q_proj_out=%s", self.layer_name, tuple(q_proj_out.shape))
         q_nope, q_pe = (
             q_proj_out.view(-1, self.local_num_heads, self.qk_head_dim)
             .split([self.qk_nope_head_dim, self.qk_rope_head_dim], dim=-1)
-        )
-        logger.info(
-            "[SFA-5.3][q_view_split] layer=%s q_nope=%s q_pe=%s", self.layer_name, tuple(q_nope.shape), tuple(q_pe.shape)
         )
 
         if hasattr(torch_npu, "npu_transpose_batchmatmul"):
@@ -1365,31 +1320,21 @@ class AscendSFAImpl(MLAAttentionImpl):
             ql_nope = torch.bmm(q_nope, self.W_UK_T)
             # Convert from (N, B, L) to (B, N, L)
             ql_nope = ql_nope.transpose(0, 1)
-        logger.info("[SFA-5.3][q_up_bmm_out] layer=%s ql_nope=%s q_pe=%s", self.layer_name, tuple(ql_nope.shape), tuple(q_pe.shape))
         return ql_nope, q_pe
 
     @_sfa_5_3_scope("SFA-5.3/09_v_up_proj")
     def _v_up_proj(self, x):
         num_input_tokens, _, _ = x.shape
-        logger.info(
-            "[SFA-5.3][_v_up_proj] layer=%s input=%s num_tokens=%s local_heads=%s",
-            self.layer_name,
-            tuple(x.shape),
-            num_input_tokens,
-            self.local_num_heads,
-        )
         if (
             x.dtype in [torch.float16, torch.bfloat16]
             and hasattr(torch.ops._C_ascend, "batch_matmul_transpose")
             and num_input_tokens <= BMM_TRANS_MAX_SUPPORTED_TOKENS
         ):
-            logger.info("[SFA-5.3][_v_up_proj] layer=%s path=_C_ascend.batch_matmul_transpose", self.layer_name)
             x = x.view(-1, self.local_num_heads, self.kv_lora_rank)
             res = torch.empty((num_input_tokens, self.local_num_heads, self.v_head_dim), dtype=x.dtype, device=x.device)
             torch.ops._C_ascend.batch_matmul_transpose(x, self.W_UV, res)
             x = res.reshape(-1, self.local_num_heads * self.v_head_dim)
         elif hasattr(torch_npu, "npu_transpose_batchmatmul"):
-            logger.info("[SFA-5.3][_v_up_proj] layer=%s path=npu_transpose_batchmatmul", self.layer_name)
             # Convert from (N, B, L)/(N, B, 1, L) to (N, B, L)
             x = x.view(-1, self.local_num_heads, self.kv_lora_rank)
             # Multiply (N, B, L) x (N, L, V) -> (B, N, V)
@@ -1397,14 +1342,12 @@ class AscendSFAImpl(MLAAttentionImpl):
             # Convert from (N, B, V) to (B, N * V)
             x = x.reshape(-1, self.local_num_heads * self.v_head_dim)
         else:
-            logger.info("[SFA-5.3][_v_up_proj] layer=%s path=torch.bmm", self.layer_name)
             # Convert from (B, N, L) to (N, B, L)
             x = x.view(-1, self.local_num_heads, self.kv_lora_rank).transpose(0, 1)
             # # Multiply (N, B, L) x (N, L, V) -> (N, B, V)
             x = torch.bmm(x, self.W_UV)
             # # Convert from (N, B, V) to (B, N * V)
             x = x.transpose(0, 1).reshape(-1, self.local_num_heads * self.v_head_dim)
-        logger.info("[SFA-5.3][_v_up_proj_out] layer=%s output=%s", self.layer_name, tuple(x.shape))
         return x
 
     def _sfa_preprocess_prolog_v3(
@@ -1594,13 +1537,6 @@ class AscendSFAImpl(MLAAttentionImpl):
         cos: torch.Tensor,
         sin: torch.Tensor,
     ):
-        logger.info(
-            "[SFA-5.3][indexer_pre] layer=%s x=%s has_indexer=%s li_c8=%s",
-            self.layer_name,
-            tuple(x.shape),
-            self.has_indexer,
-            self.enable_sparse_li_c8,
-        )
         if not self.has_indexer:
             raise RuntimeError(
                 f"indexer_select_pre_process should not be called when indexer is None. layer_name={self.layer_name}."
@@ -1610,13 +1546,11 @@ class AscendSFAImpl(MLAAttentionImpl):
         assert self.k_norm is not None
 
         kw, _ = self.wk_weights_proj(x)
-        logger.info("[SFA-5.3][indexer_pre] layer=%s wk_weights_proj_out=%s", self.layer_name, tuple(kw.shape))
         k_li = kw[:, : self.head_dim]
         k_li = self.k_norm(k_li).unsqueeze(1)
         k_li = k_li.view(-1, 1, self.head_dim)
 
         if HAS_TRITON:
-            logger.info("[SFA-5.3][indexer_pre] layer=%s rope_path=triton rope_forward_triton_siso", self.layer_name)
             cos = cos.view(-1, self.qk_rope_head_dim)
             sin = sin.view(-1, self.qk_rope_head_dim)
             k_li = rope_forward_triton_siso(
@@ -1634,29 +1568,16 @@ class AscendSFAImpl(MLAAttentionImpl):
             k_li_pe = torch_npu.npu_rotary_mul(k_li_pe, cos, sin)
             k_li_pe = k_li_pe.squeeze(2)
 
-            logger.info("[SFA-5.3][indexer_pre] layer=%s rope_path=npu_rotary_mul", self.layer_name)
             k_li = torch.cat([k_li_pe, k_li_nope], dim=-1)  # [b*s,128]
 
         if self.enable_sparse_li_c8:
-            logger.info(
-                "[SFA-5.3][indexer_pre] layer=%s li_c8_path=hadamard+npu_dynamic_quant k_li=%s",
-                self.layer_name,
-                tuple(k_li.shape),
-            )
             k_li = k_li @ AscendSFAImpl.k_hadamard
             k_li, k_li_scale = torch_npu.npu_dynamic_quant(k_li.view(-1, self.head_dim), dst_type=self.c8_k_cache_dtype)
             k_li_scale = k_li_scale.to(self.c8_k_scale_cache_dtype)  # [b*s,]
             k_li_scale = k_li_scale.unsqueeze(-1)  # [b*s,1]
         else:
             k_li_scale = None
-            logger.info("[SFA-5.3][indexer_pre] layer=%s li_c8_path=off", self.layer_name)
 
-        logger.info(
-            "[SFA-5.3][indexer_pre_out] layer=%s k_li=%s k_li_scale=%s",
-            self.layer_name,
-            tuple(k_li.shape),
-            None if k_li_scale is None else tuple(k_li_scale.shape),
-        )
         return k_li, k_li_scale
 
     @_sfa_5_3_scope("SFA-5.3/07_indexer_post")
@@ -1671,14 +1592,6 @@ class AscendSFAImpl(MLAAttentionImpl):
         actual_seq_lengths_query: torch.Tensor,
         actual_seq_lengths_key: torch.Tensor,
     ):
-        logger.info(
-            "[SFA-5.3][indexer_post] layer=%s x=%s q_c_type=%s li_c8=%s use_torch_npu_li=%s",
-            self.layer_name,
-            tuple(x.shape),
-            "tuple" if isinstance(q_c, tuple) else type(q_c).__name__,
-            self.enable_sparse_li_c8,
-            self.use_torch_npu_lightning_indexer,
-        )
         if not self.has_indexer:
             raise RuntimeError(
                 f"indexer_select_post_process should not be called when indexer is None. layer_name={self.layer_name}."
@@ -1689,12 +1602,6 @@ class AscendSFAImpl(MLAAttentionImpl):
 
         kw, _ = self.wk_weights_proj(x)
         weights = kw[:, self.head_dim :]
-        logger.info(
-            "[SFA-5.3][indexer_post] layer=%s wk_weights_proj_out=%s weights=%s",
-            self.layer_name,
-            tuple(kw.shape),
-            tuple(weights.shape),
-        )
         if isinstance(q_c, tuple):
             q_c_tensor, q_c_scale = q_c
             q_c_tensor = q_c_tensor.view(-1, q_c_tensor.shape[-1])
@@ -1712,11 +1619,6 @@ class AscendSFAImpl(MLAAttentionImpl):
                 )
             elif q_c_scale.dim() > 1 and q_c_scale.shape[-1] == 1:
                 q_c_scale = q_c_scale.squeeze(dim=-1)
-            logger.info(
-                "[SFA-5.3][indexer_post] layer=%s q_proj_path=npu_quant_matmul q_c=%s",
-                self.layer_name,
-                tuple(q_c_tensor.shape),
-            )
             q_li = torch_npu.npu_quant_matmul(
                 q_c_tensor,
                 self.wq_b.weight,
@@ -1725,16 +1627,13 @@ class AscendSFAImpl(MLAAttentionImpl):
                 **quant_matmul_kwargs,
             )
         else:
-            logger.info("[SFA-5.3][indexer_post] layer=%s q_proj_path=wq_b", self.layer_name)
             q_li, _ = self.wq_b(q_c)
         q_li = q_li.view(-1, self.n_head, self.head_dim)
         if HAS_TRITON:
-            logger.info("[SFA-5.3][indexer_post] layer=%s rope_path=triton", self.layer_name)
             q_li = rope_forward_triton_siso(
                 q_li, cos, sin, rope_dim=self.qk_rope_head_dim, is_neox_style=self.is_rope_neox_style
             )
         else:
-            logger.info("[SFA-5.3][indexer_post] layer=%s rope_path=npu_rotary_mul", self.layer_name)
             q_li_pe, q_li_nope = torch.split(
                 q_li, [self.qk_rope_head_dim, self.head_dim - self.qk_rope_head_dim], dim=-1
             )
@@ -1748,21 +1647,9 @@ class AscendSFAImpl(MLAAttentionImpl):
         q_li_shape_ori = None
         if self.enable_sparse_li_c8:
             q_li_shape_ori = q_li.shape
-            logger.info(
-                "[SFA-5.3][indexer_post] layer=%s li_c8_path=hadamard+npu_dynamic_quant q_li=%s",
-                self.layer_name,
-                tuple(q_li.shape),
-            )
             q_li = q_li @ AscendSFAImpl.q_hadamard
             q_li, q_li_scale = torch_npu.npu_dynamic_quant(q_li.view(-1, self.head_dim), dst_type=self.c8_k_cache_dtype)
             q_li_scale = q_li_scale.to(self.c8_k_scale_cache_dtype)  # [b*s,]
-        logger.info(
-            "[SFA-5.3][indexer_post_pre_device] layer=%s q_li=%s q_li_scale=%s weights=%s",
-            self.layer_name,
-            tuple(q_li.shape),
-            None if q_li_scale is None else tuple(q_li_scale.shape),
-            tuple(weights.shape),
-        )
         record_attention_compute_start()
         return DeviceOperator.indexer_select_post_process(
             self,
@@ -1806,14 +1693,6 @@ class AscendSFAImpl(MLAAttentionImpl):
     def _execute_sparse_flash_attention_process(
         self, ql_nope, q_pe, kv_cache, topk_indices, attn_metadata, actual_seq_lengths_query, actual_seq_lengths_key
     ):
-        logger.info(
-            "[SFA-5.3][sfa_process] layer=%s ql_nope=%s q_pe=%s kv_cache=%s topk=%s",
-            self.layer_name,
-            tuple(ql_nope.shape),
-            tuple(q_pe.shape),
-            tuple(None if t is None else tuple(t.shape) for t in kv_cache),
-            tuple(topk_indices.shape),
-        )
         return DeviceOperator.execute_sparse_flash_attention_process(
             self,
             ql_nope,
@@ -1849,16 +1728,7 @@ class AscendSFAImpl(MLAAttentionImpl):
         list[torch.distributed.Work],
     ]:
         """Gather native-preprocess KV tensors when DSA context parallel is enabled."""
-        logger.info(
-            "[SFA-5.3][_maybe_gather_kv_for_dsacp] layer=%s enable_dsa_cp=%s enable_sparse_sfa_c8=%s enable_sparse_li_c8=%s runtime_has_indexer=%s",
-            self.layer_name,
-            self.enable_dsa_cp,
-            self.enable_sparse_sfa_c8,
-            self.enable_sparse_li_c8,
-            self.runtime_has_indexer,
-        )
         if not self.enable_dsa_cp:
-            logger.info("[SFA-5.3][_maybe_gather_kv_for_dsacp] layer=%s path=no_dsa_cp", self.layer_name)
             return k_li, k_li_scale, None, []
 
         assert k_pe is not None
@@ -1911,14 +1781,6 @@ class AscendSFAImpl(MLAAttentionImpl):
             if kv_ag_handle is not None:
                 kv_ag_handles.append(kv_ag_handle)
 
-        logger.info(
-            "[SFA-5.3][_maybe_gather_kv_for_dsacp_out] layer=%s fused_kv=%s k_li=%s k_li_scale=%s num_handles=%s",
-            self.layer_name,
-            None if fused_kv_no_split is None else tuple(fused_kv_no_split.shape),
-            None if k_li is None else tuple(k_li.shape),
-            None if k_li_scale is None else tuple(k_li_scale.shape),
-            len(kv_ag_handles),
-        )
         return k_li, k_li_scale, fused_kv_no_split, kv_ag_handles
 
     @_sfa_5_3_scope("SFA-5.3/06_store_kvcache")
@@ -1942,18 +1804,10 @@ class AscendSFAImpl(MLAAttentionImpl):
         list[torch.distributed.Work | None] | None,
     ]:
         """Store KV produced by native preprocessing for C8 and DSA-CP paths."""
-        logger.info(
-            "[SFA-5.3][_maybe_store_kvcache] layer=%s enable_sparse_sfa_c8=%s enable_dsa_cp=%s full_gather_o_proj_enabled=%s",
-            self.layer_name,
-            self.enable_sparse_sfa_c8,
-            self.enable_dsa_cp,
-            full_gather_o_proj_enabled,
-        )
         o_proj_full_handle = None
         o_proj_full_param_handles = None
 
         if self.enable_sparse_sfa_c8 and not self.enable_dsa_cp:
-            logger.info("[SFA-5.3][_maybe_store_kvcache] layer=%s path=sfa_c8_only_scatter", self.layer_name)
             assert k_pe is not None
             assert k_nope is not None
             assert knope_scale is not None
@@ -1973,28 +1827,12 @@ class AscendSFAImpl(MLAAttentionImpl):
                 slot_mapping_sfa.view(-1, 1),
                 packed_kv.view(-1, packed_head_dim),
             )
-            logger.info(
-                "[SFA-5.3][_maybe_store_kvcache] layer=%s op=npu_scatter_nd_update_ packed_kv=%s",
-                self.layer_name,
-                tuple(packed_kv.shape),
-            )
 
         if self.enable_dsa_cp:
-            logger.info(
-                "[SFA-5.3][_maybe_store_kvcache] layer=%s waiting kv_ag_handles num=%s",
-                self.layer_name,
-                len(kv_ag_handles),
-            )
             for kv_ag_handle in kv_ag_handles:
                 kv_ag_handle.wait()
 
             if full_gather_o_proj_enabled:
-                logger.info(
-                    "[SFA-5.3][o_proj_weight_gather] layer=%s op=all_gather_async input=%s output=%s",
-                    self.layer_name,
-                    tuple(self.o_proj_tp_weight_gather_input.shape),
-                    tuple(self.o_proj_full_gather_pool.shape),
-                )
                 _, o_proj_full_handle = all_gather_async(
                     self.o_proj_tp_weight_gather_input,
                     get_tp_group(),
@@ -2012,12 +1850,6 @@ class AscendSFAImpl(MLAAttentionImpl):
             if kv_cache is not None:
                 assert fused_kv_no_split is not None
                 if self.enable_sparse_sfa_c8:
-                    logger.info(
-                        "[SFA-5.3][_maybe_store_kvcache] layer=%s dsa_cp_c8_scatter fused_kv=%s cache=%s",
-                        self.layer_name,
-                        tuple(fused_kv_no_split.shape),
-                        tuple(kv_cache[0].shape),
-                    )
                     torch_npu.npu_scatter_nd_update_(
                         kv_cache[0].view(-1, fused_kv_no_split.shape[-1]),
                         slot_mapping_sfa[: attn_metadata.num_actual_tokens].view(-1, 1),
@@ -2043,12 +1875,6 @@ class AscendSFAImpl(MLAAttentionImpl):
                 if not self.enable_sparse_sfa_c8:
                     assert k_pe is not None
                     assert k_nope is not None
-                    logger.info(
-                        "[SFA-5.3][_maybe_store_kvcache] layer=%s path=reshape_and_cache key=%s value=%s",
-                        self.layer_name,
-                        tuple(k_nope.shape),
-                        tuple(k_pe.shape),
-                    )
                     k_nope = k_nope.view(k_nope.shape[0], 1, -1)
                     k_pe = k_pe.view(k_pe.shape[0], 1, -1)
                     DeviceOperator.reshape_and_cache(
@@ -2132,22 +1958,7 @@ class AscendSFAImpl(MLAAttentionImpl):
         output: torch.Tensor | None = None,
     ) -> torch.Tensor:
         assert output is not None, "Output tensor must be provided."
-        logger.info(
-            "[SFA-5.3][entry] layer=%s hidden=%s tokens=%s state=%s "
-            "preprocess=%s dsa_cp=%s sfa_c8=%s li_c8=%s skip_topk=%s has_indexer=%s",
-            layer_name,
-            tuple(hidden_states.shape),
-            attn_metadata.num_input_tokens if attn_metadata is not None else None,
-            attn_metadata.attn_state if attn_metadata is not None else None,
-            self.preprocess_type,
-            self.enable_dsa_cp,
-            self.enable_sparse_sfa_c8,
-            self.enable_sparse_li_c8,
-            self.skip_topk,
-            self.runtime_has_indexer,
-        )
         if attn_metadata is None:
-            logger.info("[SFA-5.3][dummy_run] layer=%s output=%s", layer_name, tuple(output.shape))
             # Profiling / dummy run: run o_proj on zero input so the OTP HCCL
             # collectives are executed on every DP rank (including dummy
             # accompanying ranks that would otherwise skip attention and
@@ -2204,16 +2015,8 @@ class AscendSFAImpl(MLAAttentionImpl):
             and num_input_tokens > MLAPO_MAX_SUPPORTED_TOKENS
         ):
             fused_type = PreprocessType.NATIVE
-        logger.info(
-            "[SFA-5.3][fused_type] layer=%s fused_type=%s state=%s num_input_tokens=%s",
-            layer_name,
-            fused_type,
-            attn_metadata.attn_state,
-            num_input_tokens,
-        )
 
         if fused_type != PreprocessType.NATIVE:
-            logger.info("[SFA-5.3][fused_path] layer=%s fused_type=%s enable_sp=%s", layer_name, fused_type, self.enable_sp)
             if self.enable_sp:
                 hidden_states = torch.ops.vllm.maybe_all_gather_and_maybe_unpad(
                     hidden_states.contiguous(), need_gather_q_kv
@@ -2223,14 +2026,10 @@ class AscendSFAImpl(MLAAttentionImpl):
                     "SFA Prolog V3 requires one cache index per input token, "
                     f"got token_x={hidden_states.shape[0]} and cache_index={slot_mapping.numel()}."
                 )
-                logger.info("[SFA-5.3][preprocess] layer=%s path=PROLOG_V3 tokens=%s", layer_name, hidden_states.shape[0])
-            else:
-                logger.info("[SFA-5.3][preprocess] layer=%s path=MLAPO tokens=%s", layer_name, num_input_tokens)
             if self.runtime_has_indexer:
                 k_li, k_li_scale = self.indexer_select_pre_process(x=hidden_states, cos=cos, sin=sin)
             else:
                 k_li, k_li_scale = None, None
-                logger.info("[SFA-5.3][indexer] layer=%s runtime_has_indexer=False", layer_name)
             wait_for_kv_layer_from_connector(layer_name)
 
             if fused_type == PreprocessType.PROLOG_V3:
@@ -2250,49 +2049,21 @@ class AscendSFAImpl(MLAAttentionImpl):
                     slot_mapping=slot_mapping,
                     num_input_tokens=num_input_tokens,
                 )
-            logger.info(
-                "[SFA-5.3][fused_out] layer=%s hidden=%s ql_nope=%s q_pe=%s q_c=%s",
-                layer_name,
-                tuple(hidden_states.shape),
-                tuple(ql_nope.shape),
-                tuple(q_pe.shape),
-                None if q_c is None else (tuple(q_c.shape) if not isinstance(q_c, tuple) else tuple(x.shape for x in q_c)),
-            )
         # native
         else:
             assert self.fused_qkv_a_proj is not None, "q lora is required for DSA."
-            logger.info(
-                "[SFA-5.3][native] layer=%s hidden=%s enable_sp=%s enable_dsa_cp=%s",
-                layer_name,
-                tuple(hidden_states.shape),
-                self.enable_sp,
-                self.enable_dsa_cp,
-            )
             if self.enable_sp and not self.enable_dsa_cp:
                 hidden_states = torch.ops.vllm.maybe_all_gather_and_maybe_unpad(
                     hidden_states.contiguous(), need_gather_q_kv
                 )
-                logger.info("[SFA-5.3][sp_allgather] layer=%s hidden=%s", layer_name, tuple(hidden_states.shape))
             with record_function_or_nullcontext("SFA-5.3/01_fused_qkv_a_proj_split_qnorm"):
                 qkv_lora = self.fused_qkv_a_proj(hidden_states)[0]
-                logger.info(
-                    "[SFA-5.3][fused_qkv_a_proj] layer=%s qkv_lora=%s", layer_name, tuple(qkv_lora.shape)
-                )
                 q_c, kv_no_split = qkv_lora.split(
                     [self.q_lora_rank, self.kv_lora_rank + self.qk_rope_head_dim],
                     dim=-1,
                 )
-                logger.info(
-                    "[SFA-5.3][split] layer=%s q_c=%s kv_no_split=%s",
-                    layer_name,
-                    tuple(q_c.shape),
-                    tuple(kv_no_split.shape),
-                )
                 assert self.q_a_layernorm is not None, "q_a_layernorm must be initialized"
                 q_c = self.q_a_layernorm(q_c)
-                logger.info(
-                    "[SFA-5.3][q_a_layernorm] layer=%s q_c_normed=%s", layer_name, tuple(q_c.shape)
-                )
 
             if self.runtime_has_indexer:
                 k_li, k_li_scale = self.indexer_select_pre_process(
@@ -2302,7 +2073,6 @@ class AscendSFAImpl(MLAAttentionImpl):
                 )
             else:
                 k_li, k_li_scale = None, None
-                logger.info("[SFA-5.3][indexer] layer=%s runtime_has_indexer=False", layer_name)
 
             wait_for_kv_layer_from_connector(layer_name)
 
@@ -2314,13 +2084,6 @@ class AscendSFAImpl(MLAAttentionImpl):
             kv_outputs = self.exec_kv(kv_no_split, cos, sin, kv_cache, kv_slots, attn_metadata)
             k_pe, k_nope = kv_outputs[:2]
             knope_scale = kv_outputs[2] if len(kv_outputs) == 3 else None
-            logger.info(
-                "[SFA-5.3][exec_kv_out] layer=%s k_pe=%s k_nope=%s knope_scale=%s",
-                layer_name,
-                None if k_pe is None else tuple(k_pe.shape),
-                None if k_nope is None else tuple(k_nope.shape),
-                None if knope_scale is None else tuple(knope_scale.shape),
-            )
             k_li, k_li_scale, fused_kv_no_split, kv_ag_handles = self._maybe_gather_kv_for_dsacp(
                 k_pe,
                 k_nope,
@@ -2329,20 +2092,9 @@ class AscendSFAImpl(MLAAttentionImpl):
                 k_li_scale,
                 full_gather_o_proj_enabled,
             )
-            logger.info(
-                "[SFA-5.3][gather_kv_out] layer=%s k_li=%s k_li_scale=%s fused_kv_no_split=%s",
-                layer_name,
-                None if k_li is None else tuple(k_li.shape),
-                None if k_li_scale is None else tuple(k_li_scale.shape),
-                None if fused_kv_no_split is None else tuple(fused_kv_no_split.shape),
-            )
 
             ql_nope, q_pe = self._q_proj_and_k_up_proj(q_c)
-            logger.info(
-                "[SFA-5.3][q_up_out] layer=%s ql_nope=%s q_pe=%s", layer_name, tuple(ql_nope.shape), tuple(q_pe.shape)
-            )
             q_pe = self.rope_single(q_pe, cos, sin)
-            logger.info("[SFA-5.3][rope_single_out] layer=%s q_pe=%s", layer_name, tuple(q_pe.shape))
             self._record_query_gather_context(
                 ql_nope,
                 q_pe,
@@ -2367,14 +2119,6 @@ class AscendSFAImpl(MLAAttentionImpl):
                 attn_metadata,
                 full_gather_o_proj_enabled,
             )
-            logger.info(
-                "[SFA-5.3][store_kv_out] layer=%s k_pe=%s k_nope=%s k_li=%s o_proj_full_handle=%s",
-                layer_name,
-                None if k_pe is None else tuple(k_pe.shape),
-                None if k_nope is None else tuple(k_nope.shape),
-                None if k_li is None else tuple(k_li.shape),
-                o_proj_full_handle is not None,
-            )
 
             if self.runtime_has_indexer:
                 assert k_li is not None
@@ -2390,13 +2134,6 @@ class AscendSFAImpl(MLAAttentionImpl):
                 dsa_k_cache_idx = self.kv_cache_indexer_k_idx
                 dsa_k_scale_cache_idx = self.kv_cache_indexer_scale_idx
 
-                logger.info(
-                    "[SFA-5.3][indexer_k_write] layer=%s use_li_c8_reshape_optim=%s k_li=%s li_c8=%s",
-                    layer_name,
-                    use_li_c8_reshape_optim,
-                    tuple(k_li.shape),
-                    self.enable_sparse_li_c8,
-                )
                 if use_li_c8_reshape_optim:
                     torch.ops._C_ascend.store_kv_block(
                         k_li,
@@ -2406,27 +2143,15 @@ class AscendSFAImpl(MLAAttentionImpl):
                         attn_metadata.group_key_cache_idx,
                         attn_metadata.block_size,
                     )
-                    logger.info(
-                        "[SFA-5.3][indexer_k_store] layer=%s op=_C_ascend.store_kv_block", layer_name
-                    )
                 else:
                     torch_npu.npu_scatter_nd_update_(
                         kv_cache[dsa_k_cache_idx].view(-1, k_li.shape[-1]),
                         slot_mapping.view(-1, 1),
                         k_li.view(-1, k_li.shape[-1]),
                     )  # b, s, n, d
-                    logger.info(
-                        "[SFA-5.3][indexer_k_store] layer=%s op=npu_scatter_nd_update_", layer_name
-                    )
                 if self.enable_sparse_li_c8:
                     assert len(kv_cache) == (3 if self.enable_sparse_sfa_c8 else 4)
                     if k_li_scale is not None:
-                        logger.info(
-                            "[SFA-5.3][indexer_scale_write] layer=%s use_li_c8_reshape_optim=%s k_li_scale=%s",
-                            layer_name,
-                            use_li_c8_reshape_optim,
-                            tuple(k_li_scale.shape),
-                        )
                         if use_li_c8_reshape_optim:
                             torch.ops._C_ascend.store_kv_block(
                                 k_li_scale,
@@ -2436,25 +2161,16 @@ class AscendSFAImpl(MLAAttentionImpl):
                                 attn_metadata.group_key_cache_idx,
                                 attn_metadata.block_size,
                             )
-                            logger.info(
-                                "[SFA-5.3][indexer_scale_store] layer=%s op=_C_ascend.store_kv_block", layer_name
-                            )
                         else:
                             torch_npu.npu_scatter_nd_update_(
                                 kv_cache[dsa_k_scale_cache_idx].view(-1, k_li_scale.shape[-1]),
                                 slot_mapping.view(-1, 1),
                                 k_li_scale.view(-1, k_li_scale.shape[-1]),
                             )
-                            logger.info(
-                                "[SFA-5.3][indexer_scale_store] layer=%s op=npu_scatter_nd_update_", layer_name
-                            )
                 notify_kv_cache_written(self.layer_name or "")
         elif kv_cache is not None and self.has_indexer and self.skip_indexer_pre_process:
             # Static IndexCache S layers still write the main MLA KV cache;
             # only the per-layer indexer KV cache is intentionally skipped.
-            logger.info(
-                "[SFA-5.3][skip_indexer_pre_process] layer=%s skip_indexer_pre_process=True", layer_name
-            )
             notify_kv_cache_written(self.layer_name or "")
 
         if self.enable_dsa_cp and attn_metadata.dsa_cp_context is not None:
@@ -2464,17 +2180,10 @@ class AscendSFAImpl(MLAAttentionImpl):
         with record_function_or_nullcontext("SFA-5.3/07_topk"):
             if self.skip_topk:
                 topk_indices = self._get_indexcache_topk_indices(topk_num_tokens)
-                logger.info(
-                    "[SFA-5.3][topk] layer=%s path=skip_topk topk_num_tokens=%s topk=%s",
-                    layer_name,
-                    topk_num_tokens,
-                    tuple(topk_indices.shape),
-                )
             else:
                 if not self.has_indexer:
                     raise RuntimeError(f"skip_topk is False but indexer is None. layer_name={self.layer_name}.")
                 assert q_c is not None
-                logger.info("[SFA-5.3][topk] layer=%s path=full_indexer", layer_name)
                 topk_indices = self.indexer_select_post_process(
                     x=hidden_states,
                     q_c=q_c,
@@ -2485,18 +2194,9 @@ class AscendSFAImpl(MLAAttentionImpl):
                     actual_seq_lengths_query=actual_seq_lengths_query,
                     actual_seq_lengths_key=actual_seq_lengths_key,
                 )
-                logger.info("[SFA-5.3][topk_out] layer=%s topk=%s", layer_name, tuple(topk_indices.shape))
                 if self.use_index_cache:
                     self._update_indexcache_topk_indices(topk_indices)
 
-        logger.info(
-            "[SFA-5.3][sfa_enter] layer=%s ql_nope=%s q_pe=%s topk=%s kv_cache=%s",
-            layer_name,
-            tuple(ql_nope.shape),
-            tuple(q_pe.shape),
-            tuple(topk_indices.shape),
-            tuple(None if t is None else tuple(t.shape) for t in kv_cache),
-        )
         attn_output = self._execute_sparse_flash_attention_process(
             ql_nope,
             q_pe,
@@ -2506,7 +2206,6 @@ class AscendSFAImpl(MLAAttentionImpl):
             actual_seq_lengths_query,
             actual_seq_lengths_key,
         )
-        logger.info("[SFA-5.3][sfa_out] layer=%s attn_output=%s", layer_name, tuple(attn_output.shape))
 
         attn_output = self._v_up_proj(attn_output)
 
@@ -2514,11 +2213,6 @@ class AscendSFAImpl(MLAAttentionImpl):
             # SFA DSA-CP keeps o_proj weight sharded in the TP domain:
             # 1. prefill/mixed: gather TP shards into a temporary full weight.
             # 2. decode-only: all-to-all hidden states, then run TP o_proj.
-            logger.info(
-                "[SFA-5.3][o_proj_dsa_cp] layer=%s full_gather_o_proj_enabled=%s",
-                layer_name,
-                full_gather_o_proj_enabled,
-            )
             result, require_o_proj_forward = self._handle_o_proj_weight_switch_and_forward(
                 attn_output=attn_output,
                 output=output,
@@ -2530,30 +2224,20 @@ class AscendSFAImpl(MLAAttentionImpl):
                 # The full-weight prefill path completes o_proj internally,
                 # but a pure P node must still publish this layer's KV cache.
                 maybe_save_kv_layer_to_connector(layer_name, list(kv_cache))
-                logger.info("[SFA-5.3][o_proj_dsa_cp] layer=%s full_weight_path_done output=%s", layer_name, tuple(result.shape))
                 return result
             attn_output = result
-            logger.info("[SFA-5.3][o_proj_dsa_cp] layer=%s all_to_all_activation_path attn_output=%s", layer_name, tuple(attn_output.shape))
 
         if oproj_tp_enable():
             # oproj_tp: cross-DP sharded o_proj via static-buffer
             # all_to_all / reduce_scatter (see _forward_o_proj_tp). CP is
             # mutually exclusive with oproj_tp (oproj requires TP == 1), so
             # this is the non-CP path.
-            logger.info("[SFA-5.3][o_proj] layer=%s path=oproj_tp", layer_name)
             self._forward_o_proj_tp(attn_output, output)
         else:
             with record_function_or_nullcontext("SFA-5.3/09_o_proj_default"):
-                logger.info(
-                    "[SFA-5.3][o_proj] layer=%s path=default o_proj_input=%s output=%s",
-                    layer_name,
-                    tuple(attn_output.shape),
-                    tuple(output.shape),
-                )
                 output[...] = self.o_proj(attn_output)[0]
 
         maybe_save_kv_layer_to_connector(layer_name, list(kv_cache))
-        logger.info("[SFA-5.3][exit] layer=%s output=%s", layer_name, tuple(output.shape))
 
         return output_padded
 
@@ -2572,17 +2256,8 @@ def custom_kv_rmsnorm_rope(
     tile_size: int = SFA_QSFA_TILE_SIZE,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     rms_in, rope_in = kv.split([kv_lora_rank, qk_rope_head_dim], dim=-1)
-    logger.info(
-        "[SFA-5.3][custom_kv_rmsnorm_rope] rms_in=%s rope_in=%s dst_type=%s",
-        tuple(rms_in.shape),
-        tuple(rope_in.shape),
-        dst_type,
-    )
     k_nope, _ = torch_npu.npu_rms_norm(rms_in, gamma, epsilon=epsilon)
     k_rope = torch_npu.npu_interleave_rope(rope_in, cos, sin)
-    logger.info(
-        "[SFA-5.3][custom_kv_rmsnorm_rope] rms_out=%s rope_out=%s", tuple(k_nope.shape), tuple(k_rope.shape)
-    )
 
     prefix_shape = k_nope.shape[:-1]
     k_nope, knope_scale = torch_npu.npu_dynamic_block_quant(
@@ -2590,11 +2265,6 @@ def custom_kv_rmsnorm_rope(
         dst_type=dst_type,
         row_block_size=1,
         col_block_size=tile_size,
-    )
-    logger.info(
-        "[SFA-5.3][custom_kv_rmsnorm_rope] block_quant_out k_nope=%s knope_scale=%s",
-        tuple(k_nope.shape),
-        tuple(knope_scale.shape),
     )
     if dst_type == torch.int8:
         # Return byte views so the caller can concatenate all three components.

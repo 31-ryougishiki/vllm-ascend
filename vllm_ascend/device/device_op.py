@@ -22,7 +22,6 @@ from typing import Any
 import torch
 import torch.nn.functional as F
 import torch_npu
-from vllm.logger import logger
 from vllm.triton_utils import HAS_TRITON
 from vllm.v1.utils import record_function_or_nullcontext
 
@@ -492,23 +491,12 @@ class BaseDeviceAdaptor:
         # TODO: torch.ops._C_ascend.npu_lightning_indexer needs to be removed.
         indexer_cache_idx = sfa_impl.kv_cache_indexer_k_idx
         indexer_scale_cache_idx = sfa_impl.kv_cache_indexer_scale_idx
-        logger.info(
-            "[SFA-5.3][device_indexer_post] layer=%s enable_sparse_li_c8=%s use_torch_npu_li=%s q_li=%s",
-            sfa_impl.layer_name,
-            enable_sparse_li_c8,
-            use_torch_npu_lightning_indexer,
-            tuple(q_li.shape),
-        )
 
         if enable_sparse_li_c8:
             assert len(kv_cache) == (3 if sfa_impl.enable_sparse_sfa_c8 else 4)
             assert q_li_scale is not None
             assert q_li_shape_ori is not None
             weights = weights.to(torch.float16)
-            logger.info(
-                "[SFA-5.3][device_indexer_post] layer=%s path=_C_ascend.npu_lightning_indexer_quant",
-                sfa_impl.layer_name,
-            )
             topk_indices = torch.ops._C_ascend.npu_lightning_indexer_quant(
                 query=q_li.view(q_li_shape_ori),
                 key=kv_cache[indexer_cache_idx],
@@ -526,10 +514,6 @@ class BaseDeviceAdaptor:
                 sparse_mode=3,
             )
         elif sfa_impl.use_torch_npu_lightning_indexer:
-            logger.info(
-                "[SFA-5.3][device_indexer_post] layer=%s path=torch_npu.npu_lightning_indexer",
-                sfa_impl.layer_name,
-            )
             topk_indices, _ = torch_npu.npu_lightning_indexer(
                 query=q_li,
                 key=kv_cache[indexer_cache_idx],
@@ -543,9 +527,6 @@ class BaseDeviceAdaptor:
                 sparse_mode=3,
             )
         else:
-            logger.info(
-                "[SFA-5.3][device_indexer_post] layer=%s path=_C_ascend.npu_lightning_indexer", sfa_impl.layer_name
-            )
             topk_indices, _ = torch.ops._C_ascend.npu_lightning_indexer(
                 query=q_li,
                 key=kv_cache[indexer_cache_idx],
@@ -558,11 +539,6 @@ class BaseDeviceAdaptor:
                 sparse_count=2048,
                 sparse_mode=3,
             )
-        logger.info(
-            "[SFA-5.3][device_indexer_post_out] layer=%s topk_indices=%s",
-            sfa_impl.layer_name,
-            tuple(topk_indices.shape),
-        )
         return topk_indices
 
     @classmethod
@@ -595,13 +571,6 @@ class BaseDeviceAdaptor:
             torch.float8_e4m3fn,
             torch.float8_e5m2,
         )
-        logger.info(
-            "[SFA-5.3][device_sfa_process] layer=%s kv=%s kv_dtype=%s use_kv_quant=%s",
-            sfa_impl.layer_name,
-            tuple(kv.shape),
-            kv.dtype,
-            use_kv_quant_sparse_attention,
-        )
         if use_kv_quant_sparse_attention:
             result = cls._execute_kv_quant_sparse_flash_attention(
                 sfa_impl,
@@ -616,10 +585,6 @@ class BaseDeviceAdaptor:
                 return_lse=return_lse,
             )
         else:
-            logger.info(
-                "[SFA-5.3][device_sfa_process] layer=%s path=_C_ascend.npu_sparse_flash_attention",
-                sfa_impl.layer_name,
-            )
             key_rope = kv_cache[1]
             result = torch.ops._C_ascend.npu_sparse_flash_attention(
                 query=ql_nope,
@@ -664,13 +629,6 @@ class BaseDeviceAdaptor:
         return_lse: bool = False,
     ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         query = torch.cat([ql_nope, q_pe], dim=-1).contiguous()
-        logger.info(
-            "[SFA-5.3][base_sfa] layer=%s query=%s kv=%s topk=%s op=_C_ascend.npu_kv_quant_sparse_flash_attention",
-            sfa_impl.layer_name,
-            tuple(query.shape),
-            tuple(kv.shape),
-            tuple(topk_indices.shape),
-        )
         return torch.ops._C_ascend.npu_kv_quant_sparse_flash_attention(
             query=query,
             key=kv,
@@ -1075,13 +1033,6 @@ class A5DeviceAdaptor(BaseDeviceAdaptor):
         return_lse: bool = False,
     ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         query = torch.cat([ql_nope, q_pe], dim=-1).contiguous()
-        logger.info(
-            "[SFA-5.3][a5_sfa] layer=%s query=%s kv=%s topk=%s op=torch_npu.npu_kv_quant_sparse_flash_attention",
-            sfa_impl.layer_name,
-            tuple(query.shape),
-            tuple(kv.shape),
-            tuple(topk_indices.shape),
-        )
         result = torch_npu.npu_kv_quant_sparse_flash_attention(
             query=query,
             key=kv,
@@ -1107,9 +1058,6 @@ class A5DeviceAdaptor(BaseDeviceAdaptor):
                 "C8 sparse flash attention via torch_npu only returns attention_out; "
                 "cannot return softmax max/sum for DCP LSE merge."
             )
-        logger.info(
-            "[SFA-5.3][a5_sfa_out] layer=%s result=%s", sfa_impl.layer_name, tuple(result.shape)
-        )
         return result
 
     @staticmethod
@@ -1739,12 +1687,6 @@ class A5DeviceAdaptor(BaseDeviceAdaptor):
     ) -> torch.Tensor:
         indexer_cache_idx = sfa_impl.kv_cache_indexer_k_idx
         indexer_scale_cache_idx = sfa_impl.kv_cache_indexer_scale_idx
-        logger.info(
-            "[SFA-5.3][a5_indexer_post] layer=%s enable_sparse_li_c8=%s q_li=%s",
-            sfa_impl.layer_name,
-            enable_sparse_li_c8,
-            tuple(q_li.shape),
-        )
 
         if enable_sparse_li_c8:
             assert len(kv_cache) == (3 if sfa_impl.enable_sparse_sfa_c8 else 4)
@@ -1753,10 +1695,6 @@ class A5DeviceAdaptor(BaseDeviceAdaptor):
             if q_li_scale is not None:
                 q_li_scale = q_li_scale.view(q_li_shape_ori[:-1])
                 key_dequant_scale = kv_cache[indexer_scale_cache_idx].squeeze(2)
-                logger.info(
-                    "[SFA-5.3][a5_indexer_post] layer=%s path=torch_npu.npu_quant_lightning_indexer",
-                    sfa_impl.layer_name,
-                )
 
                 topk_indices = torch_npu.npu_quant_lightning_indexer(
                     query=q_li.view(q_li_shape_ori),
@@ -1775,10 +1713,6 @@ class A5DeviceAdaptor(BaseDeviceAdaptor):
                     sparse_mode=3,
                 )
             else:
-                logger.info(
-                    "[SFA-5.3][a5_indexer_post] layer=%s path=torch_npu.npu_lightning_indexer",
-                    sfa_impl.layer_name,
-                )
                 topk_indices, _ = torch_npu.npu_lightning_indexer(
                     query=q_li.view(q_li_shape_ori),
                     key=kv_cache[indexer_cache_idx],
@@ -1792,10 +1726,6 @@ class A5DeviceAdaptor(BaseDeviceAdaptor):
                     sparse_mode=3,
                 )
         else:
-            logger.info(
-                "[SFA-5.3][a5_indexer_post] layer=%s path=torch_npu.npu_lightning_indexer(non_c8)",
-                sfa_impl.layer_name,
-            )
             topk_indices, _ = torch_npu.npu_lightning_indexer(
                 query=q_li,
                 key=kv_cache[indexer_cache_idx],
@@ -1808,11 +1738,6 @@ class A5DeviceAdaptor(BaseDeviceAdaptor):
                 sparse_count=2048,
                 sparse_mode=3,
             )
-        logger.info(
-            "[SFA-5.3][a5_indexer_post_out] layer=%s topk_indices=%s",
-            sfa_impl.layer_name,
-            tuple(topk_indices.shape),
-        )
         return topk_indices
 
     @staticmethod
