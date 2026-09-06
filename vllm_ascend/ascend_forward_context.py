@@ -87,6 +87,62 @@ def _find_zigzag_cp_context(attn_metadata: Any):
     return None
 
 
+def _disable_zigzag_metadata_for_fallback(attn_metadata: Any) -> None:
+    """Restore continuous-slice metadata when zigzag has to be disabled.
+
+    ``AscendSFAMetadataBuilder`` decides zigzag before the forward context
+    knows whether the current run is a draft forward, uses the V2 model
+    runner, or has DP > 1. In those cases ``zigzag_cp_active`` is turned off
+    after the metadata was already built in zigzag layout. Switch the RoPE
+    tables, KV write slots and zigzag flags back to the stored continuous
+    fallback so attention, KV cache writes and the model boundary all execute
+    the same non-zigzag path.
+    """
+    if isinstance(attn_metadata, dict):
+        candidates = list(attn_metadata.values())
+    elif isinstance(attn_metadata, (list, tuple)):
+        candidates = list(attn_metadata)
+    else:
+        candidates = [attn_metadata]
+
+    for meta in candidates:
+        if meta is None:
+            continue
+        ctx = getattr(meta, "dsa_cp_context", None)
+        if ctx is None or getattr(ctx, "zigzag_index", None) is None:
+            continue
+
+        fallback_slot_mapping = getattr(ctx, "fallback_slot_mapping_cp", None)
+        fallback_cos = getattr(ctx, "fallback_cos", None)
+        fallback_sin = getattr(ctx, "fallback_sin", None)
+        if (
+            fallback_slot_mapping is None
+            or fallback_cos is None
+            or fallback_sin is None
+        ):
+            raise RuntimeError(
+                "DSA-CP zigzag metadata is missing its continuous-slice "
+                "fallback tensors and cannot be safely disabled."
+            )
+
+        ctx.slot_mapping_cp = fallback_slot_mapping
+        meta.cos = fallback_cos
+        meta.sin = fallback_sin
+        ctx.zigzag_index = None
+        ctx.zigzag_gather_index = None
+        ctx.inv_gather_index = None
+        ctx.zigzag_actual_gather_index = None
+        ctx.zigzag_actual_rows = None
+        ctx.q_half = 0
+        ctx.q_len_prev = None
+        ctx.q_len_next = None
+        ctx.kv_len_prev = None
+        ctx.kv_len_next = None
+        ctx.fallback_slot_mapping_cp = None
+        ctx.fallback_cos = None
+        ctx.fallback_sin = None
+
+
 def _cann_megamoe_supported_by_config(vllm_config: VllmConfig) -> bool:
     hf_text_config = vllm_config.model_config.hf_text_config
     hidden_size = getattr(hf_text_config, "hidden_size", None)
@@ -158,12 +214,15 @@ def set_ascend_forward_context(
             and not is_draft_model
             and not envs_vllm.VLLM_USE_V2_MODEL_RUNNER
         )
-        if envs_vllm.VLLM_USE_V2_MODEL_RUNNER:
-            forward_context.additional_kwargs["zigzag_cp_context"] = zigzag_cp_context
-            forward_context.additional_kwargs["zigzag_cp_active"] = zigzag_cp_active
-        else:
-            forward_context.zigzag_cp_context = zigzag_cp_context
-            forward_context.zigzag_cp_active = zigzag_cp_active
+        if zigzag_cp_context is not None and not zigzag_cp_active:
+            # Metadata was built in zigzag layout before these disables were
+            # known. Restore the continuous-slice fallback on every metadata
+            # object so the whole forward stays on the non-zigzag path.
+            _disable_zigzag_metadata_for_fallback(attn_metadata)
+            if draft_attn_metadatas:
+                for draft_meta in draft_attn_metadatas:
+                    _disable_zigzag_metadata_for_fallback(draft_meta)
+            zigzag_cp_context = None
 
         from vllm_ascend.ops.fused_moe.moe_comm_method import get_moe_comm_method
 
@@ -237,7 +296,10 @@ def set_ascend_forward_context(
 
         dp_world_size = get_dp_group().world_size
         if dp_world_size > 1:
-            forward_context.zigzag_cp_active = False
+            if zigzag_cp_active:
+                _disable_zigzag_metadata_for_fallback(attn_metadata)
+                zigzag_cp_active = False
+                zigzag_cp_context = None
         if dp_world_size > 1 and forward_context.dp_metadata is not None:
             dp_meta = forward_context.dp_metadata
             max_tokens_across_dp = dp_meta.num_tokens_across_dp_cpu.max().item()
@@ -253,6 +315,13 @@ def set_ascend_forward_context(
         forward_context.max_tokens_across_pcp = max_tokens_across_pcp
 
         forward_context.eplb_heat_collection_status = eplb_heat_collection_status
+
+        if envs_vllm.VLLM_USE_V2_MODEL_RUNNER:
+            forward_context.additional_kwargs["zigzag_cp_context"] = zigzag_cp_context
+            forward_context.additional_kwargs["zigzag_cp_active"] = zigzag_cp_active
+        else:
+            forward_context.zigzag_cp_context = zigzag_cp_context
+            forward_context.zigzag_cp_active = zigzag_cp_active
 
         if num_tokens is not None:
             if num_actual_tokens is None:
