@@ -582,6 +582,7 @@ def can_enable_zigzag_for_batch(
     speculative: bool = False,
     v2_model_runner: bool = False,
     dp_size: int = 1,
+    dcp_replicated: bool = False,
 ) -> bool:
     """The single source of truth for whether a batch may use zigzag CP.
 
@@ -597,8 +598,10 @@ def can_enable_zigzag_for_batch(
         return False
     if cp_size <= 1:
         return False
-    if speculative or v2_model_runner or dp_size > 1:
+    if speculative or v2_model_runner or dp_size > 1 or dcp_replicated:
         # The model-boundary fallback paths cannot carry the zigzag layout.
+        # Replicated-indexer DCP owns a different block-table/gather flow and
+        # must stay on the continuous-slice path.
         return False
     state_name = getattr(attn_state, "name", attn_state)
     if state_name not in _PURE_PREFILL_ATTENTION_STATES:

@@ -93,6 +93,9 @@ def test_can_zigzag_supports_multi_request_pure_prefill():
         assert not _can_zigzag(
             states[0], 16, 16, 2, [16], [0], dp_size=2
         )
+        assert not _can_zigzag(
+            states[0], 16, 16, 2, [16], [0], dcp_replicated=True
+        )
         # A batch containing a decode request is rejected by is_prefilling.
         assert not _can_zigzag(
             states[0],
@@ -173,6 +176,15 @@ def test_build_zigzag_meta_matches_sglang_zigzag_layout():
     torch.testing.assert_close(
         rank0["split_list"], torch.tensor([4, 4, 4, 4])
     )
+    # Single-call merged metadata: one prev batch + one next batch.
+    torch.testing.assert_close(
+        rank0["actual_seq_lengths_query_zigzag"],
+        torch.tensor([4, 8], dtype=torch.int32),
+    )
+    torch.testing.assert_close(
+        rank0["actual_seq_lengths_key_zigzag"],
+        torch.tensor([4, 16], dtype=torch.int32),
+    )
 
 
 def test_build_zigzag_meta_multi_request_balances_rank_local_tokens():
@@ -224,6 +236,17 @@ def test_build_zigzag_meta_multi_request_balances_rank_local_tokens():
     )
     torch.testing.assert_close(
         rank1["kv_len_next"], torch.tensor([6, 3], dtype=torch.int32)
+    )
+
+    # Single-call metadata describes [prev0, prev1, next0, next1] as four
+    # batches with cumulative query boundaries and raw KV lengths.
+    torch.testing.assert_close(
+        rank0["actual_seq_lengths_query_zigzag"],
+        torch.tensor([2, 3, 5, 6], dtype=torch.int32),
+    )
+    torch.testing.assert_close(
+        rank0["actual_seq_lengths_key_zigzag"],
+        torch.tensor([2, 1, 8, 4], dtype=torch.int32),
     )
 
     # Rank-concatenating gather order and its inverse rerange.
@@ -306,6 +329,15 @@ def test_build_zigzag_meta_supports_radix_cache_prefixes():
     )
     torch.testing.assert_close(
         rank0["q_len_next"], torch.tensor([1, 2], dtype=torch.int32)
+    )
+    # Merged single-call view of the same prefix batch.
+    torch.testing.assert_close(
+        rank0["actual_seq_lengths_query_zigzag"],
+        torch.tensor([1, 2, 3, 4], dtype=torch.int32),
+    )
+    torch.testing.assert_close(
+        rank0["actual_seq_lengths_key_zigzag"],
+        torch.tensor([9, 17, 12, 20], dtype=torch.int32),
     )
 
 
@@ -417,31 +449,37 @@ def test_model_boundary_shard_matches_local_zigzag_order():
     torch.testing.assert_close(sharded[:, 0], torch.tensor([0.0, 1.0, 6.0, 7.0]))
 
 
-def test_indexer_zigzag_splits_at_total_q_prev_tokens_and_concats():
+def test_indexer_zigzag_uses_single_call_with_merged_batches():
     impl = _make_impl()
     x = torch.zeros(6, 6)
     kw = torch.zeros(6, 6)
     impl.wk_weights_proj.return_value = (kw, None)
     q_c = torch.zeros(6, 2)
+    block_table_zigzag = torch.arange(24).view(4, 6)
     attn_metadata = SimpleNamespace(
         dsa_cp_context=SimpleNamespace(
             zigzag_index=torch.tensor([0, 1, 2, 6, 7, 8]),
             total_q_prev_tokens=3,
             total_q_next_tokens=3,
-            q_len_prev=torch.tensor([2, 3], dtype=torch.int32),
-            q_len_next=torch.tensor([1, 3], dtype=torch.int32),
-            kv_len_prev=torch.tensor([2, 5], dtype=torch.int32),
-            kv_len_next=torch.tensor([4, 6], dtype=torch.int32),
+            actual_seq_lengths_query_zigzag=torch.tensor(
+                [2, 3, 5, 6], dtype=torch.int32
+            ),
+            actual_seq_lengths_key_zigzag=torch.tensor(
+                [2, 5, 4, 6], dtype=torch.int32
+            ),
+            block_table_zigzag=block_table_zigzag,
         )
     )
 
     q_li = torch.arange(48, dtype=torch.float32).view(6, 2, 4)
     call_shapes = []
+    call_block_tables = []
     fake_returns = []
 
     def fake_device(*args, **kwargs):
         q_li_h = args[1]
         call_shapes.append(tuple(q_li_h.shape))
+        call_block_tables.append(kwargs.get("block_table"))
         result = torch.full((q_li_h.shape[0], 1), float(len(call_shapes)))
         fake_returns.append(result)
         return result
@@ -454,17 +492,64 @@ def test_indexer_zigzag_splits_at_total_q_prev_tokens_and_concats():
         ),
         patch("vllm_ascend.attention.sfa_v1.record_attention_compute_start"),
     ):
-        result = impl._indexer_select_post_process_zigzag(
+        result = impl.indexer_select_post_process(
             x=x,
             q_c=q_c,
             kv_cache=(),
             attn_metadata=attn_metadata,
             cos=torch.zeros(6, 2),
             sin=torch.zeros(6, 2),
+            actual_seq_lengths_query=attn_metadata.dsa_cp_context.actual_seq_lengths_query_zigzag,
+            actual_seq_lengths_key=attn_metadata.dsa_cp_context.actual_seq_lengths_key_zigzag,
+            block_table=attn_metadata.dsa_cp_context.block_table_zigzag,
         )
 
-    assert call_shapes == [(3, 2, 4), (3, 2, 4)]
-    torch.testing.assert_close(result, torch.cat(fake_returns, dim=0))
+    assert call_shapes == [(6, 2, 4)]
+    assert len(call_block_tables) == 1
+    assert call_block_tables[0] is block_table_zigzag
+    torch.testing.assert_close(result, fake_returns[0])
+
+
+def test_sfa_zigzag_single_call_passes_merged_block_table():
+    impl = AscendSFAImpl.__new__(AscendSFAImpl)
+    block_table_zigzag = torch.arange(12).view(4, 3)
+    attn_metadata = SimpleNamespace(
+        dsa_cp_context=SimpleNamespace(
+            zigzag_index=torch.tensor([0, 1, 2, 3, 4, 5]),
+            actual_seq_lengths_query_zigzag=torch.tensor(
+                [2, 4, 6], dtype=torch.int32
+            ),
+            actual_seq_lengths_key_zigzag=torch.tensor(
+                [2, 4, 6], dtype=torch.int32
+            ),
+            block_table_zigzag=block_table_zigzag,
+        )
+    )
+    ctx = attn_metadata.dsa_cp_context
+    fake_output = torch.zeros(6, 1, 4)
+    captured = {}
+
+    def fake_device(*args, **kwargs):
+        captured.update(kwargs)
+        return fake_output
+
+    with patch(
+        "vllm_ascend.attention.sfa_v1.DeviceOperator.execute_sparse_flash_attention_process",
+        side_effect=fake_device,
+    ):
+        result = impl._execute_sparse_flash_attention_process(
+            ql_nope=torch.zeros(6, 1, 4),
+            q_pe=torch.zeros(6, 1, 2),
+            kv_cache=(),
+            topk_indices=torch.zeros(6, 1, 4, dtype=torch.int32),
+            attn_metadata=attn_metadata,
+            actual_seq_lengths_query=ctx.actual_seq_lengths_query_zigzag,
+            actual_seq_lengths_key=ctx.actual_seq_lengths_key_zigzag,
+            block_table=ctx.block_table_zigzag,
+        )
+
+    assert captured["block_table"] is block_table_zigzag
+    assert result is fake_output
 
 
 def test_disable_zigzag_metadata_restores_continuous_fallback():
@@ -492,6 +577,9 @@ def test_disable_zigzag_metadata_restores_continuous_fallback():
         actual_seq_q_next_list=torch.tensor([2]),
         kv_len_prev_list=torch.tensor([2]),
         kv_len_next_list=torch.tensor([4]),
+        actual_seq_lengths_query_zigzag=torch.tensor([2, 4], dtype=torch.int32),
+        actual_seq_lengths_key_zigzag=torch.tensor([2, 4], dtype=torch.int32),
+        block_table_zigzag=torch.tensor([[0, 1], [0, 1]]),
         slot_mapping_cp=torch.tensor([0, 1, 6, 7]),
         fallback_slot_mapping_cp=fallback_slot_mapping,
         fallback_cos=fallback_cos,
@@ -528,6 +616,9 @@ def test_disable_zigzag_metadata_restores_continuous_fallback():
     assert ctx.actual_seq_q_next_list is None
     assert ctx.kv_len_prev_list is None
     assert ctx.kv_len_next_list is None
+    assert ctx.actual_seq_lengths_query_zigzag is None
+    assert ctx.actual_seq_lengths_key_zigzag is None
+    assert ctx.block_table_zigzag is None
     assert ctx.fallback_slot_mapping_cp is None
     assert ctx.fallback_cos is None
     assert ctx.fallback_sin is None

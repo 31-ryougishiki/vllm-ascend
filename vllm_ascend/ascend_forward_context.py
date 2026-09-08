@@ -149,6 +149,9 @@ def _disable_zigzag_metadata_for_fallback(attn_metadata: Any) -> None:
         ctx.actual_seq_q_next_list = None
         ctx.kv_len_prev_list = None
         ctx.kv_len_next_list = None
+        ctx.actual_seq_lengths_query_zigzag = None
+        ctx.actual_seq_lengths_key_zigzag = None
+        ctx.block_table_zigzag = None
         ctx.fallback_slot_mapping_cp = None
         ctx.fallback_cos = None
         ctx.fallback_sin = None

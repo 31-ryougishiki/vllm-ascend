@@ -2671,6 +2671,7 @@ class NPUModelRunner(GPUModelRunner):
             speculative=False,
             v2_model_runner=envs_vllm.VLLM_USE_V2_MODEL_RUNNER,
             dp_size=self.vllm_config.parallel_config.data_parallel_size,
+            dcp_replicated=enable_sfa_dcp_replicated_indexer(),
         )
 
     def _pad_for_sequence_parallelism(

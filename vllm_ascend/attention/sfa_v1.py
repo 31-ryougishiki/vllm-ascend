@@ -260,6 +260,13 @@ class DSACPContext:
     actual_seq_q_next_list: torch.Tensor | None = None
     kv_len_prev_list: torch.Tensor | None = None
     kv_len_next_list: torch.Tensor | None = None
+    # Single-kernel-call metadata: prev/next are exposed to the operators as
+    # two batches per request.  query lengths are cumulative prefixes over
+    # [req0..reqB-1 prev, req0..reqB-1 next]; KV lengths are raw per-batch
+    # lengths; block_table repeats each request row twice in the same order.
+    actual_seq_lengths_query_zigzag: torch.Tensor | None = None
+    actual_seq_lengths_key_zigzag: torch.Tensor | None = None
+    block_table_zigzag: torch.Tensor | None = None
     # Continuous-slice fallback values. Metadata is built before the draft /
     # V2-runner / DP>1 disables are known, so keep the non-zigzag cos/sin and
     # slot mapping here. set_ascend_forward_context restores them when it has
@@ -283,6 +290,7 @@ def _can_zigzag(
     speculative: bool = False,
     v2_model_runner: bool = False,
     dp_size: int = 1,
+    dcp_replicated: bool = False,
 ) -> bool:
     """Gate model-level zigzag CP to the prefill cases it can support.
 
@@ -305,6 +313,7 @@ def _can_zigzag(
         speculative=speculative,
         v2_model_runner=v2_model_runner,
         dp_size=dp_size,
+        dcp_replicated=dcp_replicated,
     )
 
 
@@ -377,6 +386,22 @@ def _build_zigzag_meta(
         kv_len_next_list, dtype=torch.int32, device=device
     )
 
+    # Single-kernel-call layout: expose prev/next as 2 * B batches.  Q batch
+    # boundaries are cumulative prefixes across [all prevs, all nexts]; KV
+    # lengths stay raw per-batch values.  block_table is duplicated by the
+    # metadata builder because the kernels only require its dim0 to match B.
+    prev_cum = _cumsum_list(q_len_prev_list)
+    next_cum = _cumsum_list(q_len_next_list)
+    prev_total = prev_cum[-1] if prev_cum else 0
+    q_len_zigzag_list = prev_cum + [prev_total + value for value in next_cum]
+    kv_len_zigzag_list = kv_len_prev_list + kv_len_next_list
+    actual_seq_lengths_query_zigzag = torch.tensor(
+        q_len_zigzag_list, dtype=torch.int32, device=device
+    )
+    actual_seq_lengths_key_zigzag = torch.tensor(
+        kv_len_zigzag_list, dtype=torch.int32, device=device
+    )
+
     zigzag_index = _int64_tensor(plan.zigzag_index)
     zigzag_gather_index = _int64_tensor(plan.zigzag_gather_index)
     inv_gather_index = _int64_tensor(plan.inv_gather_index)
@@ -404,6 +429,8 @@ def _build_zigzag_meta(
         "q_len_next": q_len_next,
         "kv_len_prev": kv_len_prev,
         "kv_len_next": kv_len_next,
+        "actual_seq_lengths_query_zigzag": actual_seq_lengths_query_zigzag,
+        "actual_seq_lengths_key_zigzag": actual_seq_lengths_key_zigzag,
         "actual_seq_q_prev_list": _int64_tensor(q_len_prev_list),
         "actual_seq_q_next_list": _int64_tensor(q_len_next_list),
         "kv_len_prev_list": _int64_tensor(kv_len_prev_list),
@@ -685,6 +712,7 @@ class AscendSFAMetadataBuilder(MLACommonMetadataBuilder[AscendSFAMetadata]):
                 speculative=draft_index is not None,
                 v2_model_runner=envs_vllm.VLLM_USE_V2_MODEL_RUNNER,
                 dp_size=self.vllm_config.parallel_config.data_parallel_size,
+                dcp_replicated=enable_sfa_dcp_replicated_indexer(),
             ):
                 assert query_lens_cpu is not None and prefix_lens_cpu is not None
                 zigzag = _build_zigzag_meta(
@@ -697,6 +725,13 @@ class AscendSFAMetadataBuilder(MLACommonMetadataBuilder[AscendSFAMetadata]):
                     num_actual_tokens,
                     num_reqs_meta=num_reqs,
                 )
+                # The merged single-call operators treat prev and next as two
+                # batches per request.  block_table rows must follow the same
+                # [all prevs, all nexts] order as the local Q tensor, so each
+                # request row is simply repeated twice.
+                block_table_zigzag = block_table.repeat(2, 1).contiguous()
+            else:
+                block_table_zigzag = None
 
             # Keep the continuous-slice RoPE/slot tensors even when zigzag is
             # selected: the zigzag metadata is built before the forward context
@@ -821,6 +856,17 @@ class AscendSFAMetadataBuilder(MLACommonMetadataBuilder[AscendSFAMetadata]):
                 kv_len_next_list=(
                     zigzag["kv_len_next_list"] if zigzag is not None else None
                 ),
+                actual_seq_lengths_query_zigzag=(
+                    zigzag["actual_seq_lengths_query_zigzag"]
+                    if zigzag is not None
+                    else None
+                ),
+                actual_seq_lengths_key_zigzag=(
+                    zigzag["actual_seq_lengths_key_zigzag"]
+                    if zigzag is not None
+                    else None
+                ),
+                block_table_zigzag=block_table_zigzag,
                 fallback_slot_mapping_cp=(
                     slot_mapping_cp_continuous if zigzag is not None else None
                 ),
@@ -1987,6 +2033,7 @@ class AscendSFAImpl(MLAAttentionImpl):
         sin: torch.Tensor,
         actual_seq_lengths_query: torch.Tensor,
         actual_seq_lengths_key: torch.Tensor,
+        block_table: torch.Tensor | None = None,
     ):
         if not self.has_indexer:
             raise RuntimeError(
@@ -2014,80 +2061,8 @@ class AscendSFAImpl(MLAAttentionImpl):
             actual_seq_lengths_key,
             self.enable_sparse_li_c8,
             self.use_torch_npu_lightning_indexer,
+            block_table=block_table,
         )
-
-    def _indexer_select_post_process_zigzag(
-        self,
-        x: torch.Tensor,
-        q_c: torch.Tensor | tuple[torch.Tensor, torch.Tensor],
-        kv_cache: tuple[torch.Tensor, ...],
-        attn_metadata: M,
-        cos: torch.Tensor,
-        sin: torch.Tensor,
-    ) -> torch.Tensor:
-        """Run the LightningIndexer twice over the prev/next zigzag halves.
-
-        ``x``, ``q_c`` and the derived weights are already in
-        [all_prev_blocks, all_next_blocks] local order.  The split point is
-        ``total_q_prev_tokens``, so multi-request and uneven blocks are split
-        at the true prev/next boundary instead of a hard-coded ``q_half``.
-        """
-        ctx = attn_metadata.dsa_cp_context
-        assert ctx is not None and ctx.zigzag_index is not None
-        split = ctx.total_q_prev_tokens
-        if split <= 0:
-            raise RuntimeError(
-                "zigzag indexer split point must be positive, got "
-                f"total_q_prev_tokens={split}"
-            )
-
-        assert self.wk_weights_proj is not None
-        kw, _ = self.wk_weights_proj(x)
-        weights = kw[:, self.head_dim :]
-        q_li, q_li_scale, q_li_shape_ori = self._indexer_qk_proj(q_c, cos, sin)
-        record_attention_compute_start()
-
-        parts = []
-        for split_idx, (token_count, q_len, kv_len) in enumerate(
-            (
-                (split, ctx.q_len_prev, ctx.kv_len_prev),
-                (ctx.total_q_next_tokens, ctx.q_len_next, ctx.kv_len_next),
-            )
-        ):
-            start = 0 if split_idx == 0 else split
-            if q_li_shape_ori is None:
-                q_li_h = q_li[start : start + token_count]
-                q_li_scale_h = None
-            else:
-                # LI-C8 flattens q_li to [T * n_head, head_dim].
-                head_start = start * self.n_head
-                head_end = head_start + token_count * self.n_head
-                q_li_h = q_li[head_start:head_end]
-                q_li_scale_h = (
-                    q_li_scale[head_start:head_end] if q_li_scale is not None else None
-                )
-            shape_h = (
-                (token_count, *q_li_shape_ori[1:])
-                if q_li_shape_ori is not None
-                else None
-            )
-            weights_h = weights[start : start + token_count]
-            parts.append(
-                DeviceOperator.indexer_select_post_process(
-                    self,
-                    q_li_h,
-                    q_li_scale_h,
-                    shape_h,
-                    weights_h,
-                    kv_cache,
-                    attn_metadata,
-                    q_len,
-                    kv_len,
-                    self.enable_sparse_li_c8,
-                    self.use_torch_npu_lightning_indexer,
-                )
-            )
-        return torch.cat(parts, dim=0)
 
     def _get_indexcache_topk_indices(self, num_tokens: int) -> torch.Tensor:
         if self.topk_indices_buffer is None:
@@ -2115,7 +2090,15 @@ class AscendSFAImpl(MLAAttentionImpl):
 
     @_sfa_5_3_scope("SFA-5.3/08_sfa_process")
     def _execute_sparse_flash_attention_process(
-        self, ql_nope, q_pe, kv_cache, topk_indices, attn_metadata, actual_seq_lengths_query, actual_seq_lengths_key
+        self,
+        ql_nope,
+        q_pe,
+        kv_cache,
+        topk_indices,
+        attn_metadata,
+        actual_seq_lengths_query,
+        actual_seq_lengths_key,
+        block_table: torch.Tensor | None = None,
     ):
         return DeviceOperator.execute_sparse_flash_attention_process(
             self,
@@ -2126,6 +2109,7 @@ class AscendSFAImpl(MLAAttentionImpl):
             attn_metadata,
             actual_seq_lengths_query,
             actual_seq_lengths_key,
+            block_table=block_table,
         )
 
     def _record_query_gather_context(
@@ -2700,13 +2684,24 @@ class AscendSFAImpl(MLAAttentionImpl):
                     raise RuntimeError(f"skip_topk is False but indexer is None. layer_name={self.layer_name}.")
                 assert q_c is not None
                 assert attn_metadata.dsa_cp_context is not None
-                topk_indices = self._indexer_select_post_process_zigzag(
+                ctx = attn_metadata.dsa_cp_context
+                assert ctx.actual_seq_lengths_query_zigzag is not None
+                assert ctx.actual_seq_lengths_key_zigzag is not None
+                assert ctx.block_table_zigzag is not None
+                # Single LightningIndexer call: prev and next are two batches
+                # per request in the same TND tensor, distinguished by the
+                # merged cumulative query lengths / per-batch KV lengths and
+                # the duplicated block_table rows.
+                topk_indices = self.indexer_select_post_process(
                     x=hidden_states,
                     q_c=q_c,
                     kv_cache=kv_cache,
                     attn_metadata=attn_metadata,
                     cos=cos,
                     sin=sin,
+                    actual_seq_lengths_query=ctx.actual_seq_lengths_query_zigzag,
+                    actual_seq_lengths_key=ctx.actual_seq_lengths_key_zigzag,
+                    block_table=ctx.block_table_zigzag,
                 )
                 if self.use_index_cache:
                     self._update_indexcache_topk_indices(topk_indices)
@@ -2730,26 +2725,21 @@ class AscendSFAImpl(MLAAttentionImpl):
         if zigzag_active:
             assert attn_metadata.dsa_cp_context is not None
             ctx = attn_metadata.dsa_cp_context
-            split = ctx.total_q_prev_tokens
-            attn_prev = self._execute_sparse_flash_attention_process(
-                ql_nope[:split],
-                q_pe[:split],
+            assert ctx.actual_seq_lengths_query_zigzag is not None
+            assert ctx.actual_seq_lengths_key_zigzag is not None
+            assert ctx.block_table_zigzag is not None
+            # Single SFA call: Q and topk_indices stay in [prev, next] local
+            # order; the merged metadata describes each half as one batch.
+            attn_output = self._execute_sparse_flash_attention_process(
+                ql_nope,
+                q_pe,
                 kv_cache,
-                topk_indices[:split],
+                topk_indices,
                 attn_metadata,
-                ctx.q_len_prev,
-                ctx.kv_len_prev,
+                ctx.actual_seq_lengths_query_zigzag,
+                ctx.actual_seq_lengths_key_zigzag,
+                block_table=ctx.block_table_zigzag,
             )
-            attn_next = self._execute_sparse_flash_attention_process(
-                ql_nope[split:],
-                q_pe[split:],
-                kv_cache,
-                topk_indices[split:],
-                attn_metadata,
-                ctx.q_len_next,
-                ctx.kv_len_next,
-            )
-            attn_output = torch.cat([attn_prev, attn_next], dim=0)
         else:
             attn_output = self._execute_sparse_flash_attention_process(
                 ql_nope,
