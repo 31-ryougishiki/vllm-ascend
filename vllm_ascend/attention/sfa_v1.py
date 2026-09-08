@@ -370,15 +370,15 @@ def _build_zigzag_meta(
     def _int64_tensor(values: Sequence[int]) -> torch.Tensor:
         return torch.tensor(values, dtype=torch.int64, device=device)
 
-    # Query-length tensors consumed by the LightningIndexer / SFA kernels are
-    # cumulative per-request offsets; KV lengths are raw per-request lengths,
-    # matching the existing continuous-slice metadata builder.
-    q_len_prev = torch.tensor(
-        _cumsum_list(q_len_prev_list), dtype=torch.int32, device=device
-    )
-    q_len_next = torch.tensor(
-        _cumsum_list(q_len_next_list), dtype=torch.int32, device=device
-    )
+    # Compute the cumulative query boundaries once, then materialize both the
+    # legacy per-half tensors and the merged single-call tensor from the same
+    # lists.
+    prev_cum = _cumsum_list(q_len_prev_list)
+    next_cum = _cumsum_list(q_len_next_list)
+    prev_total = prev_cum[-1] if prev_cum else 0
+
+    q_len_prev = torch.tensor(prev_cum, dtype=torch.int32, device=device)
+    q_len_next = torch.tensor(next_cum, dtype=torch.int32, device=device)
     kv_len_prev = torch.tensor(
         kv_len_prev_list, dtype=torch.int32, device=device
     )
@@ -390,9 +390,6 @@ def _build_zigzag_meta(
     # boundaries are cumulative prefixes across [all prevs, all nexts]; KV
     # lengths stay raw per-batch values.  block_table is duplicated by the
     # metadata builder because the kernels only require its dim0 to match B.
-    prev_cum = _cumsum_list(q_len_prev_list)
-    next_cum = _cumsum_list(q_len_next_list)
-    prev_total = prev_cum[-1] if prev_cum else 0
     q_len_zigzag_list = prev_cum + [prev_total + value for value in next_cum]
     kv_len_zigzag_list = kv_len_prev_list + kv_len_next_list
     actual_seq_lengths_query_zigzag = torch.tensor(
@@ -729,7 +726,7 @@ class AscendSFAMetadataBuilder(MLACommonMetadataBuilder[AscendSFAMetadata]):
                 # batches per request.  block_table rows must follow the same
                 # [all prevs, all nexts] order as the local Q tensor, so each
                 # request row is simply repeated twice.
-                block_table_zigzag = block_table.repeat(2, 1).contiguous()
+                block_table_zigzag = torch.cat([block_table, block_table], dim=0)
             else:
                 block_table_zigzag = None
 
