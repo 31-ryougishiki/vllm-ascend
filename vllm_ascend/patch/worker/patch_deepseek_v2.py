@@ -407,9 +407,20 @@ def _zigzag_layer_forward(
     else:
         hidden_states = self.self_attn(positions, hidden_states, llama_4_scaling)
 
+    # self.self_attn.mla_attn is AscendMultiHeadLatentAttention (the pluggable
+    # MultiHeadLatentAttentionWrapper).  Depending on the vLLM version the
+    # actual attention implementation is exposed either directly on the
+    # wrapper (wrapper.impl) or nested one level deeper
+    # (wrapper.mla_attn.impl); support both.
+    mla_impl = None
+    mla_wrapper = getattr(self.self_attn, "mla_attn", None)
+    if mla_wrapper is not None:
+        mla_impl = getattr(mla_wrapper, "impl", None)
+        if mla_impl is None:
+            mla_impl = getattr(getattr(mla_wrapper, "mla_attn", None), "impl", None)
     full_o_proj = (
-        hasattr(self.self_attn, "mla_attn")
-        and getattr(self.self_attn.mla_attn.impl, "enable_dsa_cp_with_o_proj_tp", False)
+        mla_impl is not None
+        and getattr(mla_impl, "enable_dsa_cp_with_o_proj_tp", False)
     )
     if self.use_sequence_parallel_moe and not full_o_proj:
         # The attention o_proj was built with reduce_results=False for the
