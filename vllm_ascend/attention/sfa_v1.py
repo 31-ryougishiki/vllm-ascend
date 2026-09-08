@@ -677,7 +677,12 @@ class AscendSFAMetadataBuilder(MLACommonMetadataBuilder[AscendSFAMetadata]):
                 prefix_lens_cpu,
                 is_prefilling_cpu,
                 num_actual_tokens,
-                speculative=(self.speculative_config is not None or draft_index is not None),
+                # Only an actual draft-step metadata build must avoid
+                # zigzag.  A speculative config by itself (e.g. deepseek_mtp
+                # with enforce_eager) does not: the main prefill forward is
+                # still pure-prefill and its output is gathered back to
+                # natural order before the MTP proposer consumes it.
+                speculative=draft_index is not None,
                 v2_model_runner=envs_vllm.VLLM_USE_V2_MODEL_RUNNER,
                 dp_size=self.vllm_config.parallel_config.data_parallel_size,
             ):

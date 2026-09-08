@@ -2665,7 +2665,10 @@ class NPUModelRunner(GPUModelRunner):
             prefix_lens,
             is_prefilling,
             num_actual_tokens,
-            speculative=self.speculative_config is not None,
+            # MTP / speculative config does not globally disable zigzag: the
+            # draft forwards are gated separately by build_for_drafting() and
+            # set_ascend_forward_context(is_draft_model=True).
+            speculative=False,
             v2_model_runner=envs_vllm.VLLM_USE_V2_MODEL_RUNNER,
             dp_size=self.vllm_config.parallel_config.data_parallel_size,
         )
