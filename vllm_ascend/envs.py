@@ -77,10 +77,11 @@ env_variables: dict[str, Callable[[], Any]] = {
     # it will consume more NPU memory. If reducing NPU memory usage is a higher priority
     # for your DeepSeek W8A8 scene, then disable it.
     "VLLM_ASCEND_ENABLE_MLAPO": lambda: bool(int(os.getenv("VLLM_ASCEND_ENABLE_MLAPO", "1"))),
-    # Whether to enable zigzag CP balance for DSA prefill (SFA C8, single
-    # sequence; the SP-padded token count must be a multiple of 2 * tp_size,
-    # actual prompt length may be non-divisible). Set to 0 to force the
-    # original continuous-slice attention path.
+    # Whether to enable zigzag CP balance for DSA prefill (multi-request and
+    # radix-cache prefix are supported; every sequence's extend length must be
+    # >= 2 * tp_size and the SP-padded token count must be a multiple of
+    # 2 * tp_size; actual prompt length may be non-divisible). Set to 0 to
+    # force the original continuous-slice attention path.
     "VLLM_ASCEND_CP_BALANCE": lambda: bool(int(os.getenv("VLLM_ASCEND_CP_BALANCE", "1"))),
     # Minimum number of prefill tokens required before zigzag CP balance is
     # applied. Below this threshold the per-layer block exchange and extra

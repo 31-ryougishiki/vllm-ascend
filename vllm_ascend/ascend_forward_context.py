@@ -13,6 +13,7 @@ from vllm.forward_context import BatchDescriptor, get_forward_context, set_forwa
 from vllm.logger import logger
 
 from vllm_ascend.ascend_config import get_ascend_config
+from vllm_ascend.layers.cp_zigzag import zigzag_reorder_moe_aux
 from vllm_ascend.utils import (
     AscendDeviceType,
     enable_sp,
@@ -134,10 +135,20 @@ def _disable_zigzag_metadata_for_fallback(attn_metadata: Any) -> None:
         ctx.zigzag_actual_gather_index = None
         ctx.zigzag_actual_rows = None
         ctx.q_half = 0
+        ctx.total_q_prev_tokens = 0
+        ctx.total_q_next_tokens = 0
+        ctx.split_list = None
+        ctx.cp_reverse_index = None
+        ctx.reverse_split_len = None
+        ctx.prefix_offsets = None
         ctx.q_len_prev = None
         ctx.q_len_next = None
         ctx.kv_len_prev = None
         ctx.kv_len_next = None
+        ctx.actual_seq_q_prev_list = None
+        ctx.actual_seq_q_next_list = None
+        ctx.kv_len_prev_list = None
+        ctx.kv_len_next_list = None
         ctx.fallback_slot_mapping_cp = None
         ctx.fallback_cos = None
         ctx.fallback_sin = None
@@ -333,14 +344,13 @@ def set_ascend_forward_context(
                 mc2_mask = reserved_mc2_mask[: forward_context.padded_num_tokens]
                 mc2_mask[:num_actual_tokens] = True
                 mc2_mask[num_actual_tokens:] = False
-                if (
-                    zigzag_cp_active
-                    and zigzag_cp_context is not None
-                    and zigzag_cp_context.zigzag_gather_index is not None
-                    and mc2_mask.shape[0] == zigzag_cp_context.zigzag_gather_index.shape[0]
-                ):
-                    # MoE consumes rank-concatenating zigzag order.
-                    mc2_mask = mc2_mask[zigzag_cp_context.zigzag_gather_index]
+                if zigzag_cp_active and zigzag_cp_context is not None:
+                    # MoE consumes rank-concatenating zigzag order.  This is
+                    # the exact same full padded zigzag_gather_index that
+                    # experts_selector applies to input_ids.
+                    mc2_mask = zigzag_reorder_moe_aux(
+                        mc2_mask, zigzag_cp_context
+                    )
                 forward_context.mc2_mask = mc2_mask
         try:
             yield

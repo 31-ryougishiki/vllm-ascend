@@ -226,6 +226,11 @@ class AscendCommonAttentionMetadata(CommonAttentionMetadata):
     positions: torch.Tensor = None
     positions_cpu: torch.Tensor = None
 
+    # Host-side copy of ``is_prefilling`` so attention metadata builders can
+    # validate pure-prefill-only features (e.g. DSA-CP zigzag) without a
+    # device-to-host sync in the metadata hot path.
+    is_prefilling_cpu: torch.Tensor = None
+
     # Current attention state (e.g., ChunkedPrefill, DecodeOnly).
     attn_state: Any = None
 
@@ -288,6 +293,7 @@ class AscendCommonAttentionMetadata(CommonAttentionMetadata):
             dcp_local_seq_lens=_slice_reqs(self.dcp_local_seq_lens),
             dcp_local_seq_lens_cpu=_slice_reqs(self.dcp_local_seq_lens_cpu),
             is_prefilling=_slice_reqs(self.is_prefilling),
+            is_prefilling_cpu=_slice_reqs(self.is_prefilling_cpu),
             encoder_seq_lens=_slice_reqs(self.encoder_seq_lens),
             encoder_seq_lens_cpu=_slice_reqs(self.encoder_seq_lens_cpu),
             logits_indices_padded=self.logits_indices_padded,

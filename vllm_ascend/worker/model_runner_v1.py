@@ -34,6 +34,7 @@ import numpy as np
 import torch
 import torch.distributed as dist
 import torch.nn as nn
+import vllm.envs as envs_vllm
 from vllm._aiter_ops import rocm_aiter_ops
 from vllm.compilation.cuda_graph import CUDAGraphStat
 from vllm.config import CompilationMode, CUDAGraphMode, VllmConfig, get_layers_from_vllm_config
@@ -184,7 +185,10 @@ from vllm_ascend.ascend_forward_context import (  # isort: skip
 
 from vllm.model_executor.models.interfaces import supports_multimodal_pruning
 
-from vllm_ascend.layers.cp_zigzag import zigzag_gather_hidden_states_and_aux
+from vllm_ascend.layers.cp_zigzag import (
+    can_enable_zigzag_for_batch,
+    zigzag_gather_hidden_states_and_aux,
+)
 from vllm_ascend.sample.rejection_sampler import AscendRejectionSampler
 
 if TYPE_CHECKING:
@@ -2608,17 +2612,80 @@ class NPUModelRunner(GPUModelRunner):
                 hidden_states = self._all_gather_hidden_states_and_aux(hidden_states)
         return hidden_states
 
-    def _pad_for_sequence_parallelism(self, num_scheduled_tokens: int) -> int:
+    def _zigzag_padding_eligible(
+        self,
+        num_scheduled_tokens: int,
+        num_scheduled_tokens_np: np.ndarray | None,
+    ) -> bool:
+        """Run the same zigzag policy the metadata builder will run.
+
+        Keeping this check identical to ``_can_zigzag`` /
+        ``can_enable_zigzag_for_batch`` is what guarantees non-zigzag batches
+        (multi-request that cannot be balanced, prefix-decode mixes, draft,
+        V2 runner, DP>1) never get the extra ``2 * tp_size`` padding.
+        """
+        if num_scheduled_tokens_np is None or num_scheduled_tokens_np.size == 0:
+            return False
+        tp_size = self.vllm_config.parallel_config.tensor_parallel_size
+        if not enable_dsa_cp() or tp_size <= 1:
+            return False
+
+        query_lens = [int(x) for x in num_scheduled_tokens_np]
+        num_actual_tokens = int(sum(query_lens))
+        if num_actual_tokens != num_scheduled_tokens:
+            return False
+        num_tokens_pad = round_up(num_actual_tokens, 2 * tp_size)
+
+        prefix_lens: list[int] = []
+        is_prefilling: list[bool] = []
+        try:
+            num_reqs = len(query_lens)
+            num_computed = self.input_batch.num_computed_tokens_cpu_tensor[
+                :num_reqs
+            ].tolist()
+            num_prompt = self.input_batch.num_prompt_tokens_cpu_tensor[
+                :num_reqs
+            ].tolist()
+            prefix_lens = [int(computed) for computed in num_computed]
+            is_prefilling = [
+                int(computed) < int(prompt)
+                for computed, prompt in zip(num_computed, num_prompt)
+            ]
+        except Exception:
+            # Warmup / dummy runs may not have a populated InputBatch.  Fall
+            # back to the legacy single-request no-prefix policy in that case.
+            prefix_lens = [0] * len(query_lens)
+            is_prefilling = [True] * len(query_lens)
+
+        return can_enable_zigzag_for_batch(
+            getattr(self, "attn_state", AscendAttentionState.DecodeOnly),
+            num_tokens_pad,
+            tp_size,
+            query_lens,
+            prefix_lens,
+            is_prefilling,
+            num_actual_tokens,
+            speculative=self.speculative_config is not None,
+            v2_model_runner=envs_vllm.VLLM_USE_V2_MODEL_RUNNER,
+            dp_size=self.vllm_config.parallel_config.data_parallel_size,
+        )
+
+    def _pad_for_sequence_parallelism(
+        self,
+        num_scheduled_tokens: int,
+        num_scheduled_tokens_np: np.ndarray | None = None,
+    ) -> int:
         # Pad tokens to a multiple of tensor_parallel_size when
         # enabled collective fusion for SP. Zigzag CP splits each rank-local
         # slice into a prev/next pair, so eligible prefills additionally pad
-        # to 2 * tp_size.
+        # to 2 * tp_size.  The eligibility check is identical to the one used
+        # by AscendSFAMetadataBuilder, so non-zigzag batches keep the normal
+        # tp_size alignment.
         tp_size = self.vllm_config.parallel_config.tensor_parallel_size
         if enable_sp(self.vllm_config) or enable_sp_by_pass():
             align_size = tp_size
-            if (
-                enable_dsa_cp()
-                and num_scheduled_tokens >= ascend_envs.VLLM_ASCEND_CP_BALANCE_MIN_TOKENS
+            if self._zigzag_padding_eligible(
+                num_scheduled_tokens, num_scheduled_tokens_np
             ):
                 align_size *= 2
             return round_up(num_scheduled_tokens, align_size)
@@ -2689,7 +2756,9 @@ class NPUModelRunner(GPUModelRunner):
         force_num_active_loras: int | None = None,
         num_encoder_reqs: int = 0,
     ) -> tuple[CUDAGraphMode, BatchDescriptor, bool, torch.Tensor | None, CUDAGraphStat | None]:
-        num_tokens_padded = self._pad_for_sequence_parallelism(num_tokens)
+        num_tokens_padded = self._pad_for_sequence_parallelism(
+            num_tokens, num_scheduled_tokens_np
+        )
         is_all_decode = np.all(self.input_batch.num_computed_tokens_cpu[:num_reqs] > 0)
         uniform_decode = (
             (
@@ -2904,6 +2973,7 @@ class NPUModelRunner(GPUModelRunner):
             slot_mapping=slot_mapping_gid_0,
             causal=True,
             is_prefilling=is_prefilling,
+            is_prefilling_cpu=is_prefilling,
             num_input_tokens=num_tokens_padded,
             actual_seq_lengths_q=self.actual_seq_lengths_q,
             positions=self.positions,

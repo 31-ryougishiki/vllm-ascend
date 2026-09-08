@@ -2,7 +2,7 @@ import enum
 import functools
 from collections.abc import Callable
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, Any, TypeVar
+from typing import TYPE_CHECKING, Any, Sequence, TypeVar
 
 import scipy  # type: ignore
 import torch
@@ -45,6 +45,10 @@ from vllm_ascend.device.device_op import DeviceOperator
 from vllm_ascend.device.mxfp_compat import FLOAT8_E8M0FNU_DTYPE
 from vllm_ascend.distributed.parallel_state import get_otp_group
 from vllm_ascend.distributed.utils import all_gather_async
+from vllm_ascend.layers.cp_zigzag import (
+    build_zigzag_plan,
+    can_enable_zigzag_for_batch,
+)
 from vllm_ascend.memcache_comm_fence import (
     record_attention_compute_start,
 )
@@ -236,11 +240,26 @@ class DSACPContext:
     # zigzag_gather_index and actual_rows is None.
     zigzag_actual_gather_index: torch.Tensor | None = None
     zigzag_actual_rows: torch.Tensor | None = None
+    # Deprecated prev/next split point.  For the legacy single-request aligned
+    # case it equals total_q_prev_tokens; the active paths use
+    # total_q_prev_tokens / total_q_next_tokens instead.
     q_half: int = 0
+    total_q_prev_tokens: int = 0
+    total_q_next_tokens: int = 0
+    # SGLang-style multi-request metadata (device tensors, int64 unless the
+    # field is used by the attention kernels).
+    split_list: torch.Tensor | None = None
+    cp_reverse_index: torch.Tensor | None = None
+    reverse_split_len: torch.Tensor | None = None
+    prefix_offsets: torch.Tensor | None = None
     q_len_prev: torch.Tensor | None = None
     q_len_next: torch.Tensor | None = None
     kv_len_prev: torch.Tensor | None = None
     kv_len_next: torch.Tensor | None = None
+    actual_seq_q_prev_list: torch.Tensor | None = None
+    actual_seq_q_next_list: torch.Tensor | None = None
+    kv_len_prev_list: torch.Tensor | None = None
+    kv_len_next_list: torch.Tensor | None = None
     # Continuous-slice fallback values. Metadata is built before the draft /
     # V2-runner / DP>1 disables are known, so keep the non-zigzag cos/sin and
     # slot mapping here. set_ascend_forward_context restores them when it has
@@ -256,120 +275,149 @@ def _can_zigzag(
     num_tokens: int,
     num_tokens_pad: int,
     cp_size: int,
-    num_reqs: int,
-    seq_len: int,
+    query_lens: Sequence[int] | None = None,
+    prefix_lens: Sequence[int] | None = None,
+    is_prefilling: Sequence[bool] | None = None,
     num_actual_tokens: int | None = None,
+    *,
+    speculative: bool = False,
+    v2_model_runner: bool = False,
+    dp_size: int = 1,
 ) -> bool:
-    """Gate model-level zigzag CP to prefill cases it can support.
+    """Gate model-level zigzag CP to the prefill cases it can support.
 
-    ``num_tokens`` is the padded token count seen by the model. Non-divisible
-    prompts are supported through the SP padding already applied by
-    ``NPUModelRunner._pad_for_sequence_parallelism`` (aligned to
-    ``2 * cp_size``), so the padded length is divisible by ``2 * cp_size`` and
-    the trailing padding rows are excluded from KV/indexer writes.
+    ``num_tokens`` / ``num_tokens_pad`` are the padded token counts seen by
+    the metadata builder; they must agree for the metadata path.  The actual
+    policy is :func:`vllm_ascend.layers.cp_zigzag.can_enable_zigzag_for_batch`,
+    which is also used by the model runner for SP padding, so both sides
+    always make the same zigzag decision.
     """
-    if num_actual_tokens is None:
-        num_actual_tokens = num_tokens
-    if not ascend_envs.VLLM_ASCEND_CP_BALANCE:
-        return False
-    if cp_size <= 1:
-        return False
-    if num_reqs != 1:
-        return False
-    if attn_state not in (AscendAttentionState.ChunkedPrefill, AscendAttentionState.PrefillNoCache):
-        return False
     if num_tokens != num_tokens_pad:
         return False
-    # Full, unpadded prefill only: radix-cache hits / chunked later chunks
-    # have seq_len > actual query tokens and keep the continuous path.
-    if num_actual_tokens > num_tokens or seq_len != num_actual_tokens:
-        return False
-    if num_tokens % (2 * cp_size) != 0:
-        return False
-    return num_actual_tokens >= ascend_envs.VLLM_ASCEND_CP_BALANCE_MIN_TOKENS
+    return can_enable_zigzag_for_batch(
+        attn_state,
+        num_tokens_pad,
+        cp_size,
+        query_lens,
+        prefix_lens,
+        is_prefilling,
+        num_actual_tokens,
+        speculative=speculative,
+        v2_model_runner=v2_model_runner,
+        dp_size=dp_size,
+    )
 
 
 def _build_zigzag_meta(
     num_tokens: int,
     cp_size: int,
     cp_rank: int,
+    query_lens: Sequence[int],
+    prefix_lens: Sequence[int] | None,
     device: torch.device,
     num_actual_tokens: int | None = None,
+    num_reqs_meta: int | None = None,
 ) -> dict[str, Any]:
-    """Single-sequence head/tail pairing: rank r takes block r and block 2c-1-r.
+    """Build device-side zigzag metadata for a multi-request prefill batch.
 
-    ``num_tokens`` is the SP-padded length (a multiple of ``2 * cp_size``) and
-    ``num_actual_tokens`` is the real prompt length. Padding lives at the tail
-    of the natural sequence, mirroring SGLang's ``pad_len`` handling in
-    ``prepare_context_parallel_metadata``.
+    Every sequence is split into ``2 * cp_size`` blocks independently.  The
+    block sizes are balanced so each rank owns exactly ``num_tokens / cp_size``
+    local tokens, which keeps all FlashComm collectives equal-shaped.  For the
+    legacy single-request aligned case the layout is identical to SGLang's
+    head/tail zigzag pairing.
+
+    ``query_lens`` are the per-request scheduled token counts; ``prefix_lens``
+    are radix-cache / chunked-prefill prefix lengths that get added to the
+    causal KV lengths.  Padding lives at the tail of the natural stream,
+    mirroring SGLang's ``pad_len`` handling in ``prepare_context_parallel_metadata``.
 
     Indices are computed on the CPU (num_tokens is small metadata) to avoid
     launching argsort/index kernels on the device in the metadata hot path.
     """
-    if num_actual_tokens is None:
-        num_actual_tokens = num_tokens
-    assert num_tokens % (2 * cp_size) == 0
-    assert 0 <= num_actual_tokens <= num_tokens
+    plan = build_zigzag_plan(
+        query_lens,
+        prefix_lens or (0,) * len(query_lens),
+        cp_size,
+        cp_rank,
+        num_tokens,
+        num_actual_tokens,
+    )
+    if plan.total_q_prev_tokens + plan.total_q_next_tokens != plan.local_tokens:
+        raise AssertionError(
+            "zigzag prev/next split does not cover the local token count"
+        )
 
-    half = num_tokens // (2 * cp_size)
-    prev_s = cp_rank * half
-    next_s = (2 * cp_size - 1 - cp_rank) * half
+    # Match the width of attn_metadata.block_table / seq_lens.  Padded
+    # requests have zero tokens in every kernel-facing tensor, mirroring the
+    # continuous-slice metadata builder.
+    if num_reqs_meta is None:
+        num_reqs_meta = plan.num_reqs
+    pad_reqs = max(int(num_reqs_meta) - plan.num_reqs, 0)
+    q_len_prev_list = list(plan.q_len_prev_list) + [0] * pad_reqs
+    q_len_next_list = list(plan.q_len_next_list) + [0] * pad_reqs
+    kv_len_prev_list = list(plan.kv_len_prev_list) + [0] * pad_reqs
+    kv_len_next_list = list(plan.kv_len_next_list) + [0] * pad_reqs
 
-    zigzag_positions = list(range(prev_s, prev_s + half)) + list(
-        range(next_s, next_s + half)
+    def _int64_tensor(values: Sequence[int]) -> torch.Tensor:
+        return torch.tensor(values, dtype=torch.int64, device=device)
+
+    # Query-length tensors consumed by the LightningIndexer / SFA kernels are
+    # cumulative per-request offsets; KV lengths are raw per-request lengths,
+    # matching the existing continuous-slice metadata builder.
+    q_len_prev = torch.tensor(
+        _cumsum_list(q_len_prev_list), dtype=torch.int32, device=device
+    )
+    q_len_next = torch.tensor(
+        _cumsum_list(q_len_next_list), dtype=torch.int32, device=device
+    )
+    kv_len_prev = torch.tensor(
+        kv_len_prev_list, dtype=torch.int32, device=device
+    )
+    kv_len_next = torch.tensor(
+        kv_len_next_list, dtype=torch.int32, device=device
     )
 
-    # Rank-concatenating all-gather order: rank0's zigzag rows, rank1's, ...
-    gather_positions: list[int] = []
-    for rank in range(cp_size):
-        p = rank * half
-        n = (2 * cp_size - 1 - rank) * half
-        gather_positions.extend(range(p, p + half))
-        gather_positions.extend(range(n, n + half))
-
-    # inv_gather_index[p] is the row of gathered tensor holding global token p.
-    inv_positions = [0] * num_tokens
-    for row, global_pos in enumerate(gather_positions):
-        inv_positions[global_pos] = row
-
-    # Actual (non-padding) rows in gather order, plus their positions in the
-    # gathered tensor. KV/indexer writes use these to skip padding rows. With
-    # no padding, actual_gather_index aliases zigzag_gather_index and
-    # actual_rows stays None (the full gathered tensor is already actual).
-    actual_gather_positions = [p for p in gather_positions if p < num_actual_tokens]
-    actual_gather_rows = [
-        row for row, p in enumerate(gather_positions) if p < num_actual_tokens
-    ]
-
-    zigzag_index = torch.tensor(zigzag_positions, dtype=torch.int64, device=device)
-    zigzag_gather_index = torch.tensor(
-        gather_positions, dtype=torch.int64, device=device
-    )
-    inv_gather_index = torch.tensor(inv_positions, dtype=torch.int64, device=device)
-    if num_actual_tokens == num_tokens:
+    zigzag_index = _int64_tensor(plan.zigzag_index)
+    zigzag_gather_index = _int64_tensor(plan.zigzag_gather_index)
+    inv_gather_index = _int64_tensor(plan.inv_gather_index)
+    if plan.num_actual_tokens == plan.num_tokens:
         zigzag_actual_gather_index = zigzag_gather_index
         zigzag_actual_rows = None
     else:
-        zigzag_actual_gather_index = torch.tensor(
-            actual_gather_positions, dtype=torch.int64, device=device
-        )
-        zigzag_actual_rows = torch.tensor(
-            actual_gather_rows, dtype=torch.int64, device=device
-        )
+        zigzag_actual_gather_index = _int64_tensor(plan.actual_gather_index)
+        zigzag_actual_rows = _int64_tensor(plan.actual_rows)
 
-    one = torch.tensor([half], device=device, dtype=torch.int32)
     return {
         "zigzag_index": zigzag_index,
         "zigzag_gather_index": zigzag_gather_index,
         "inv_gather_index": inv_gather_index,
         "zigzag_actual_gather_index": zigzag_actual_gather_index,
         "zigzag_actual_rows": zigzag_actual_rows,
-        "q_half": half,
-        "q_len_prev": one,
-        "q_len_next": one,
-        "kv_len_prev": torch.tensor([prev_s + half], device=device, dtype=torch.int32),
-        "kv_len_next": torch.tensor([next_s + half], device=device, dtype=torch.int32),
+        "q_half": plan.total_q_prev_tokens,
+        "total_q_prev_tokens": plan.total_q_prev_tokens,
+        "total_q_next_tokens": plan.total_q_next_tokens,
+        "split_list": _int64_tensor(plan.split_list),
+        "cp_reverse_index": _int64_tensor(plan.cp_reverse_index),
+        "reverse_split_len": _int64_tensor(plan.reverse_split_len),
+        "prefix_offsets": _int64_tensor(plan.prefix_offsets),
+        "q_len_prev": q_len_prev,
+        "q_len_next": q_len_next,
+        "kv_len_prev": kv_len_prev,
+        "kv_len_next": kv_len_next,
+        "actual_seq_q_prev_list": _int64_tensor(q_len_prev_list),
+        "actual_seq_q_next_list": _int64_tensor(q_len_next_list),
+        "kv_len_prev_list": _int64_tensor(kv_len_prev_list),
+        "kv_len_next_list": _int64_tensor(kv_len_next_list),
     }
+
+
+def _cumsum_list(values: Sequence[int]) -> list[int]:
+    result: list[int] = []
+    total = 0
+    for value in values:
+        total += int(value)
+        result.append(total)
+    return result
 
 
 @dataclass
@@ -559,6 +607,34 @@ class AscendSFAMetadataBuilder(MLACommonMetadataBuilder[AscendSFAMetadata]):
         else:
             seq_lens_cpu = common_attn_metadata.seq_lens[:num_reqs].to("cpu")
 
+        # CPU-side per-request query/prefix lengths for the zigzag policy and
+        # plan.  These values already live on the host; converting them with a
+        # single .tolist() keeps tensor.item()/GPU syncs out of the hot path.
+        query_lens_cpu: list[int] | None = None
+        prefix_lens_cpu: list[int] | None = None
+        is_prefilling_cpu: list[bool] | None = None
+        query_start_loc_cpu = getattr(common_attn_metadata, "query_start_loc_cpu", None)
+        if query_start_loc_cpu is not None and num_reqs > 0:
+            raw_query_lens = [
+                int(query_start_loc_cpu[i + 1]) - int(query_start_loc_cpu[i])
+                for i in range(min(num_reqs, int(query_start_loc_cpu.shape[0]) - 1))
+            ]
+            real_req_indices = [i for i, query_len in enumerate(raw_query_lens) if query_len > 0]
+            if real_req_indices:
+                query_lens_cpu = [raw_query_lens[i] for i in real_req_indices]
+                seq_lens_list = seq_lens_cpu.tolist()
+                prefix_lens_cpu = [
+                    int(seq_lens_list[i]) - raw_query_lens[i] for i in real_req_indices
+                ]
+                is_prefilling_tensor = getattr(
+                    common_attn_metadata, "is_prefilling_cpu", None
+                )
+                if is_prefilling_tensor is not None:
+                    is_prefilling_list = is_prefilling_tensor.tolist()
+                    is_prefilling_cpu = [
+                        bool(is_prefilling_list[i]) for i in real_req_indices
+                    ]
+
         cos, sin = get_cos_and_sin_mla(input_positions, use_cache=(draft_index is None))
 
         dsa_cp_context = None
@@ -586,26 +662,35 @@ class AscendSFAMetadataBuilder(MLACommonMetadataBuilder[AscendSFAMetadata]):
             slot_mapping_cp_continuous = slot_mapping[local_start:local_end_with_pad]
 
             # Decide zigzag while cos/sin still cover the full padded token
-            # range: zigzag_index uses global token positions.
+            # range: zigzag_index uses global token positions.  The same
+            # predicate drives the model runner's 2 * tp padding, so the two
+            # sides cannot disagree.  SFA C8 is no longer a hard requirement:
+            # both C8 and non-C8 DSA-CP KV/indexer writers use the reordered
+            # slot mapping below.
             zigzag = None
-            if (
-                get_ascend_config().enable_sparse_sfa_c8
-                and _can_zigzag(
-                    common_attn_metadata.attn_state,
-                    num_tokens,
-                    num_tokens_pad,
-                    global_tp_size,
-                    num_reqs,
-                    int(seq_lens_cpu[0].item()) if num_reqs == 1 else -1,
-                    num_actual_tokens,
-                )
+            if _can_zigzag(
+                common_attn_metadata.attn_state,
+                num_tokens,
+                num_tokens_pad,
+                global_tp_size,
+                query_lens_cpu,
+                prefix_lens_cpu,
+                is_prefilling_cpu,
+                num_actual_tokens,
+                speculative=(self.speculative_config is not None or draft_index is not None),
+                v2_model_runner=envs_vllm.VLLM_USE_V2_MODEL_RUNNER,
+                dp_size=self.vllm_config.parallel_config.data_parallel_size,
             ):
+                assert query_lens_cpu is not None and prefix_lens_cpu is not None
                 zigzag = _build_zigzag_meta(
                     num_tokens_pad,
                     global_tp_size,
                     get_tp_group().rank_in_group,
+                    query_lens_cpu,
+                    prefix_lens_cpu,
                     slot_mapping.device,
                     num_actual_tokens,
+                    num_reqs_meta=num_reqs,
                 )
 
             # Keep the continuous-slice RoPE/slot tensors even when zigzag is
@@ -699,10 +784,38 @@ class AscendSFAMetadataBuilder(MLACommonMetadataBuilder[AscendSFAMetadata]):
                     zigzag["zigzag_actual_rows"] if zigzag is not None else None
                 ),
                 q_half=zigzag["q_half"] if zigzag is not None else 0,
+                total_q_prev_tokens=(
+                    zigzag["total_q_prev_tokens"] if zigzag is not None else 0
+                ),
+                total_q_next_tokens=(
+                    zigzag["total_q_next_tokens"] if zigzag is not None else 0
+                ),
+                split_list=zigzag["split_list"] if zigzag is not None else None,
+                cp_reverse_index=(
+                    zigzag["cp_reverse_index"] if zigzag is not None else None
+                ),
+                reverse_split_len=(
+                    zigzag["reverse_split_len"] if zigzag is not None else None
+                ),
+                prefix_offsets=(
+                    zigzag["prefix_offsets"] if zigzag is not None else None
+                ),
                 q_len_prev=zigzag["q_len_prev"] if zigzag is not None else None,
                 q_len_next=zigzag["q_len_next"] if zigzag is not None else None,
                 kv_len_prev=zigzag["kv_len_prev"] if zigzag is not None else None,
                 kv_len_next=zigzag["kv_len_next"] if zigzag is not None else None,
+                actual_seq_q_prev_list=(
+                    zigzag["actual_seq_q_prev_list"] if zigzag is not None else None
+                ),
+                actual_seq_q_next_list=(
+                    zigzag["actual_seq_q_next_list"] if zigzag is not None else None
+                ),
+                kv_len_prev_list=(
+                    zigzag["kv_len_prev_list"] if zigzag is not None else None
+                ),
+                kv_len_next_list=(
+                    zigzag["kv_len_next_list"] if zigzag is not None else None
+                ),
                 fallback_slot_mapping_cp=(
                     slot_mapping_cp_continuous if zigzag is not None else None
                 ),
@@ -1910,11 +2023,18 @@ class AscendSFAImpl(MLAAttentionImpl):
         """Run the LightningIndexer twice over the prev/next zigzag halves.
 
         ``x``, ``q_c`` and the derived weights are already in
-        [prev_block, next_block] local order; only the causal lengths differ.
+        [all_prev_blocks, all_next_blocks] local order.  The split point is
+        ``total_q_prev_tokens``, so multi-request and uneven blocks are split
+        at the true prev/next boundary instead of a hard-coded ``q_half``.
         """
         ctx = attn_metadata.dsa_cp_context
         assert ctx is not None and ctx.zigzag_index is not None
-        half = ctx.q_half
+        split = ctx.total_q_prev_tokens
+        if split <= 0:
+            raise RuntimeError(
+                "zigzag indexer split point must be positive, got "
+                f"total_q_prev_tokens={split}"
+            )
 
         assert self.wk_weights_proj is not None
         kw, _ = self.wk_weights_proj(x)
@@ -1923,23 +2043,30 @@ class AscendSFAImpl(MLAAttentionImpl):
         record_attention_compute_start()
 
         parts = []
-        for half_idx, (q_len, kv_len) in enumerate(
-            ((ctx.q_len_prev, ctx.kv_len_prev), (ctx.q_len_next, ctx.kv_len_next))
+        for split_idx, (token_count, q_len, kv_len) in enumerate(
+            (
+                (split, ctx.q_len_prev, ctx.kv_len_prev),
+                (ctx.total_q_next_tokens, ctx.q_len_next, ctx.kv_len_next),
+            )
         ):
-            start = half_idx * half
+            start = 0 if split_idx == 0 else split
             if q_li_shape_ori is None:
-                q_li_h = q_li[start : start + half]
+                q_li_h = q_li[start : start + token_count]
                 q_li_scale_h = None
             else:
                 # LI-C8 flattens q_li to [T * n_head, head_dim].
                 head_start = start * self.n_head
-                head_end = head_start + half * self.n_head
+                head_end = head_start + token_count * self.n_head
                 q_li_h = q_li[head_start:head_end]
                 q_li_scale_h = (
                     q_li_scale[head_start:head_end] if q_li_scale is not None else None
                 )
-            shape_h = (half, *q_li_shape_ori[1:]) if q_li_shape_ori is not None else None
-            weights_h = weights[start : start + half]
+            shape_h = (
+                (token_count, *q_li_shape_ori[1:])
+                if q_li_shape_ori is not None
+                else None
+            )
+            weights_h = weights[start : start + token_count]
             parts.append(
                 DeviceOperator.indexer_select_post_process(
                     self,
@@ -2598,21 +2725,21 @@ class AscendSFAImpl(MLAAttentionImpl):
         if zigzag_active:
             assert attn_metadata.dsa_cp_context is not None
             ctx = attn_metadata.dsa_cp_context
-            half = ctx.q_half
+            split = ctx.total_q_prev_tokens
             attn_prev = self._execute_sparse_flash_attention_process(
-                ql_nope[:half],
-                q_pe[:half],
+                ql_nope[:split],
+                q_pe[:split],
                 kv_cache,
-                topk_indices[:half],
+                topk_indices[:split],
                 attn_metadata,
                 ctx.q_len_prev,
                 ctx.kv_len_prev,
             )
             attn_next = self._execute_sparse_flash_attention_process(
-                ql_nope[half:],
-                q_pe[half:],
+                ql_nope[split:],
+                q_pe[split:],
                 kv_cache,
-                topk_indices[half:],
+                topk_indices[split:],
                 attn_metadata,
                 ctx.q_len_next,
                 ctx.kv_len_next,
