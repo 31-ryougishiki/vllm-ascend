@@ -344,6 +344,15 @@ def set_ascend_forward_context(
             forward_context.zigzag_cp_context = zigzag_cp_context
             forward_context.zigzag_cp_active = zigzag_cp_active
 
+        if zigzag_cp_active:
+            logger.info(
+                "[CP_BALANCE] set_ascend_forward_context zigzag_cp_active=True: "
+                "is_draft_model=%s, dp_size=%s, v2_model_runner=%s",
+                is_draft_model,
+                get_dp_group().world_size,
+                envs_vllm.VLLM_USE_V2_MODEL_RUNNER,
+            )
+
         if zigzag_cp_active and zigzag_cp_context is not None and input_ids is not None:
             # MoE hash routing runs once per MoE layer, but the reorder is
             # identical every time: reorder ``input_ids`` here once and let
@@ -354,6 +363,12 @@ def set_ascend_forward_context(
             input_ids = input_ids.to(torch.int64)
             input_ids = zigzag_reorder_moe_aux(input_ids, zigzag_cp_context)
             forward_context.input_ids = input_ids
+            logger.info_once(
+                "[CP_BALANCE] MoE input_ids reordered once in "
+                "set_ascend_forward_context: shape=%s, gather_index_len=%s",
+                tuple(input_ids.shape),
+                zigzag_cp_context.zigzag_gather_index.shape[0],
+            )
 
         if num_tokens is not None:
             if num_actual_tokens is None:

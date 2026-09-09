@@ -2611,6 +2611,10 @@ class NPUModelRunner(GPUModelRunner):
             or getattr(forward_context, "zigzag_cp_active", False)
         ) and not isinstance(hidden_states, IntermediateTensors):
             if getattr(forward_context, "zigzag_cp_active", False):
+                logger.info_once(
+                    "[CP_BALANCE] model output gather via "
+                    "zigzag_gather_hidden_states_and_aux"
+                )
                 hidden_states = zigzag_gather_hidden_states_and_aux(hidden_states)
             else:
                 hidden_states = self._all_gather_hidden_states_and_aux(hidden_states)
@@ -2661,7 +2665,7 @@ class NPUModelRunner(GPUModelRunner):
             prefix_lens = [0] * len(query_lens)
             is_prefilling = [True] * len(query_lens)
 
-        return can_enable_zigzag_for_batch(
+        zigzag_enabled = can_enable_zigzag_for_batch(
             getattr(self, "attn_state", AscendAttentionState.DecodeOnly),
             num_tokens_pad,
             tp_size,
@@ -2678,6 +2682,18 @@ class NPUModelRunner(GPUModelRunner):
             dcp_replicated=enable_sfa_dcp_replicated_indexer(self.vllm_config),
             full_o_proj=dsa_cp_with_o_proj_tp_for_config(self.vllm_config),
         )
+        if zigzag_enabled:
+            logger.info(
+                "[CP_BALANCE] runner-side zigzag padding eligible: "
+                "num_actual_tokens=%s, num_tokens_pad=%s, tp_size=%s, "
+                "num_reqs=%s, attn_state=%s",
+                num_actual_tokens,
+                num_tokens_pad,
+                tp_size,
+                len(query_lens),
+                getattr(self, "attn_state", None),
+            )
+        return zigzag_enabled
 
     def _pad_for_sequence_parallelism(
         self,

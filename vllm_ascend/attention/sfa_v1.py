@@ -731,6 +731,19 @@ class AscendSFAMetadataBuilder(MLACommonMetadataBuilder[AscendSFAMetadata]):
                 # [all prevs, all nexts] order as the local Q tensor, so each
                 # request row is simply repeated twice.
                 block_table_zigzag = torch.cat([block_table, block_table], dim=0)
+                logger.info(
+                    "[CP_BALANCE] metadata builder enables zigzag: "
+                    "rank=%s, cp_size=%s, num_tokens_pad=%s, "
+                    "num_actual_tokens=%s, num_reqs=%s, "
+                    "local_tokens=%s, zigzag_index_len=%s",
+                    get_tp_group().rank_in_group,
+                    global_tp_size,
+                    num_tokens_pad,
+                    num_actual_tokens,
+                    num_reqs,
+                    num_tokens_per_device,
+                    zigzag["zigzag_index"].shape[0],
+                )
             else:
                 block_table_zigzag = None
 
@@ -2544,6 +2557,13 @@ class AscendSFAImpl(MLAAttentionImpl):
                 and attn_metadata.dsa_cp_context.zigzag_index is not None
                 and bool(_EXTRA_CTX.zigzag_cp_active)
             )
+            if zigzag_active:
+                logger.info_once(
+                    "[CP_BALANCE] SFA attention entered zigzag single-call "
+                    "path (first layer=%s, local_tokens=%s)",
+                    layer_name,
+                    hidden_states.shape[0],
+                )
 
             if self.runtime_has_indexer:
                 k_li, k_li_scale = self.indexer_select_pre_process(

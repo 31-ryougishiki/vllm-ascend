@@ -10,6 +10,7 @@ from vllm.distributed import (
     tensor_model_parallel_all_gather,
     tensor_model_parallel_all_reduce,
 )
+from vllm.logger import logger
 from vllm.model_executor.layers.layernorm import RMSNorm
 from vllm.model_executor.layers.linear import (
     ColumnParallelLinear,
@@ -317,6 +318,14 @@ def _patched_forward(
     from vllm_ascend.ascend_forward_context import _EXTRA_CTX
 
     zigzag_active = bool(_EXTRA_CTX.zigzag_cp_active)
+    if zigzag_active:
+        logger.info_once(
+            "[CP_BALANCE] DeepseekV2Model boundary zigzag active: "
+            "pp_rank=%s, first_pp_rank=%s, last_pp_rank=%s",
+            get_pp_group().rank_in_group,
+            get_pp_group().is_first_rank,
+            get_pp_group().is_last_rank,
+        )
 
     if get_pp_group().is_first_rank:
         if inputs_embeds is not None:
