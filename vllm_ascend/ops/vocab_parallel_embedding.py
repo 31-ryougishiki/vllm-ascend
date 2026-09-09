@@ -20,7 +20,7 @@ import torch
 import torch.distributed as dist
 from torch import nn
 from torch.nn.parameter import Parameter
-from vllm.distributed import divide
+from vllm.distributed import divide, tensor_model_parallel_all_reduce
 from vllm.distributed.parallel_state import get_tp_group
 from vllm.model_executor.layers.logits_processor import LogitsProcessor
 from vllm.model_executor.layers.quantization.base_config import (
@@ -167,6 +167,25 @@ class AscendVocabParallelEmbedding(VocabParallelEmbedding):
         else:
             return self._forward_origin(input_)
 
+    def forward_zigzag_local(self, input_):
+        """Embedding entry for model-level zigzag CP.
+
+        ``input_`` is already the rank-local ``[prev_blocks, next_blocks]``
+        token-id tensor (length ``num_tokens_pad / tp_size``).  Each rank
+        computes only its local rows for its vocab shard and then all-reduces
+        the local partial embeddings across TP.  This avoids the
+        FlashComm/SP embedding path's full-token lookup + reduce_scatter,
+        which would first shrink the tensor to a continuous local slice and
+        then require an all-gather + advanced index to recover the zigzag
+        layout.
+        """
+        if self.forward_type == "embed_tp":
+            raise NotImplementedError(
+                "forward_zigzag_local is not supported together with "
+                "fine-grained embedding TP"
+            )
+        return self._forward_origin(input_, already_sequence_parallel=True)
+
     def _forward_embed_tp(self, input_):
         num_tokens = input_.shape[0]
 
@@ -226,7 +245,7 @@ class AscendVocabParallelEmbedding(VocabParallelEmbedding):
         # Strip padding rows; preserve the original return shape.
         return self._embed_rs_out_buf[:num_tokens].view(num_tokens, -1)
 
-    def _forward_origin(self, input_):
+    def _forward_origin(self, input_, already_sequence_parallel: bool = False):
         if self.tp_size > 1:
             # Build the mask.
             masked_input, input_mask = self._mask_input_for_vocab_range(
@@ -244,8 +263,16 @@ class AscendVocabParallelEmbedding(VocabParallelEmbedding):
         # Mask the output embedding.
         if self.tp_size > 1:
             output_parallel.masked_fill_(input_mask.unsqueeze(-1), 0)
-        # Reduce across all the model parallel GPUs.
-        output = torch.ops.vllm.maybe_pad_and_reduce(output_parallel)
+        if already_sequence_parallel:
+            # The input rows are already the rank-local sequence shard, so the
+            # partial vocab-shard embeddings only need an all-reduce to become
+            # the complete per-row embeddings.  Do NOT reduce-scatter here:
+            # that would shrink the token dimension a second time.
+            output = tensor_model_parallel_all_reduce(output_parallel)
+        else:
+            # Reduce across all the model parallel GPUs (SP reduces/scatters
+            # the token dimension under FlashComm).
+            output = torch.ops.vllm.maybe_pad_and_reduce(output_parallel)
         return output
 
 

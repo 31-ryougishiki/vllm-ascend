@@ -327,15 +327,37 @@ def _patched_forward(
             get_pp_group().is_last_rank,
         )
 
+    hidden_is_zigzag_local = False
     if get_pp_group().is_first_rank:
         if inputs_embeds is not None:
             hidden_states = inputs_embeds
         else:
             if input_ids is None:
                 raise ValueError("Either input_ids or inputs_embeds must be provided to DeepseekV2Model.forward")
-            hidden_states = self.embed_input_ids(input_ids)
+            if zigzag_active and hasattr(self.embed_tokens, "forward_zigzag_local"):
+                # Optimal path: shard token ids first, then embed only the
+                # rank-local zigzag rows.  AscendVocabParallelEmbedding
+                # computes the vocab-shard partial for those local rows and
+                # all-reduces them locally, avoiding the full-token embedding
+                # lookup and the FlashComm reduce_scatter + all_gather pair.
+                local_input_ids = zigzag_shard_tensor(input_ids)
+                hidden_states = self.embed_tokens.forward_zigzag_local(local_input_ids)
+                hidden_is_zigzag_local = True
+            else:
+                hidden_states = self.embed_input_ids(input_ids)
         residual = None
-        if zigzag_active:
+        if zigzag_active and not hidden_is_zigzag_local:
+            if hidden_states.shape[0] != positions.shape[0]:
+                # AscendVocabParallelEmbedding under FlashComm/SP ends with
+                # maybe_pad_and_reduce: it returns a TP-reduce-scattered
+                # rank-local continuous slice, NOT the full padded
+                # natural-order embedding.  zigzag_shard_tensor indexes with
+                # global natural positions, so it must consume the full
+                # tensor.  Gather the embedding back to full padded length
+                # before applying the zigzag shard.  ``positions`` is still
+                # the full padded tensor, so the shape check also avoids a
+                # double gather when embedding already returns full rows.
+                hidden_states = tensor_model_parallel_all_gather(hidden_states, 0)
             hidden_states = zigzag_shard_tensor(hidden_states)
     else:
         assert intermediate_tensors is not None
