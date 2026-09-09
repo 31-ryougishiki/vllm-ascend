@@ -1369,11 +1369,8 @@ def singleton(cls):
     return get_instance
 
 
-@lru_cache(maxsize=1)
-def enable_dsa_cp() -> bool:
-    from vllm.config import get_current_vllm_config
-
-    vllm_config = get_current_vllm_config()
+def enable_dsa_cp_for_config(vllm_config: VllmConfig) -> bool:
+    """Config-based DSA-CP predicate for runtime paths without a config context."""
     # DSA CP is only applicable to models with indexer (e.g., DSv3.2, DSv4).
     has_indexer = hasattr(vllm_config.model_config, "hf_text_config") and hasattr(
         vllm_config.model_config.hf_text_config, "index_topk"
@@ -1386,11 +1383,36 @@ def enable_dsa_cp() -> bool:
     if additional_config is not None and "enable_dsa_cp" in additional_config:
         dsa_cp_enable = bool(additional_config["enable_dsa_cp"])
 
-    if dsa_cp_enable and not enable_sp():
+    if dsa_cp_enable and not enable_sp(vllm_config):
         raise ValueError(
             "DSA CP requires SP to be enabled. Please enable SP(set VLLM_ASCEND_ENABLE_FLASHCOMM1=1) to use DSA CP."
         )
-    return dsa_cp_enable and enable_sp()
+    return dsa_cp_enable and enable_sp(vllm_config)
+
+
+@lru_cache(maxsize=1)
+def enable_dsa_cp() -> bool:
+    from vllm.config import get_current_vllm_config
+
+    vllm_config = get_current_vllm_config()
+    return enable_dsa_cp_for_config(vllm_config)
+
+
+def dsa_cp_with_o_proj_tp_for_config(vllm_config: VllmConfig) -> bool:
+    """Whether DSA-CP prefill may gather the full TP o_proj weight.
+
+    Pure-config helper used by runtime paths (e.g. model runner profile/dummy
+    runs) where ``get_current_vllm_config`` may not be set.  Keep in sync with
+    :func:`enable_dsa_cp_with_o_proj_tp`.
+    """
+    kv_transfer_config = vllm_config.kv_transfer_config
+
+    # Keep the original TP o_proj weight when:
+    # 1) KV pooling is disabled, or
+    # 2) KV pooling is enabled on a prefill producer (including kv_both).
+    # DSA-CP prefill produces a full-head attention output, so the runtime
+    # asynchronously gathers a temporary full o_proj weight for the forward.
+    return kv_transfer_config is None or kv_transfer_config.is_kv_producer
 
 
 @lru_cache(maxsize=1)
@@ -1400,14 +1422,7 @@ def enable_dsa_cp_with_o_proj_tp() -> bool:
     from vllm.config import get_current_vllm_config
 
     vllm_config = get_current_vllm_config()
-    kv_transfer_config = vllm_config.kv_transfer_config
-
-    # Keep the original TP o_proj weight when:
-    # 1) KV pooling is disabled, or
-    # 2) KV pooling is enabled on a prefill producer (including kv_both).
-    # DSA-CP prefill produces a full-head attention output, so the runtime
-    # asynchronously gathers a temporary full o_proj weight for the forward.
-    return kv_transfer_config is None or kv_transfer_config.is_kv_producer
+    return dsa_cp_with_o_proj_tp_for_config(vllm_config)
 
 
 def check_gdn_layer(vllm_config) -> bool:

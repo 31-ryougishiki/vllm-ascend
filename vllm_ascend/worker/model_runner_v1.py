@@ -155,9 +155,9 @@ from vllm_ascend.utils import (
     AscendDeviceType,
     calc_split_factor,
     check_gdn_layer,
+    dsa_cp_with_o_proj_tp_for_config,
     embedding_tp_enable,
-    enable_dsa_cp,
-    enable_dsa_cp_with_o_proj_tp,
+    enable_dsa_cp_for_config,
     enable_sfa_dcp_replicated_indexer,
     enable_sp,
     enable_sp_by_pass,
@@ -2631,7 +2631,7 @@ class NPUModelRunner(GPUModelRunner):
         if num_scheduled_tokens_np is None or num_scheduled_tokens_np.size == 0:
             return False
         tp_size = self.vllm_config.parallel_config.tensor_parallel_size
-        if not enable_dsa_cp() or tp_size <= 1:
+        if not enable_dsa_cp_for_config(self.vllm_config) or tp_size <= 1:
             return False
 
         query_lens = [int(x) for x in num_scheduled_tokens_np]
@@ -2675,8 +2675,8 @@ class NPUModelRunner(GPUModelRunner):
             speculative=False,
             v2_model_runner=envs_vllm.VLLM_USE_V2_MODEL_RUNNER,
             dp_size=self.vllm_config.parallel_config.data_parallel_size,
-            dcp_replicated=enable_sfa_dcp_replicated_indexer(),
-            full_o_proj=enable_dsa_cp_with_o_proj_tp(),
+            dcp_replicated=enable_sfa_dcp_replicated_indexer(self.vllm_config),
+            full_o_proj=dsa_cp_with_o_proj_tp_for_config(self.vllm_config),
         )
 
     def _pad_for_sequence_parallelism(

@@ -65,6 +65,7 @@ from vllm_ascend.utils import (
     AscendDeviceType,
     _round_up,
     dispose_layer,
+    dsa_cp_with_o_proj_tp_for_config,
     enable_dsa_cp,
     enable_dsa_cp_with_o_proj_tp,
     enable_sfa_dcp_replicated_indexer,
@@ -711,8 +712,8 @@ class AscendSFAMetadataBuilder(MLACommonMetadataBuilder[AscendSFAMetadata]):
                 speculative=draft_index is not None,
                 v2_model_runner=envs_vllm.VLLM_USE_V2_MODEL_RUNNER,
                 dp_size=self.vllm_config.parallel_config.data_parallel_size,
-                dcp_replicated=enable_sfa_dcp_replicated_indexer(),
-                full_o_proj=enable_dsa_cp_with_o_proj_tp(),
+                dcp_replicated=enable_sfa_dcp_replicated_indexer(self.vllm_config),
+                full_o_proj=dsa_cp_with_o_proj_tp_for_config(self.vllm_config),
             ):
                 assert query_lens_cpu is not None and prefix_lens_cpu is not None
                 zigzag = _build_zigzag_meta(
