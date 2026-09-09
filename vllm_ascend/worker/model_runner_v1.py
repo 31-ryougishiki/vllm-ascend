@@ -2700,12 +2700,15 @@ class NPUModelRunner(GPUModelRunner):
             logger.info(
                 "[CP_BALANCE] runner-side zigzag padding eligible: "
                 "num_actual_tokens=%s, num_tokens_pad=%s, tp_size=%s, "
-                "num_reqs=%s, attn_state=%s",
+                "num_reqs=%s, attn_state=%s, local_cos=%s, "
+                "full_pad_scatter=%s",
                 num_actual_tokens,
                 num_tokens_pad,
                 tp_size,
                 len(query_lens),
                 getattr(self, "attn_state", None),
+                ascend_envs.VLLM_ASCEND_CP_BALANCE_LOCAL_COS,
+                ascend_envs.VLLM_ASCEND_CP_BALANCE_FULL_PAD_SCATTER,
             )
         else:
             logger.info(
@@ -2713,7 +2716,7 @@ class NPUModelRunner(GPUModelRunner):
                 "attn_state=%s, num_actual_tokens=%s, num_tokens_pad=%s, "
                 "min_query_len=%s, is_prefilling=%s, dp_size=%s, "
                 "full_o_proj=%s, v2_runner=%s, cp_balance_env=%s, "
-                "min_tokens_env=%s",
+                "min_tokens_env=%s, local_cos=%s, full_pad_scatter=%s",
                 getattr(self, "attn_state", None),
                 num_actual_tokens,
                 num_tokens_pad,
@@ -2724,6 +2727,8 @@ class NPUModelRunner(GPUModelRunner):
                 envs_vllm.VLLM_USE_V2_MODEL_RUNNER,
                 ascend_envs.VLLM_ASCEND_CP_BALANCE,
                 ascend_envs.VLLM_ASCEND_CP_BALANCE_MIN_TOKENS,
+                ascend_envs.VLLM_ASCEND_CP_BALANCE_LOCAL_COS,
+                ascend_envs.VLLM_ASCEND_CP_BALANCE_FULL_PAD_SCATTER,
             )
         return zigzag_enabled
 

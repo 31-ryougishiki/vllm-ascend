@@ -88,6 +88,18 @@ env_variables: dict[str, Callable[[], Any]] = {
     # kernel launches cost more than the attention imbalance they save. Tune
     # this on the target hardware: 8192 is a conservative default.
     "VLLM_ASCEND_CP_BALANCE_MIN_TOKENS": lambda: int(os.getenv("VLLM_ASCEND_CP_BALANCE_MIN_TOKENS", "8192")),
+    # Debug knob: generate zigzag cos/sin directly from local positions
+    # (default) instead of building the full padded RoPE table and indexing it.
+    "VLLM_ASCEND_CP_BALANCE_LOCAL_COS": lambda: bool(
+        int(os.getenv("VLLM_ASCEND_CP_BALANCE_LOCAL_COS", "1"))
+    ),
+    # Debug knob: scatter the full padded all-gathered KV/indexer tensor with
+    # -1 slot skipping for every dtype (default). Set to 0 to restore the old
+    # dtype-dependent actual-row filtering for dtypes that support advanced
+    # indexing.
+    "VLLM_ASCEND_CP_BALANCE_FULL_PAD_SCATTER": lambda: bool(
+        int(os.getenv("VLLM_ASCEND_CP_BALANCE_FULL_PAD_SCATTER", "1"))
+    ),
     # Whether to enable weight cast format to FRACTAL_NZ.
     # 0: close nz;
     # 1: only quant case enable nz;

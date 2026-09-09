@@ -748,23 +748,46 @@ class AscendSFAMetadataBuilder(MLACommonMetadataBuilder[AscendSFAMetadata]):
                 block_table_zigzag = None
 
             if zigzag is not None:
-                # Position-based rotary lookup: cos[zigzag_index] on the full
-                # padded table and a direct lookup for the local positions
-                # return exactly the same cache rows.  use_cache=False keeps
-                # this metadata independent of the shared _cos_mla buffer: a
-                # later attention group may legitimately overwrite that
-                # buffer with full natural-order positions in the same
-                # forward.
-                local_positions = input_positions[zigzag["zigzag_index"]]
-                cos, sin = get_cos_and_sin_mla(local_positions, use_cache=False)
-                # Keep the continuous-slice RoPE tensors for the draft /
-                # V2-runner / DP>1 fallback.  use_cache=False avoids
-                # overwriting the global MLA cos/sin buffer with a second,
-                # different row order in the same forward.
-                cos_continuous, sin_continuous = get_cos_and_sin_mla(
-                    input_positions[local_start:local_end_with_pad],
-                    use_cache=False,
-                )
+                if ascend_envs.VLLM_ASCEND_CP_BALANCE_LOCAL_COS:
+                    # Position-based rotary lookup: cos[zigzag_index] on the
+                    # full padded table and a direct lookup for the local
+                    # positions return exactly the same cache rows.
+                    # use_cache=False keeps this metadata independent of the
+                    # shared _cos_mla buffer: a later attention group may
+                    # legitimately overwrite that buffer with full
+                    # natural-order positions in the same forward.
+                    local_positions = input_positions[zigzag["zigzag_index"]]
+                    cos, sin = get_cos_and_sin_mla(
+                        local_positions, use_cache=False
+                    )
+                    # Keep the continuous-slice RoPE tensors for the draft /
+                    # V2-runner / DP>1 fallback.
+                    cos_continuous, sin_continuous = get_cos_and_sin_mla(
+                        input_positions[local_start:local_end_with_pad],
+                        use_cache=False,
+                    )
+                else:
+                    # Legacy debug path: full padded RoPE table followed by
+                    # zigzag advanced indexing, kept for A/B isolation.
+                    cos, sin = get_cos_and_sin_mla(
+                        input_positions, use_cache=(draft_index is None)
+                    )
+                    assert cos.shape == sin.shape, (
+                        f"cos.shape must be equal to sin.shape, "
+                        f"got {cos.shape} and {sin.shape}"
+                    )
+                    pad_size = num_tokens_pad - cos.shape[0]
+                    if pad_size > 0:
+                        cos = nn.functional.pad(
+                            cos, (0, 0, 0, 0, 0, 0, 0, pad_size)
+                        )
+                        sin = nn.functional.pad(
+                            sin, (0, 0, 0, 0, 0, 0, 0, pad_size)
+                        )
+                    cos_continuous = cos[local_start:local_end_with_pad]
+                    sin_continuous = sin[local_start:local_end_with_pad]
+                    cos = cos[zigzag["zigzag_index"]]
+                    sin = sin[zigzag["zigzag_index"]]
             else:
                 cos, sin = get_cos_and_sin_mla(
                     input_positions, use_cache=(draft_index is None)
@@ -2312,14 +2335,52 @@ class AscendSFAImpl(MLAAttentionImpl):
                     and dsa_cp_context.zigzag_gather_index is not None
                 ):
                     # all-gather order is [r0_prev, r0_next, r1_prev, ...].
-                    # Reorder only the integer slot mapping and scatter the
-                    # full padded gather for every dtype: padding rows carry
-                    # slot_mapping == -1 and are skipped by the scatter ops,
-                    # so no KV data needs to be advanced-indexed per layer.
-                    scatter_slots = slot_mapping_sfa[
-                        dsa_cp_context.zigzag_gather_index
-                    ]
-                    fused_kv_actual = fused_kv_no_split
+                    if (
+                        not ascend_envs.VLLM_ASCEND_CP_BALANCE_FULL_PAD_SCATTER
+                        and _supports_npu_advanced_index(fused_kv_no_split.dtype)
+                    ):
+                        # Legacy debug path: write only real rows for dtypes
+                        # that support advanced indexing.
+                        actual_gather_index = (
+                            dsa_cp_context.zigzag_actual_gather_index
+                        )
+                        actual_rows = dsa_cp_context.zigzag_actual_rows
+                        assert actual_gather_index is not None
+                        scatter_slots = slot_mapping_sfa[actual_gather_index]
+                        if (
+                            dsa_cp_context.num_tokens
+                            != attn_metadata.num_actual_tokens
+                        ):
+                            assert actual_rows is not None
+                            fused_kv_actual = fused_kv_no_split[actual_rows]
+                        else:
+                            fused_kv_actual = fused_kv_no_split[
+                                : attn_metadata.num_actual_tokens
+                            ]
+                        logger.info_once(
+                            "[CP_BALANCE] KV legacy actual-row scatter path: "
+                            "dtype=%s, actual_rows=%s, slots=%s",
+                            fused_kv_no_split.dtype,
+                            fused_kv_actual.shape[0],
+                            scatter_slots.shape[0],
+                        )
+                    else:
+                        # Reorder only the integer slot mapping and scatter the
+                        # full padded gather: padding rows carry
+                        # slot_mapping == -1 and are skipped by the scatter ops.
+                        scatter_slots = slot_mapping_sfa[
+                            dsa_cp_context.zigzag_gather_index
+                        ]
+                        fused_kv_actual = fused_kv_no_split
+                        logger.info_once(
+                            "[CP_BALANCE] KV full-padded scatter path: "
+                            "dtype=%s, full_rows=%s, actual_rows=%s, "
+                            "slots=%s",
+                            fused_kv_no_split.dtype,
+                            fused_kv_no_split.shape[0],
+                            attn_metadata.num_actual_tokens,
+                            scatter_slots.shape[0],
+                        )
                 else:
                     scatter_slots = slot_mapping_sfa[: attn_metadata.num_actual_tokens]
                     fused_kv_actual = fused_kv_no_split[: attn_metadata.num_actual_tokens]
@@ -2643,13 +2704,44 @@ class AscendSFAImpl(MLAAttentionImpl):
                     attn_metadata.dsa_cp_context is not None
                     and attn_metadata.dsa_cp_context.zigzag_gather_index is not None
                 ):
-                    # Reorder only the integer slot mapping and scatter the
-                    # full padded gather for every dtype.  Padding rows carry
-                    # slot_mapping == -1 and are skipped by the scatter op, so
-                    # indexer K / scale never need tensor[actual_rows] here.
-                    idx_slots = slot_mapping[
-                        attn_metadata.dsa_cp_context.zigzag_gather_index
-                    ]
+                    if (
+                        not ascend_envs.VLLM_ASCEND_CP_BALANCE_FULL_PAD_SCATTER
+                        and _supports_npu_advanced_index(k_li_to_write.dtype)
+                    ):
+                        # Legacy debug path: write only real indexer rows for
+                        # dtypes that support advanced indexing.
+                        actual_gather_index = (
+                            attn_metadata.dsa_cp_context.zigzag_actual_gather_index
+                        )
+                        actual_rows = attn_metadata.dsa_cp_context.zigzag_actual_rows
+                        assert actual_gather_index is not None
+                        idx_slots = slot_mapping[actual_gather_index]
+                        if k_li_to_write.shape[0] != attn_metadata.num_actual_tokens:
+                            assert actual_rows is not None
+                            k_li_to_write = k_li_to_write[actual_rows]
+                        if (
+                            k_li_scale_to_write is not None
+                            and k_li_scale_to_write.shape[0]
+                            != attn_metadata.num_actual_tokens
+                        ):
+                            assert actual_rows is not None
+                            k_li_scale_to_write = k_li_scale_to_write[actual_rows]
+                    else:
+                        # Reorder only the integer slot mapping and scatter the
+                        # full padded gather.  Padding rows carry -1 slots and
+                        # are skipped by the scatter op.
+                        idx_slots = slot_mapping[
+                            attn_metadata.dsa_cp_context.zigzag_gather_index
+                        ]
+                        logger.info_once(
+                            "[CP_BALANCE] Indexer full-padded scatter path: "
+                            "k_dtype=%s, full_rows=%s, actual_rows=%s, "
+                            "slots=%s",
+                            k_li_to_write.dtype,
+                            k_li_to_write.shape[0],
+                            attn_metadata.num_actual_tokens,
+                            idx_slots.shape[0],
+                        )
 
                 if use_li_c8_reshape_optim:
                     torch.ops._C_ascend.store_kv_block(
