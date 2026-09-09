@@ -2635,12 +2635,25 @@ class NPUModelRunner(GPUModelRunner):
         if num_scheduled_tokens_np is None or num_scheduled_tokens_np.size == 0:
             return False
         tp_size = self.vllm_config.parallel_config.tensor_parallel_size
-        if not enable_dsa_cp_for_config(self.vllm_config) or tp_size <= 1:
+        dsa_cp_enabled = enable_dsa_cp_for_config(self.vllm_config)
+        if not dsa_cp_enabled or tp_size <= 1:
+            logger.info(
+                "[CP_BALANCE] runner-side zigzag check disabled: "
+                "dsa_cp=%s, tp_size=%s",
+                dsa_cp_enabled,
+                tp_size,
+            )
             return False
 
         query_lens = [int(x) for x in num_scheduled_tokens_np]
         num_actual_tokens = int(sum(query_lens))
         if num_actual_tokens != num_scheduled_tokens:
+            logger.info(
+                "[CP_BALANCE] runner-side zigzag skipped: "
+                "actual_tokens=%s != scheduled_tokens=%s",
+                num_actual_tokens,
+                num_scheduled_tokens,
+            )
             return False
         num_tokens_pad = round_up(num_actual_tokens, 2 * tp_size)
 
@@ -2665,6 +2678,7 @@ class NPUModelRunner(GPUModelRunner):
             prefix_lens = [0] * len(query_lens)
             is_prefilling = [True] * len(query_lens)
 
+        full_o_proj = dsa_cp_with_o_proj_tp_for_config(self.vllm_config)
         zigzag_enabled = can_enable_zigzag_for_batch(
             getattr(self, "attn_state", AscendAttentionState.DecodeOnly),
             num_tokens_pad,
@@ -2680,7 +2694,7 @@ class NPUModelRunner(GPUModelRunner):
             v2_model_runner=envs_vllm.VLLM_USE_V2_MODEL_RUNNER,
             dp_size=self.vllm_config.parallel_config.data_parallel_size,
             dcp_replicated=enable_sfa_dcp_replicated_indexer(self.vllm_config),
-            full_o_proj=dsa_cp_with_o_proj_tp_for_config(self.vllm_config),
+            full_o_proj=full_o_proj,
         )
         if zigzag_enabled:
             logger.info(
@@ -2692,6 +2706,24 @@ class NPUModelRunner(GPUModelRunner):
                 tp_size,
                 len(query_lens),
                 getattr(self, "attn_state", None),
+            )
+        else:
+            logger.info(
+                "[CP_BALANCE] runner-side zigzag NOT eligible: "
+                "attn_state=%s, num_actual_tokens=%s, num_tokens_pad=%s, "
+                "min_query_len=%s, is_prefilling=%s, dp_size=%s, "
+                "full_o_proj=%s, v2_runner=%s, cp_balance_env=%s, "
+                "min_tokens_env=%s",
+                getattr(self, "attn_state", None),
+                num_actual_tokens,
+                num_tokens_pad,
+                min(query_lens),
+                is_prefilling,
+                self.vllm_config.parallel_config.data_parallel_size,
+                full_o_proj,
+                envs_vllm.VLLM_USE_V2_MODEL_RUNNER,
+                ascend_envs.VLLM_ASCEND_CP_BALANCE,
+                ascend_envs.VLLM_ASCEND_CP_BALANCE_MIN_TOKENS,
             )
         return zigzag_enabled
 
@@ -2707,13 +2739,20 @@ class NPUModelRunner(GPUModelRunner):
         # by AscendSFAMetadataBuilder, so non-zigzag batches keep the normal
         # tp_size alignment.
         tp_size = self.vllm_config.parallel_config.tensor_parallel_size
-        if enable_sp(self.vllm_config) or enable_sp_by_pass():
+        sp_enabled = enable_sp(self.vllm_config)
+        if sp_enabled or enable_sp_by_pass():
             align_size = tp_size
             if self._zigzag_padding_eligible(
                 num_scheduled_tokens, num_scheduled_tokens_np
             ):
                 align_size *= 2
             return round_up(num_scheduled_tokens, align_size)
+        logger.info(
+            "[CP_BALANCE] _pad_for_sequence_parallelism: "
+            "enable_sp=%s, enable_sp_by_pass=%s -> zigzag check skipped",
+            sp_enabled,
+            enable_sp_by_pass(),
+        )
         return num_scheduled_tokens
 
     # These functions from upstream vllm handle PP+SP. Ascend's flashcomm1 SP
