@@ -67,19 +67,33 @@ def get_mrv2_in_profile_run() -> bool:
     return _MRV2_IN_PROFILE_RUN.get()
 
 
+def _iter_attn_metadata(attn_metadata: Any):
+    """Yield per-layer metadata objects from dict / list-of-dict / object.
+
+    v1 attention metadata is normally ``{layer_name: metadata}``.  When
+    ubatching is enabled it becomes a list of such dicts, so walk both shapes
+    to keep zigzag activation/fallback decisions consistent.
+    """
+    if isinstance(attn_metadata, dict):
+        yield from attn_metadata.values()
+    elif isinstance(attn_metadata, (list, tuple)):
+        for item in attn_metadata:
+            if isinstance(item, dict):
+                yield from item.values()
+            else:
+                yield item
+    else:
+        yield attn_metadata
+
+
 def _find_zigzag_cp_context(attn_metadata: Any):
     """Find the DSA-CP zigzag context from attention metadata.
 
-    ``attn_metadata`` may be a per-layer dict (vLLM v1) or a single object.
-    All layers of one forward share the same token layout, so returning the
-    first non-None context is enough.
+    ``attn_metadata`` may be a per-layer dict (vLLM v1), a list of per-layer
+    dicts (ubatching), or a single object.  All layers of one forward share
+    the same token layout, so returning the first non-None context is enough.
     """
-    candidates: list[Any] = []
-    if isinstance(attn_metadata, dict):
-        candidates.extend(attn_metadata.values())
-    else:
-        candidates.append(attn_metadata)
-    for meta in candidates:
+    for meta in _iter_attn_metadata(attn_metadata):
         if meta is None:
             continue
         ctx = getattr(meta, "dsa_cp_context", None)
@@ -99,14 +113,7 @@ def _disable_zigzag_metadata_for_fallback(attn_metadata: Any) -> None:
     fallback so attention, KV cache writes and the model boundary all execute
     the same non-zigzag path.
     """
-    if isinstance(attn_metadata, dict):
-        candidates = list(attn_metadata.values())
-    elif isinstance(attn_metadata, (list, tuple)):
-        candidates = list(attn_metadata)
-    else:
-        candidates = [attn_metadata]
-
-    for meta in candidates:
+    for meta in _iter_attn_metadata(attn_metadata):
         if meta is None:
             continue
         ctx = getattr(meta, "dsa_cp_context", None)
@@ -337,6 +344,17 @@ def set_ascend_forward_context(
             forward_context.zigzag_cp_context = zigzag_cp_context
             forward_context.zigzag_cp_active = zigzag_cp_active
 
+        if zigzag_cp_active and zigzag_cp_context is not None and input_ids is not None:
+            # MoE hash routing runs once per MoE layer, but the reorder is
+            # identical every time: reorder ``input_ids`` here once and let
+            # experts_selector consume the rank-concatenating zigzag order
+            # directly.  Keep the model-embedding ``input_ids`` (passed to the
+            # model by the runner) in natural order; this context copy is only
+            # the MoE-side alias.
+            input_ids = input_ids.to(torch.int64)
+            input_ids = zigzag_reorder_moe_aux(input_ids, zigzag_cp_context)
+            forward_context.input_ids = input_ids
+
         if num_tokens is not None:
             if num_actual_tokens is None:
                 num_actual_tokens = num_tokens
@@ -348,9 +366,10 @@ def set_ascend_forward_context(
                 mc2_mask[:num_actual_tokens] = True
                 mc2_mask[num_actual_tokens:] = False
                 if zigzag_cp_active and zigzag_cp_context is not None:
-                    # MoE consumes rank-concatenating zigzag order.  This is
-                    # the exact same full padded zigzag_gather_index that
-                    # experts_selector applies to input_ids.
+                    # MoE consumes rank-concatenating zigzag order.  Both
+                    # mc2_mask and forward_context.input_ids use the exact
+                    # same full padded zigzag_gather_index, so they can never
+                    # drift apart.
                     mc2_mask = zigzag_reorder_moe_aux(
                         mc2_mask, zigzag_cp_context
                     )

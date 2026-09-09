@@ -157,6 +157,7 @@ from vllm_ascend.utils import (
     check_gdn_layer,
     embedding_tp_enable,
     enable_dsa_cp,
+    enable_dsa_cp_with_o_proj_tp,
     enable_sfa_dcp_replicated_indexer,
     enable_sp,
     enable_sp_by_pass,
@@ -2605,7 +2606,10 @@ class NPUModelRunner(GPUModelRunner):
             hidden_states = run_model()
             self._update_full_graph_params_if_needed(forward_context, num_tokens_padded)
 
-        if forward_context.flash_comm_v1_enabled and not isinstance(hidden_states, IntermediateTensors):
+        if (
+            forward_context.flash_comm_v1_enabled
+            or getattr(forward_context, "zigzag_cp_active", False)
+        ) and not isinstance(hidden_states, IntermediateTensors):
             if getattr(forward_context, "zigzag_cp_active", False):
                 hidden_states = zigzag_gather_hidden_states_and_aux(hidden_states)
             else:
@@ -2672,6 +2676,7 @@ class NPUModelRunner(GPUModelRunner):
             v2_model_runner=envs_vllm.VLLM_USE_V2_MODEL_RUNNER,
             dp_size=self.vllm_config.parallel_config.data_parallel_size,
             dcp_replicated=enable_sfa_dcp_replicated_indexer(),
+            full_o_proj=enable_dsa_cp_with_o_proj_tp(),
         )
 
     def _pad_for_sequence_parallelism(

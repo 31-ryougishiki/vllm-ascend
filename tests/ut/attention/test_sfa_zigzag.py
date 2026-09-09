@@ -96,6 +96,11 @@ def test_can_zigzag_supports_multi_request_pure_prefill():
         assert not _can_zigzag(
             states[0], 16, 16, 2, [16], [0], dcp_replicated=True
         )
+        # Rank-local zigzag rows require the SFA prefill full-o_proj path;
+        # KV-consumer-only o_proj layouts must not enable zigzag.
+        assert not _can_zigzag(
+            states[0], 16, 16, 2, [16], [0], full_o_proj=False
+        )
         # A batch containing a decode request is rejected by is_prefilling.
         assert not _can_zigzag(
             states[0],

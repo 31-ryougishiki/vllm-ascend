@@ -62,8 +62,9 @@ def zigzag_reorder_moe_aux(x: torch.Tensor, ctx=None) -> torch.Tensor:
     ``[r0_prev, r0_next, r1_prev, r1_next, ...]``.  ``input_ids`` (hash
     routing) and ``mc2_mask`` must therefore use the exact same full padded
     ``zigzag_gather_index``; using the same helper for both guarantees they can
-    never drift apart.  Padding rows are reordered as well and are masked
-    downstream (``slot_mapping == -1`` / ``mc2_mask == False``).
+    never drift apart.  ``set_ascend_forward_context`` applies the reorder to
+    ``input_ids`` once per forward.  Padding rows are reordered as well and
+    are masked downstream (``slot_mapping == -1`` / ``mc2_mask == False``).
     """
     if ctx is None:
         ctx = get_zigzag_cp_context()
@@ -583,6 +584,7 @@ def can_enable_zigzag_for_batch(
     v2_model_runner: bool = False,
     dp_size: int = 1,
     dcp_replicated: bool = False,
+    full_o_proj: bool = True,
 ) -> bool:
     """The single source of truth for whether a batch may use zigzag CP.
 
@@ -602,6 +604,13 @@ def can_enable_zigzag_for_batch(
         # The model-boundary fallback paths cannot carry the zigzag layout.
         # Replicated-indexer DCP owns a different block-table/gather flow and
         # must stay on the continuous-slice path.
+        return False
+    if not full_o_proj:
+        # Under zigzag every rank owns different token rows.  SFA prefill can
+        # only produce a complete per-row o_proj result when it may gather the
+        # full TP weight (enable_dsa_cp_with_o_proj_tp); a KV-consumer-only
+        # deployment keeps the TP-sharded o_proj and cannot reduce correctly
+        # across ranks that hold different rows.
         return False
     state_name = getattr(attn_state, "name", attn_state)
     if state_name not in _PURE_PREFILL_ATTENTION_STATES:
