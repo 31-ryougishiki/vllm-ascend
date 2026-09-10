@@ -308,6 +308,43 @@ python tools/cp_balance_compare/ab_cp_compare.py \
 - 某个配置 `server exited`：多半是 8 卡未释放或端口被占，`npu-smi info` +
   `ps -ef | grep "[v]llm serve"` 后重跑，或 `--restart-wait 90`。
 
+### 6.3 拉起后长时间没输出，driver 怎么判断"可以发请求了"
+
+就绪判定只有一个：`GET http://127.0.0.1:<port>/health` 返回 200。
+
+```
+launch  ->  [wait] B: polling http://127.0.0.1:12800/health (startup timeout=3600s)
+            [wait] B: /health not ready yet (elapsed=30s/3600s, last=ConnectionError)
+            ...
+            [ready] B: /health -> 200 (elapsed=420s)     ← 从这里才开始
+            [check] B fingerprint OK: {...}              ← 校验 launcher 实际配置
+            [query] B -> http://127.0.0.1:12800          ← 真正开始发请求
+```
+
+- 轮询间隔 3s，上限 `--startup-timeout`（默认 3600s）；每 `--wait-log-every`（默认 30s）
+  打一次心跳，所以"很久没输出"现在会变成一行行 `[wait]`；
+- 首次请求一定在 `[ready]` + `[check] ... OK` 之后；`[query]` 那一行才是发请求；
+- 如果 launcher 进程提前退出（配置错误/HBM 没释放），driver 立即报错并打印日志尾部，
+  不会等满 1 小时。
+
+长时间停在 `[wait]` 时按下面排查：
+
+```bash
+# 1) 模型是否在加载（正常会看到权重加载/compile/warmup 日志，耗时几分钟）
+tail -f /dev/shm/cp_ab/logs/server_B.log
+npu-smi info                     # 8 张卡是否被 8 个进程占用
+
+# 2) 端口是否真的监听（应与 launcher 的 --port 一致）
+ss -ltnp | grep 12800
+curl --noproxy '*' -sv http://127.0.0.1:12800/health
+
+# 3) 代理问题（driver 已用 trust_env=False 规避；如果你用旧版 driver 才有此问题）
+env | grep -i proxy
+```
+
+心跳里 `last=` 的含义：`ConnectionError` = 端口还没监听（多在加载）；`ProxyError` =
+请求被代理劫持（旧版 driver）；`Timeout` = 服务响应慢。
+
 ## 7. 相关代码
 
 - `vllm_ascend/layers/cp_zigzag.py`：zigzag plan / shard / gather

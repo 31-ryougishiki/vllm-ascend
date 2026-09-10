@@ -85,6 +85,13 @@ try:
 except ImportError:  # pragma: no cover
     sys.exit("ab_cp_compare needs `requests`; run `pip install requests numpy`")
 
+# Never route localhost traffic through the shell's HTTP proxy.  The launcher
+# unsets proxies for the server, but the driver runs in the caller's shell where
+# http_proxy/https_proxy may be set; requests would then send /health through a
+# proxy and the driver would look "stuck" forever.
+HTTP_SESSION = requests.Session()
+HTTP_SESSION.trust_env = False
+
 
 FINGERPRINT_PREFIX = "[cp-ab]"
 CFG_JSON_PREFIX = "[cp-ab-cfg]"
@@ -389,18 +396,41 @@ def launch_server(args: argparse.Namespace, name: str, log_dir: Path):
     return proc, port, log, log_path
 
 
-def wait_ready(url: str, timeout: float, proc=None) -> bool:
-    deadline = time.time() + timeout
+def wait_ready(
+    url: str,
+    timeout: float,
+    proc=None,
+    label: str = "",
+    log_every: float = 30.0,
+) -> bool:
+    """Ready == ``GET <url>/health`` returns 200.
+
+    Polls every 3s until ``timeout``; if the launcher process exits early the
+    wait stops immediately (bad config / HBM not released).  A heartbeat is
+    printed every ``log_every`` seconds so a long model load does not look like
+    a hang.
+    """
+    start = time.time()
+    deadline = start + timeout
+    last_log = start
+    last_error = "connecting"
     while time.time() < deadline:
         if proc is not None and proc.poll() is not None:
-            # The launcher died (bad config, HBM not released, ...): fail fast
-            # instead of waiting for the whole startup timeout.
+            # The launcher died (bad config, HBM not released, ...): fail fast.
             return False
         try:
-            if requests.get(url + "/health", timeout=3).status_code == 200:
+            if HTTP_SESSION.get(url + "/health", timeout=3).status_code == 200:
+                print(f"[ready] {label}: /health -> 200 (elapsed={time.time() - start:.0f}s)")
                 return True
-        except requests.RequestException:
-            pass
+        except requests.RequestException as exc:
+            last_error = type(exc).__name__
+        now = time.time()
+        if now - last_log >= log_every:
+            print(
+                f"[wait] {label}: /health not ready yet "
+                f"(elapsed={now - start:.0f}s/{timeout:.0f}s, last={last_error})"
+            )
+            last_log = now
         time.sleep(3)
     return False
 
@@ -568,7 +598,7 @@ def query_batch(url: str, args: argparse.Namespace, prompts: list[Prompt]) -> li
     last_err: Exception | None = None
     for attempt in range(args.http_retries):
         try:
-            resp = requests.post(url + "/v1/completions", json=payload, timeout=args.http_timeout)
+            resp = HTTP_SESSION.post(url + "/v1/completions", json=payload, timeout=args.http_timeout)
             resp.raise_for_status()
             data = resp.json()
             choices = sorted(data["choices"], key=lambda item: item.get("index", 0))
@@ -987,14 +1017,15 @@ def print_metrics(metrics: dict[str, Any]) -> None:
     top1 = " ".join(f"{pair}={metrics['top1%' + pair]:.2f}" for pair in top1_pairs)
     deltas = " ".join(f"{pair}={metrics['p99|d|' + pair]:.2e}" for pair in delta_pairs)
     focus = "C-B" if "C-B" in delta_pairs else (delta_pairs[-1] if delta_pairs else "")
-    first = metrics.get(f"first_div_{focus}", "-") if focus else "-"
+    first = (metrics.get(f"first_div_{focus}") or "-") if focus else "-"
     block = metrics.get(f"block@first_div_{focus}", "-") if focus else "-"
     gen_pairs = sorted(key[len("gen_top1%"):] for key in metrics if key.startswith("gen_top1%"))
     gen = " ".join(f"{pair}={metrics['gen_top1%' + pair]}" for pair in gen_pairs)
     print(
         f"[{metrics['case']}.{metrics['req']}] len={metrics['length']} "
         f"top1% {top1} | p99|d| {deltas} | "
-        f"first_div {focus}={first} @ {block} {gen}"
+        f"first_div {focus}={first} @ {block} "
+        f"gen_top1% {gen}"
     )
 
 
@@ -1034,7 +1065,17 @@ def collect_sequential(args, names, cases, out_dir, log_dir):
             continue
         url = f"http://127.0.0.1:{port}"
         try:
-            if not wait_ready(url, args.startup_timeout, proc):
+            print(
+                f"[wait] {name}: polling {url}/health "
+                f"(startup timeout={args.startup_timeout:.0f}s); the model load can take minutes"
+            )
+            if not wait_ready(
+                url,
+                args.startup_timeout,
+                proc,
+                label=name,
+                log_every=args.wait_log_every,
+            ):
                 state = "exited" if proc is not None and proc.poll() is not None else "not ready"
                 print(f"[error] {name} server {state}; log tail:\n{tail(log_path)}")
                 raise SystemExit(1)
@@ -1207,6 +1248,12 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         help="seconds to wait after killing a server before launching the next one",
     )
     parser.add_argument("--startup-timeout", type=float, default=3600)
+    parser.add_argument(
+        "--wait-log-every",
+        type=float,
+        default=30.0,
+        help="seconds between '/health not ready' heartbeat lines while the server loads",
+    )
     parser.add_argument("--http-timeout", type=float, default=900)
     parser.add_argument("--http-retries", type=int, default=3)
     parser.add_argument("--delta-threshold", type=float, default=0.05)

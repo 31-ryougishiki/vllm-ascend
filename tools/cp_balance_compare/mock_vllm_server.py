@@ -142,7 +142,11 @@ def start_mock_servers(
     servers: list[ThreadingHTTPServer] = []
     urls: dict[str, str] = {}
     for index, (name, offset) in enumerate(offsets.items()):
-        server = ThreadingHTTPServer(("127.0.0.1", base_port + index), _Handler)
+        # base_port=0 means "pick an ephemeral port per server"; otherwise use
+        # consecutive ports.  Do not use `base_port + index` when base_port is 0,
+        # that would try to bind port 1, 2, ... on the host.
+        bind_port = 0 if base_port == 0 else base_port + index
+        server = ThreadingHTTPServer(("127.0.0.1", bind_port), _Handler)
         server.offset = offset  # type: ignore[attr-defined]
         server.echo_mode = True  # type: ignore[attr-defined]
         thread = threading.Thread(target=server.serve_forever, daemon=True)

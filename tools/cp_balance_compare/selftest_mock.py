@@ -72,6 +72,32 @@ def _expect_runtime_error(func) -> None:
     raise AssertionError("expected RuntimeError")
 
 
+def test_wait_ready_stops_when_launcher_exited() -> None:
+    proc = subprocess.Popen([sys.executable, "-c", "pass"])
+    proc.wait(timeout=30)
+    assert driver.wait_ready("http://127.0.0.1:1", timeout=5, proc=proc, label="X", log_every=1) is False
+
+
+def test_wait_ready_ignores_proxy_env() -> None:
+    import os
+
+    servers, urls = mock.start_mock_servers({"B": 0.0})
+    keys = ("HTTP_PROXY", "HTTPS_PROXY", "http_proxy", "https_proxy", "ALL_PROXY", "all_proxy")
+    saved = {key: os.environ.get(key) for key in keys}
+    try:
+        for key in keys:
+            os.environ[key] = "http://127.0.0.1:9"  # an unreachable proxy
+        # The driver session must bypass proxies for localhost.
+        assert driver.wait_ready(urls["B"], timeout=10, proc=None, label="B", log_every=100)
+    finally:
+        mock.stop_mock_servers(servers)
+        for key, value in saved.items():
+            if value is None:
+                os.environ.pop(key, None)
+            else:
+                os.environ[key] = value
+
+
 def test_parse_choice_token_ids_prompt() -> None:
     choice = mock.make_choice(0, [11, 22, 33, 44], top_k=3, offset=0.0, echo=True)
     entry = driver.parse_choice(choice, {"choices": [choice]}, 3)
