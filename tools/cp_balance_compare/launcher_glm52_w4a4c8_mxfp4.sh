@@ -19,7 +19,7 @@
 #
 # It is a drop-in replacement for
 # /home/z30055003/script/start_server_prefill-w4a4c8-mxfp4.sh with two extra
-# properties required by the A/B/C driver:
+# properties required by the B/C driver:
 #   1. every cp_balance knob can be overridden through the environment,
 #   2. it prints one "[cp-ab] ..." fingerprint line (--config-check).
 #
@@ -89,13 +89,15 @@ export PYTHONPATH="${VLLM_ASCEND_REPO}:${PYTHONPATH:-}"
 
 # ---------------------------------------------------------------------------
 # cp_balance knobs (overridable; defaults match the original script).
+# MIN_TOKENS is pinned by the driver and checked in the fingerprint; here it is
+# only the fallback for manual runs (vllm_ascend source default is 8192).
 # ---------------------------------------------------------------------------
 export VLLM_ASCEND_CP_BALANCE="${VLLM_ASCEND_CP_BALANCE:-1}"
 export VLLM_ASCEND_CP_BALANCE_MIN_TOKENS="${VLLM_ASCEND_CP_BALANCE_MIN_TOKENS:-2048}"
 export VLLM_ASCEND_CP_BALANCE_EMBED_LOCAL="${VLLM_ASCEND_CP_BALANCE_EMBED_LOCAL:-0}"
 
 # NOTE: no PD-only knobs here. `recompute_scheduler_enable=true` is rejected by
-# vllm_ascend.platform unless kv_role='kv_consumer', and the A/B/C comparison by
+# vllm_ascend.platform unless kv_role='kv_consumer', and the B/C comparison by
 # default runs without the PD connector. Add it back with
 # `--extra-additional-config '{"recompute_scheduler_enable": true}'` only when
 # the run really is a PD decode node.
@@ -146,11 +148,11 @@ spec_flag=0
 if [ -n "${spec_config}" ]; then spec_flag=1; fi
 kv_flag=0
 if [ -n "${kv_config}" ]; then kv_flag=1; fi
-echo "[cp-ab] CP_BALANCE=${VLLM_ASCEND_CP_BALANCE} DSA_CP=${dsa_cp} EMBED_LOCAL=${VLLM_ASCEND_CP_BALANCE_EMBED_LOCAL} SPEC=${spec_flag} KV=${kv_flag}"
+echo "[cp-ab] CP_BALANCE=${VLLM_ASCEND_CP_BALANCE} DSA_CP=${dsa_cp} MIN_TOKENS=${VLLM_ASCEND_CP_BALANCE_MIN_TOKENS} EMBED_LOCAL=${VLLM_ASCEND_CP_BALANCE_EMBED_LOCAL} SPEC=${spec_flag} KV=${kv_flag}"
 # Effective additional_config, verified verbatim by ab_cp_compare.py --config-check.
 echo "[cp-ab-cfg] ${additional_config}"
 
-port="${2:-${1:-12800}}"
+port="${2:-${1:-8034}}"
 
 # DRY_RUN=1: validate the environment without touching the NPUs (used by
 # `ab_cp_compare.py --preflight`).

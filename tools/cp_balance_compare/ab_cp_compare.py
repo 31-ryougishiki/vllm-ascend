@@ -12,20 +12,23 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 # This file is a part of the vllm-ascend project.
-"""A/B/C prefill precision comparison for DSA-CP cp_balance.
+"""B/C prefill precision comparison for DSA-CP cp_balance.
 
-Configurations (same weights, same TP size and the same additional_config
-except ``enable_dsa_cp``):
+Only the cp_balance switch varies; DSA-CP itself is always on.  One node runs
+one server at a time (TP=N occupies the whole node), so the two configurations
+are started sequentially:
 
-* ``A``  : DSA-CP off                            -> golden non-CP anchor (optional)
-* ``B``  : DSA-CP on  + ``VLLM_ASCEND_CP_BALANCE=0`` -> DSA-CP continuous baseline
-* ``C``  : DSA-CP on  + ``VLLM_ASCEND_CP_BALANCE=1`` -> zigzag cp_balance
-* ``<ref>2`` : optional repeat of the first config -> noise floor (``--repeat-a``)
+* ``B``  : DSA-CP on + ``VLLM_ASCEND_CP_BALANCE=0`` -> continuous-slice baseline
+* ``C``  : DSA-CP on + ``VLLM_ASCEND_CP_BALANCE=1`` -> zigzag cp_balance
+* ``B2`` : optional repeat of B (``--repeat-a``) -> noise floor
 
-The decisive comparison is ``C-B`` (same DSA-CP path, only the token layout
-differs).  ``A`` only separates "DSA-CP's own error" (``B-A``) from cp_balance;
-when B (``CP_BALANCE=0``) is already the trusted baseline, run
-``--configs B,C --repeat-a`` and use ``B2-B`` as the noise floor.
+The decisive comparison is ``C-B``: same DSA-CP path, same kernels, only the
+token layout differs, so the delta is cp_balance's account.  A repeat of the
+baseline (``B2-B``) measures the run-to-run noise floor it has to beat.
+
+The DSA-CP-off "golden anchor" (former config ``A``) is intentionally not part
+of the tool any more: it runs a different code path, so it can only give a
+coarse reference.  Keep B as the trusted baseline instead.
 
 For every prompt the driver calls ``/v1/completions`` with ``echo=true`` and
 ``logprobs=K`` and records, for every token position:
@@ -43,15 +46,16 @@ whole node; with several nodes, start them yourself and use ``--urls``.
 
 Examples
 --------
-Run everything on one node (uses ``launcher_template.sh`` by default)::
+Run both configurations sequentially on one node (port 8034 by default, uses
+``launcher_template.sh`` if ``--launcher`` is not given)::
 
     MODEL_PATH=/path/to/weights python tools/cp_balance_compare/ab_cp_compare.py \
         --out /dev/shm/cp_ab --prompt-lens 2048,2049,4096 --repeat-a
 
-Three servers on three nodes::
+Compare two servers that are already running::
 
     python tools/cp_balance_compare/ab_cp_compare.py --out /dev/shm/cp_ab \
-        --urls A=http://n1:12800,B=http://n2:12800,C=http://n3:12800
+        --urls B=http://n1:8034,C=http://n2:8034
 
 Real prompts from a JSONL file (see ``load_prompts_file``)::
 
@@ -113,12 +117,18 @@ BASE_ADDITIONAL_CONFIG: dict[str, Any] = {
     "enable_dsa_cp": True,
 }
 
-# name -> (enable_dsa_cp, VLLM_ASCEND_CP_BALANCE)
+# name -> (enable_dsa_cp, VLLM_ASCEND_CP_BALANCE).  Only the cp_balance switch
+# differs between the two configurations the tool compares; DSA-CP stays on.
+# ``A`` (DSA-CP off) is kept in the registry solely so that asking for it
+# raises a readable error instead of a KeyError -- see ``run()``.
 CONFIGS: dict[str, tuple[bool, str]] = {
     "A": (False, "0"),
     "B": (True, "0"),
     "C": (True, "1"),
 }
+
+# Only B and C (plus a repeated baseline) are selectable; A is not supported.
+SUPPORTED_CONFIGS = ("B", "C")
 
 Prompt = str | list[int]
 PromptCase = tuple[str, list[Prompt]]
@@ -144,7 +154,7 @@ def additional_config(enable_dsa_cp: bool, extra_json: str = "") -> str:
 
 
 def config_spec(name: str) -> tuple[bool, str]:
-    """(enable_dsa_cp, VLLM_ASCEND_CP_BALANCE) for a config, incl. ``A2``/``B2``."""
+    """(enable_dsa_cp, VLLM_ASCEND_CP_BALANCE) for a config, incl. ``B2``."""
     base = name[:-1] if name.endswith("2") and name[:-1] in CONFIGS else name
     return CONFIGS[base]
 
@@ -154,6 +164,12 @@ def resolved_config(name: str, args: argparse.Namespace) -> dict[str, str]:
     enable_dsa_cp, cp_balance = config_spec(name)
     resolved = {
         "VLLM_ASCEND_CP_BALANCE": cp_balance,
+        # Zigzag only activates at/above this token count (vllm_ascend/envs.py,
+        # default 8192 in the source).  The driver pins it explicitly and the
+        # fingerprint checks it, so a launcher/box default can never silently
+        # keep C on the continuous-slice path (which would make C == B and look
+        # like "cp_balance has no precision impact").
+        "VLLM_ASCEND_CP_BALANCE_MIN_TOKENS": str(args.cp_balance_min_tokens),
         "VLLM_ASCEND_ADDITIONAL_CONFIG": additional_config(enable_dsa_cp, args.extra_additional_config),
         "VLLM_ASCEND_SPEC_CONFIG": args.spec_config,
         "VLLM_ASCEND_KV_TRANSFER_CONFIG": "" if args.no_kv_connector else args.kv_transfer_config,
@@ -189,6 +205,7 @@ def expected_fingerprint(name: str, args: argparse.Namespace) -> dict[str, int]:
     return {
         "CP_BALANCE": int(resolved["VLLM_ASCEND_CP_BALANCE"]),
         "DSA_CP": 1 if enable_dsa_cp else 0,
+        "MIN_TOKENS": int(resolved["VLLM_ASCEND_CP_BALANCE_MIN_TOKENS"]),
         "EMBED_LOCAL": int(resolved["VLLM_ASCEND_CP_BALANCE_EMBED_LOCAL"]),
         "SPEC": 1 if resolved["VLLM_ASCEND_SPEC_CONFIG"] else 0,
         "KV": 1 if resolved["VLLM_ASCEND_KV_TRANSFER_CONFIG"] else 0,
@@ -247,7 +264,7 @@ def verify_config(name: str, args: argparse.Namespace, log_path: Path) -> bool:
     """Make sure the launcher really applied this config's env overrides.
 
     A launcher that silently ignores ``VLLM_ASCEND_ADDITIONAL_CONFIG`` makes
-    A/B/C all run the same configuration, which would look like a perfect
+    B and C run the same configuration, which would look like a perfect
     precision match.  The launcher therefore prints a ``[cp-ab]`` fingerprint
     line and a ``[cp-ab-cfg]`` line with the effective additional_config; both
     are compared here.
@@ -284,7 +301,7 @@ def verify_config(name: str, args: argparse.Namespace, log_path: Path) -> bool:
     if actual_cfg is None:
         print(
             f"[warn] {name}: launcher did not log {CFG_JSON_PREFIX}; "
-            "additional_config content was not verified (only the 5 flags were)"
+            "additional_config content was not verified (only the 6 flags were)"
         )
     elif actual_cfg != expected_cfg:
         message = (
@@ -512,8 +529,40 @@ def _lp_value(value: Any) -> float:
     return float(value)
 
 
-def _rank_topk(entry: dict[Any, Any], top_k: int) -> tuple[list[int], list[float]]:
-    ranked = sorted(((int(key), _lp_value(value)) for key, value in entry.items()), key=lambda kv: kv[1], reverse=True)
+# A token identity must be comparable across configs and stable across runs.
+# The OpenAI completions schema lets the server pick the key format: decoded
+# text (the default), ``"token_id:123"`` placeholders when
+# ``return_tokens_as_token_ids`` is set, or plain numeric ids.  Normalising all
+# of them to one string keeps ``==`` meaningful on the 1-token and 5-token sets.
+_TOKEN_ID_PREFIX = "token_id:"
+
+
+def token_key(key: Any) -> str:
+    """Normalise a ``top_logprobs`` key into a comparable token identity."""
+    text = str(key)
+    if text.startswith(_TOKEN_ID_PREFIX):
+        return text
+    if text.startswith("tok:"):
+        # Already normalised text identity (idempotent).
+        return text
+    try:
+        return f"{_TOKEN_ID_PREFIX}{int(text)}"
+    except ValueError:
+        return f"tok:{text}"
+
+
+def _values_are_token_ids(entry: dict[Any, Any]) -> bool:
+    """True when the keys look like ids/placeholders rather than decoded text."""
+    keys = [str(key) for key in entry]
+    return bool(keys) and all(key.startswith(_TOKEN_ID_PREFIX) or key.isdigit() for key in keys)
+
+
+def _rank_topk(entry: dict[Any, Any], top_k: int) -> tuple[list[str], list[float]]:
+    ranked = sorted(
+        ((token_key(key), _lp_value(value)) for key, value in entry.items()),
+        key=lambda kv: kv[1],
+        reverse=True,
+    )
     return [token for token, _ in ranked[:top_k]], [logprob for _, logprob in ranked[:top_k]]
 
 
@@ -525,6 +574,10 @@ def parse_choice(choice: dict[str, Any], data: dict[str, Any], top_k: int) -> di
     carries ``n_prompt + 1`` output positions (the last one is the first
     generated token).  When ``logprobs`` is missing the vLLM
     ``prompt_logprobs`` extension is used as a fallback.
+
+    Token identities are normalised with :func:`token_key`, because the server
+    may return decoded token *text* (default), ``token_id:N`` placeholders, or
+    plain numeric ids depending on its launcher flags.
     """
     prompt_ids = choice.get("prompt_token_ids") or data.get("prompt_token_ids")
     prompt_ids = list(prompt_ids) if prompt_ids else None
@@ -548,18 +601,33 @@ def parse_choice(choice: dict[str, Any], data: dict[str, Any], top_k: int) -> di
         for index, entry in enumerate(pl):
             if index == 0 or not entry or prompt_ids is None or index >= len(prompt_ids):
                 continue
-            value = entry.get(str(prompt_ids[index]))
-            if value is not None:
-                token_lps[index] = _lp_value(value)
+            token_text = str(prompt_ids[index])
+            # vLLM may key these by decoded text, by ``token_id:N`` (when
+            # ``return_tokens_as_token_ids`` is set) or by a plain id string.
+            for wanted in (f"{_TOKEN_ID_PREFIX}{token_text}", token_text, int(prompt_ids[index])):
+                value = entry.get(wanted)
+                if value is not None:
+                    token_lps[index] = _lp_value(value)
+                    break
+            else:
+                if not _values_are_token_ids(entry):
+                    raise RuntimeError(
+                        f"prompt_logprobs are keyed by decoded token text and do not contain the "
+                        f"token at position {index}; re-run with `return_tokens_as_token_ids: true` "
+                        "or use `logprobs`/`echo` instead"
+                    )
+                # Id/placeholder-keyed reply with the prompt token outside the
+                # top-K: a miss is legitimate here.
+                continue
 
     if n_out < n_prompt:
         raise RuntimeError(
             f"logprobs cover {n_out} positions but the prompt has {n_prompt} tokens; is echo enabled?"
         )
 
-    top1: list[int | None] = []
+    top1: list[str | None] = []
     top1_lp: list[float | None] = []
-    top5: list[list[int]] = []
+    top5: list[list[str]] = []
     for entry in top_lps:
         if not entry:
             top1.append(None)
@@ -582,8 +650,86 @@ def parse_choice(choice: dict[str, Any], data: dict[str, Any], top_k: int) -> di
     }
 
 
+def _prompt_token_hint(prompt: Prompt) -> list[int] | None:
+    """The exact token ids of one prompt, or ``None`` for a text prompt.
+
+    Only token-id prompts can be checked locally; a text prompt is tokenised by
+    the server, so its length is known only from the response.
+    """
+    if isinstance(prompt, str):
+        return None
+    if not all(isinstance(token, int) for token in prompt):
+        return None
+    return [int(token) for token in prompt]
+
+
+def verify_response(entry: dict[str, Any], sent_ids: list[int] | None) -> None:
+    """Fail loudly when a 200 response cannot be compared position by position.
+
+    The whole method rests on "same input token at every position": the server
+    has to echo the prompt we sent (``prompt_token_ids``) and to give a logprob
+    for every one of those positions.  A silently truncated tokenisation or a
+    dropped ``logprobs`` would otherwise show up as a precision difference.
+    """
+    prompt_ids = [int(token) for token in (entry.get("prompt_token_ids") or ())]
+    if not prompt_ids:
+        raise RuntimeError(
+            "response has no prompt_token_ids; cannot align token positions "
+            "(is `echo=True` supported by this server?)"
+        )
+    if sent_ids is not None and prompt_ids != sent_ids:
+        detail = (
+            f"server echoed {len(prompt_ids)} prompt tokens but {len(sent_ids)} were sent"
+            if len(prompt_ids) != len(sent_ids)
+            else "same length but different token ids"
+        )
+        raise RuntimeError(
+            f"{detail}; the server rewrote the input (BOS/EOS or truncation?) and "
+            "per-position comparison would be meaningless"
+        )
+
+    n_prompt = int(entry["n_prompt"])
+
+    # ``tok_lp``/``top1`` must cover every echoed prompt position (plus the
+    # first generated token when the server follows the echo convention).  A
+    # shorter array means the last prompt tokens were silently dropped and the
+    # comparison would only see a prefix.
+    n_logprobs = len(entry["tok_lp"])
+    if n_logprobs < len(prompt_ids):
+        raise RuntimeError(
+            f"logprobs cover {n_logprobs} positions but the prompt has {len(prompt_ids)} tokens "
+            "(prompt_logprobs fell back to the prompt-only form or was truncated)"
+        )
+    if n_prompt < 2:
+        raise RuntimeError(f"prompt has only {n_prompt} tokens; nothing to compare")
+
+    # tok_lp[i] is None only for index 0 (the first token has no predecessor);
+    # every other position must carry the logprob of the true prompt token.
+    missing = [index for index in range(1, min(n_prompt, len(entry["tok_lp"]))) if entry["tok_lp"][index] is None]
+    if missing:
+        raise RuntimeError(
+            f"server returned no token logprob for {len(missing)} of {n_prompt} prompt positions "
+            f"(first missing index={missing[0]}); the comparison would silently lose those tokens"
+        )
+    if len(entry["tok_lp"]) < n_prompt:
+        raise RuntimeError(
+            f"logprobs cover {len(entry['tok_lp'])} positions but the prompt has {n_prompt} tokens"
+        )
+
+
+def report_token_budget(case_id: str, entries: list[dict[str, Any]], min_tokens: int | None) -> None:
+    """Say out loud how many prompt tokens the server actually prefilled."""
+    total = sum(int(entry["n_prompt"]) for entry in entries)
+    if min_tokens is not None and entries and total < int(min_tokens):
+        print(
+            f"    [warn] {case_id}: {total} prompt tokens < VLLM_ASCEND_CP_BALANCE_MIN_TOKENS="
+            f"{min_tokens}; zigzag stays off for this case, so C is a copy of B here"
+        )
+
+
 def query_batch(url: str, args: argparse.Namespace, prompts: list[Prompt]) -> list[dict[str, Any]]:
     prompt_field: Any = prompts[0] if len(prompts) == 1 else prompts
+    sent_ids = [_prompt_token_hint(prompt) for prompt in prompts]
     payload = {
         "model": args.model,
         "prompt": prompt_field,
@@ -593,6 +739,8 @@ def query_batch(url: str, args: argparse.Namespace, prompts: list[Prompt]) -> li
         "echo": True,
         "logprobs": args.topk,
         "prompt_logprobs": args.topk,
+        # Keep the server from prepending BOS/EOS: the per-position comparison
+        # is only valid when the echoed tokens are exactly the tokens we sent.
         "add_special_tokens": False,
     }
     last_err: Exception | None = None
@@ -605,9 +753,10 @@ def query_batch(url: str, args: argparse.Namespace, prompts: list[Prompt]) -> li
             if len(choices) != len(prompts):
                 raise RuntimeError(f"asked {len(prompts)} prompts, got {len(choices)} choices")
             results = []
-            for choice, prompt in zip(choices, prompts):
+            for choice, prompt, hint in zip(choices, prompts, sent_ids):
                 entry = parse_choice(choice, data, args.topk)
                 entry["prompt"] = prompt
+                verify_response(entry, hint)
                 results.append(entry)
             return results
         except Exception as exc:  # noqa: BLE001
@@ -616,26 +765,40 @@ def query_batch(url: str, args: argparse.Namespace, prompts: list[Prompt]) -> li
     raise RuntimeError(f"request failed after {args.http_retries} tries: {last_err}")
 
 
-def query_case(url: str, args: argparse.Namespace, case: PromptCase) -> list[dict[str, Any]]:
+def query_case(
+    url: str,
+    args: argparse.Namespace,
+    case: PromptCase,
+    min_tokens: int | None = None,
+) -> list[dict[str, Any]]:
     case_id, prompts = case
     if len(prompts) == 1:
-        return query_batch(url, args, prompts)
-    if args.multi_mode == "batch":
+        results = query_batch(url, args, prompts)
+    elif args.multi_mode == "batch":
         # One EngineRequest with several prompts: they are scheduled in the
         # same prefill batch, which is what the multi-request zigzag path
         # needs.  (Concurrent requests only "most likely" land in one batch.)
-        return query_batch(url, args, prompts)
-    with ThreadPoolExecutor(max_workers=len(prompts)) as pool:
-        return list(pool.map(lambda prompt: query_batch(url, args, [prompt])[0], prompts))
+        results = query_batch(url, args, prompts)
+    else:
+        with ThreadPoolExecutor(max_workers=len(prompts)) as pool:
+            results = list(pool.map(lambda prompt: query_batch(url, args, [prompt])[0], prompts))
+    report_token_budget(case_id, results, min_tokens)
+    return results
 
 
-def query_all(url: str, args: argparse.Namespace, cases: list[PromptCase]) -> dict[str, list[dict[str, Any]]]:
+def query_all(
+    url: str,
+    args: argparse.Namespace,
+    cases: list[PromptCase],
+    min_tokens: int | None = None,
+) -> dict[str, list[dict[str, Any]]]:
     out: dict[str, list[dict[str, Any]]] = {}
     for case in cases:
         case_id = case[0]
         try:
-            out[case_id] = query_case(url, args, case)
-            print(f"    {case_id}: {len(case[1])} prompt(s) OK")
+            out[case_id] = query_case(url, args, case, min_tokens)
+            lengths = [int(entry["n_prompt"]) for entry in out[case_id]]
+            print(f"    {case_id}: {len(case[1])} prompt(s) OK, prompt_tokens={lengths}")
         except Exception as exc:  # noqa: BLE001
             print(f"    {case_id}: FAILED ({exc})")
             out[case_id] = [{"error": str(exc)} for _ in case[1]]
@@ -650,8 +813,9 @@ def query_all(url: str, args: argparse.Namespace, cases: list[PromptCase]) -> di
 def build_pairs(names: list[str]) -> list[tuple[str, str]]:
     """Ordered ``(newer, older)`` pairs so deltas read as e.g. ``C-B``.
 
-    For ``[A, B, C]`` this is exactly ``(B,A), (C,B), (C,A)``; for ``[B, C]``
-    it is just ``(C,B)``; a repeated config ``B2`` adds ``(B2,B)``.
+    For ``[B, C]`` this is just ``(C,B)``; a repeated config ``B2`` adds
+    ``(B2,B)``.  ``[A, B, C]`` would still yield ``(B,A), (C,B), (C,A)``, but
+    ``A`` is not a supported configuration any more.
     """
     base = [name for name in names if not (name.endswith("2") and name[:-1] in names)]
     pairs: list[tuple[str, str]] = []
@@ -669,8 +833,13 @@ def as_float(values) -> np.ndarray:
     return np.array([math.nan if v is None else float(v) for v in values], dtype=np.float64)
 
 
-def as_int(values) -> np.ndarray:
-    return np.array([-1 if v is None else int(v) for v in values], dtype=np.int64)
+def as_token(values) -> np.ndarray:
+    """Token identities as a numpy array; missing entries become ``""``.
+
+    Tokens are opaque strings (see :func:`token_key`), so agreement is plain
+    string equality and "is there a logprob here" is ``!= ""``.
+    """
+    return np.array(["" if v is None else str(v) for v in values], dtype=object)
 
 
 def rolling_mean(values: np.ndarray, window: int) -> np.ndarray:
@@ -741,7 +910,7 @@ def _case_arrays(results: dict, case_id: str, names: list[str], req: int):
     if length < 2:
         return None
     tok_lp = {name: as_float(entry["tok_lp"])[1:length] for name, entry in entries.items()}
-    top1 = {name: as_int(entry["top1"])[1:length] for name, entry in entries.items()}
+    top1 = {name: as_token(entry["top1"])[1:length] for name, entry in entries.items()}
     top5 = {name: entry["top5"][1:length] for name, entry in entries.items()}
     gen_pos = {
         name: (int(entry["n_prompt"]) if int(entry["n_out"]) > int(entry["n_prompt"]) else None)
@@ -764,7 +933,7 @@ def _pair_metrics(pairs, tok_lp, top1, top5, threshold: float, run: int, length:
         else:
             metrics[f"block@first_div_{key}"] = "-"
         agree_key = f"{x}~{y}"
-        valid = (top1[x] >= 0) & (top1[y] >= 0)
+        valid = (top1[x] != "") & (top1[y] != "")
         if valid.any():
             metrics[f"top1%{agree_key}"] = 100.0 * float(np.mean((top1[x] == top1[y])[valid]))
         else:
@@ -792,14 +961,14 @@ def _generated_token_metrics(results, case_id, req, pairs, gen_pos):
             metrics[f"gen_top1%{key}"] = None
             metrics[f"gen_top5_ovl%{key}"] = None
             continue
-        top1_x = as_int(results[x][case_id][req]["top1"])
-        top1_y = as_int(results[y][case_id][req]["top1"])
+        top1_x = as_token(results[x][case_id][req]["top1"])
+        top1_y = as_token(results[y][case_id][req]["top1"])
         if top1_x.size <= pos_x or top1_y.size <= pos_y:
             metrics[f"gen_top1%{key}"] = None
             metrics[f"gen_top5_ovl%{key}"] = None
             continue
-        token_x, token_y = int(top1_x[pos_x]), int(top1_y[pos_y])
-        if token_x < 0 or token_y < 0:
+        token_x, token_y = str(top1_x[pos_x]), str(top1_y[pos_y])
+        if not token_x or not token_y:
             metrics[f"gen_top1%{key}"] = None
             metrics[f"gen_top5_ovl%{key}"] = None
             continue
@@ -824,6 +993,13 @@ def compare_case(results, case_id, names, args, noise, out_dir) -> dict[str, Any
         if extracted is None:
             continue
         length, tok_lp, top1, top5, gen_pos = extracted
+        if length - 1 < args.run_len:
+            # first_sustained() cannot find a run of `run_len` in a shorter
+            # window: it would report "no divergence" for lack of data.
+            print(
+                f"    [warn] {case_id}.{req}: only {length - 1} comparable positions "
+                f"(< --run-len {args.run_len}); first_div is not measurable for this case"
+            )
         threshold = max(args.delta_threshold, 5.0 * float((noise or {}).get("p99", 0.0)))
         segments = (
             zigzag_segments(length, args.cp_size) if args.annotate_plan and case_id.startswith("single_") else []
@@ -909,7 +1085,7 @@ def write_csv(out_dir, case_id, req, tok_lp, top1, pairs, metrics) -> None:
             writer.writerow(
                 [int(pos)]
                 + [float(tok_lp[n][k]) for n in names]
-                + [int(top1[n][k]) for n in names]
+                + [str(top1[n][k]) for n in names]
                 + [float(tok_lp[x][k] - tok_lp[y][k]) for x, y in pairs]
                 + [int(top1[x][k] == top1[y][k]) for x, y in pairs]
             )
@@ -1085,7 +1261,18 @@ def collect_sequential(args, names, cases, out_dir, log_dir):
                 print(f"[error] {exc}")
                 raise SystemExit(1)
             print(f"[query] {name} -> {url}")
-            results[name] = query_all(url, args, cases)
+            results[name] = query_all(url, args, cases, args.cp_balance_min_tokens)
+            measured = [
+                int(entry["n_prompt"])
+                for entries in results[name].values()
+                for entry in entries
+                if "error" not in entry
+            ]
+            if measured:
+                print(
+                    f"[tokens] {name}: prompt_tokens per request = {measured} "
+                    f"(max={max(measured)}, min_tokens={args.cp_balance_min_tokens})"
+                )
             (out_dir / f"results_{name}.json").write_text(json.dumps(results[name], ensure_ascii=False))
             runtimes[name] = zigzag_state_from_log(log_path)
             failure = check_zigzag_activation(name, args, runtimes[name], log_path)
@@ -1112,7 +1299,7 @@ def collect_from_urls(args, names, cases):
     results = {}
     for name in names:
         print(f"[query] {name} -> {urls[name]}")
-        results[name] = query_all(urls[name], args, cases)
+        results[name] = query_all(urls[name], args, cases, args.cp_balance_min_tokens)
     return results
 
 
@@ -1120,9 +1307,16 @@ def run(args: argparse.Namespace) -> int:
     requested = [item.strip().upper() for item in args.configs.split(",") if item.strip()]
     unknown = [item for item in requested if item not in CONFIGS]
     if unknown:
-        raise SystemExit(f"--configs has unknown entries {unknown}; choose from {sorted(CONFIGS)}")
+        raise SystemExit(f"--configs has unknown entries {unknown}; choose from {list(SUPPORTED_CONFIGS)}")
+    unsupported = [item for item in requested if item not in SUPPORTED_CONFIGS]
+    if unsupported:
+        raise SystemExit(
+            f"--configs {unsupported} is not supported: this tool compares the cp_balance switch only, "
+            f"with DSA-CP always on. Use --configs {','.join(SUPPORTED_CONFIGS)} "
+            "(B = CP_BALANCE=0 baseline, C = CP_BALANCE=1 zigzag)."
+        )
     if len(requested) < 2:
-        raise SystemExit("--configs needs at least two configs, e.g. 'B,C' or 'A,B,C'")
+        raise SystemExit(f"--configs needs at least two configs, e.g. '{','.join(SUPPORTED_CONFIGS)}'")
     names = list(requested)
     if args.repeat_a:
         # Repeat the reference (first) config as <ref>2 to measure the noise floor.
@@ -1153,7 +1347,7 @@ def run(args: argparse.Namespace) -> int:
         return 0
 
     # Compare only the configs that were actually collected, so an early stop
-    # (zigzag miss) still produces the A/B/C deltas instead of an empty summary.
+    # (zigzag miss) still produces the B/C deltas instead of an empty summary.
     collected = [name for name in names if name in results]
     print(f"[compare] configs: {collected}" + (f" (skipped {skipped})" if skipped else ""))
     (out_dir / "results_all.json").write_text(json.dumps(results, ensure_ascii=False))
@@ -1185,14 +1379,25 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         default="bash tools/cp_balance_compare/launcher_template.sh {port}",
         help="server launcher command template; {port} is substituted",
     )
-    parser.add_argument("--urls", default="", help="A=http://..,B=http://..,C=http://.. (skip launching)")
+    parser.add_argument(
+        "--urls",
+        default="",
+        help="B=http://..,C=http://.. (skip launching); with --repeat-a also pass "
+        "B2=http://.. pointing at a *separate* baseline server",
+    )
     parser.add_argument(
         "--configs",
-        default="A,B,C",
+        default="B,C",
         help="comma-separated configs to run; the first one is the reference. "
-        "Use 'B,C' to compare the DSA-CP baseline directly against cp_balance.",
+        "Only the cp_balance switch varies (B = CP_BALANCE=0, C = CP_BALANCE=1); "
+        "DSA-CP is always on, so 'A' is rejected.",
     )
-    parser.add_argument("--base-port", type=int, default=12800)
+    parser.add_argument(
+        "--base-port",
+        type=int,
+        default=8034,
+        help="port passed to the launcher; single-node runs restart the server on this port",
+    )
     parser.add_argument("--model", default="glm")
     parser.add_argument("--prompt-lens", default="2048,2049,4096", help="comma-separated synthetic prompt lengths")
     parser.add_argument("--multi-lens", default="", help="multi-request groups separated by ';'")
@@ -1201,6 +1406,13 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--seed", type=int, default=1234)
     parser.add_argument("--topk", type=int, default=20)
     parser.add_argument("--cp-size", type=int, default=8)
+    parser.add_argument(
+        "--cp-balance-min-tokens",
+        type=int,
+        default=2048,
+        help="VLLM_ASCEND_CP_BALANCE_MIN_TOKENS for every config; zigzag stays off below "
+        "this token count, so it is pinned in the config fingerprint (source default is 8192)",
+    )
     parser.add_argument("--spec-config", default="", help="VLLM_ASCEND_SPEC_CONFIG; empty disables MTP")
     parser.add_argument(
         "--kv-transfer-config",

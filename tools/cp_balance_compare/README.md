@@ -1,30 +1,22 @@
-# cp_balance A/B/C 精度对比工具
+# cp_balance 开关对比工具（B/C，104 单节点）
 
 用于定位 **DSA-CP cp_balance（zigzag）** 开启后 prefill 精度异常的对比工具。它把
 "精度不对"拆成可量化的问题：**第几个 token 开始不一致、差多少、落在哪个 rank 的哪个块**。
 
-配合 `vllm-ascend` 上的 `enable_dsa_cp` / `VLLM_ASCEND_CP_BALANCE` 两个开关，跑三组配置：
+只对比 **cp_balance 开/关**两种配置，DSA-CP 始终打开（不再跑关 DSA-CP 的"金标准"，
+那条路径不同、只能当粗参照）：配合 `vllm-ascend` 上的 `VLLM_ASCEND_CP_BALANCE` 开关跑两组：
 
 | 配置 | 含义 | 角色 |
 | --- | --- | --- |
-| `A` | `enable_dsa_cp=false` | 完全不走 DSA-CP 的"金标准"锚点（可选） |
 | `B` | `enable_dsa_cp=true` + `VLLM_ASCEND_CP_BALANCE=0` | **基线**：同 DSA-CP、同 kernel、连续切块 |
 | `C` | `enable_dsa_cp=true` + `VLLM_ASCEND_CP_BALANCE=1` | zigzag cp_balance，待排查对象 |
-| `B2` | 再跑一遍 B（`--repeat-a`） | **优选噪声底**（同配置重复，最有可比性） |
+| `B2` | 再独立起一次 B（`--repeat-a`） | **噪声底**（同配置第二次加载，与 `C-B` 最有可比性） |
 
 判断标准：
 
-- **`C-B` 才是 cp_balance 的账**（同 DSA-CP、同 SP、同 C8，只差 token 布局）。如果
+- **`C-B` 就是 cp_balance 的账**（同 DSA-CP、同 SP、同 C8，只差 token 布局）。如果
   `C-B` 和 `B2-B` 同量级，说明看到的差异只是归约顺序噪声；
-- `A` 只有一个用途：把"DSA-CP 本身的误差"（`B-A`）和"cp_balance 的误差"（`C-B`）
-  分开。如果你已确认 `CP_BALANCE=0`（B）就是正确基线，**可以只跑 B/C**，用 B2 当噪声底，
-  省掉 A 的一次 8 卡加载：
-
-  ```bash
-  --configs B,C --repeat-a
-  ```
-
-- 只有 `--configs A,B,C`（默认）时才会有 `B-A`/`C-A` 这两列。
+- 默认 `--configs B,C`，`--repeat-a` 再补一次 B 得到 `B2-B` 噪声底；`A` 已不支持。
 
 ## 1. 目录内容
 
@@ -40,10 +32,11 @@
 
 ## 2. 快速开始
 
-### 2.1 单节点 8 卡（GLM-5.2-w4a4c8-mxfp4）
+### 2.1 104 单节点（GLM-5.2-w4a4c8-mxfp4，默认端口 8034）
 
-TP=8 的 server 会占满 8 张卡，三个配置无法同时在线；driver 会在**同一条命令里顺序**
-完成"拉起 → `/health` 就绪 → 打请求 → 杀进程 → 下一个 → 对比"。
+TP=8 的 server 会占满 8 张卡，两组配置无法同时在线；driver 会在**同一条命令里顺序**
+完成"拉起 → `/health` 就绪 → 打请求 → 杀进程 → 下一个 → 对比"。默认端口 **8034**
+（`--base-port` 可改），拉起的 server 也从同一个端口起。
 
 本仓库自带按这台机器定制的 launcher（eth2 / `141.61.133.104` /
 `/home/z30055003/vllm-ascend` / `/mnt/share/weights/...`，均可被环境变量覆盖）：
@@ -60,25 +53,21 @@ python tools/cp_balance_compare/ab_cp_compare.py \
   --repo-root /home/z30055003/vllm-ascend \
   --launcher "bash tools/cp_balance_compare/launcher_glm52_w4a4c8_mxfp4.sh x {port}" \
   --no-kv-connector
-# 期望输出：[preflight] A: OK ... [preflight] all configs OK
+# 期望输出：[preflight] B: OK ... [preflight] C: OK ... [preflight] all configs OK
 
-# 1) 基线(B) vs zigzag(C) + B/B2 噪声底。默认关 MTP、关 PD connector，先隔离变量
-#    --configs B,C   ：只跑 DSA-CP 基线 B 和 cp_balance C，省掉 A 的一次加载
+# 1) 基线(B, CP_BALANCE=0) vs zigzag(C, CP_BALANCE=1) + B/B2 噪声底。
+#    默认关 MTP、关 PD connector，先隔离变量；默认端口 8034。
 #    --zigzag-check strict：C 没进 zigzag 直接判失败（默认跳过剩下的配置，避免白加载）
 python tools/cp_balance_compare/ab_cp_compare.py \
   --out /dev/shm/cp_ab \
   --repo-root /home/z30055003/vllm-ascend \
   --launcher "bash tools/cp_balance_compare/launcher_glm52_w4a4c8_mxfp4.sh x {port}" \
-  --configs B,C \
   --config-check strict \
   --zigzag-check strict \
   --prompt-lens 2048,2049,4096 \
   --multi-lens "2048,2048;3000,1500" \
   --repeat-a \
   --no-kv-connector
-
-# 1b) 需要 "不开 DSA-CP" 的金标准锚点（区分 DSA-CP 自身误差）时再加 A：
-#     --configs A,B,C（A 会多一次加载；A/A2 可选）
 
 # 2) 结果、曲线、CSV
 ls /dev/shm/cp_ab
@@ -95,8 +84,8 @@ python tools/cp_balance_compare/ab_cp_compare.py \
   --kv-transfer-config '{"kv_connector": "MooncakeConnectorV1","kv_role": "kv_producer","kv_port": "30000","engine_id": "0","kv_connector_extra_config": {"use_ascend_direct": true,"prefill": {"dp_size": 1,"tp_size": 8},"decode": {"dp_size": 32,"tp_size": 1},"ascend_local_comm_res_path": "/etc/hixlep"}}'
 ```
 
-一轮 A/B/C 的耗时 ≈ 4 次模型加载 + 采集；`--max-num-batched-tokens 16384` 下
-`--prompt-lens 2048,2049,4096`、`--multi-lens "2048,2048;3000,1500"` 都能一次装下。
+两组配置 = **2 次模型加载** + 采集（`--repeat-a` 再加 1 次）；`--max-num-batched-tokens 16384`
+下 `--prompt-lens 2048,2049,4096`、`--multi-lens "2048,2048;3000,1500"` 都能一次装下。
 先用 `--prompt-lens 2048,2049 --repeat-a` 快速跑一轮定位，再扩长度。
 
 单节点顺序拉起时，driver 杀掉上一个 server 后会等待 `--restart-wait`（默认 30s）再起下一个。
@@ -106,12 +95,18 @@ python tools/cp_balance_compare/ab_cp_compare.py \
 python tools/cp_balance_compare/ab_cp_compare.py ... --restart-wait 90
 ```
 
+**注意**：`VLLM_ASCEND_CP_BALANCE_MIN_TOKENS`（prompt 低于它就完全不进 zigzag）由 driver
+按 `--cp-balance-min-tokens`（默认 2048）统一注入并写进指纹校验，launcher 里的默认值只对
+手工启动生效——所以不要把对比用的 prompt 长度设得比它更小，否则 C 会一直走连续切块路径、
+看起来"和 B 完全一致"。如果 C 因为任何原因没进 zigzag，`[runtime] C: ... forward_zigzag=False`
+（或 `--zigzag-check strict` 直接失败）就是判据。
+
 ### 2.2 复用自己的启动脚本
 
 如果不想用仓库里的 launcher，只要把 `/home/z30055003/script/start_server_prefill-w4a4c8-mxfp4.sh`
 改成满足两个约定：
 
-1. **all cp_balance knobs 用 `${VAR-default}`（不要硬编码）**：
+1. **所有 cp_balance 开关用 `${VAR-default}`（不要硬编码）**：
    ```bash
    export VLLM_ASCEND_CP_BALANCE=${VLLM_ASCEND_CP_BALANCE:-1}
    export VLLM_ASCEND_CP_BALANCE_MIN_TOKENS=${VLLM_ASCEND_CP_BALANCE_MIN_TOKENS:-2048}
@@ -121,13 +116,14 @@ python tools/cp_balance_compare/ab_cp_compare.py ... --restart-wait 90
    spec_config="${VLLM_ASCEND_SPEC_CONFIG-'<原来的 MTP JSON>'}"
    kv_config="${VLLM_ASCEND_KV_TRANSFER_CONFIG-'<原来的 Mooncake JSON>'}"
    ```
-2. **启动前打印指纹**：
+2. **启动前打印指纹**（driver 逐字段比对，包括 `MIN_TOKENS`）：
    ```bash
    dsa_cp=1
    if printf '%s' "$additional_config" | grep -q '"enable_dsa_cp"[[:space:]]*:[[:space:]]*false'; then
      dsa_cp=0
    fi
    echo "[cp-ab] CP_BALANCE=${VLLM_ASCEND_CP_BALANCE} DSA_CP=${dsa_cp} \
+   MIN_TOKENS=${VLLM_ASCEND_CP_BALANCE_MIN_TOKENS} \
    EMBED_LOCAL=${VLLM_ASCEND_CP_BALANCE_EMBED_LOCAL} \
    SPEC=$([ -n "$spec_config" ] && echo 1 || echo 0) KV=$([ -n "$kv_config" ] && echo 1 || echo 0)"
    ```
@@ -144,17 +140,22 @@ python tools/cp_balance_compare/ab_cp_compare.py \
   --out /dev/shm/cp_ab
 ```
 
-`--config-check strict` 会比对 `logs/server_<name>.log` 里的 `[cp-ab]` 指纹；如果 launcher
-没真正应用 env 覆盖（A/B/C 实际是同一个配置），driver 会直接报错退出，而不是给出
-"精度完全一致"的假结论。
+`--config-check strict` 会比对 `logs/server_<name>.log` 里的 `[cp-ab]` 指纹和 `[cp-ab-cfg]`
+完整 additional_config；如果 launcher 没真正应用 env 覆盖（B/C 实际是同一个配置），
+driver 会直接报错退出，而不是给出"精度完全一致"的假结论。
 
-### 2.3 多节点：三台各起一个 server
+### 2.3 两台 server 同时在线（可选）
+
+单节点 8 卡放不下两台，但如果你有两台 104（或一台机器上起了第二个实例），可以让它们分别
+以 `CP_BALANCE=0/1` 常驻，driver 只负责采集。注意 `--repeat-a` 需要一个额外的 B 实例 URL，
+否则 B2 指回同一台 server，噪声底会恒等于 0（`--urls` 模式无法重启 server，这是预期行为）：
 
 ```bash
-# node1/2/3 上各自按 2.2 的方式起 server，端口一致
+# node1: CP_BALANCE=0 起 server；node2: CP_BALANCE=1 起 server，端口都是 8034
 python tools/cp_balance_compare/ab_cp_compare.py \
-  --urls A=http://node1:12800,B=http://node2:12800,C=http://node3:12800 \
+  --urls B=http://node1:8034,C=http://node2:8034 \
   --out /dev/shm/cp_ab
+# 需要噪声底时：--urls B=...,C=...,B2=http://node1b:8034 --repeat-a
 ```
 
 ### 2.4 用真实 prompt（JSONL / JSON）
@@ -176,11 +177,87 @@ python tools/cp_balance_compare/ab_cp_compare.py \
   保证它们进同一个 prefill batch，这条路径比"并发发多个请求"更严格；
 - token 数从响应里的 `prompt_token_ids` 推导，文本 prompt 也能逐位置对齐。
 
-## 3. 采集与指标
+## 3. 请求契约与失败语义
+
+### 3.1 服务可用性 / 请求是否真的成功
+
+就绪判定只有一个：`GET http://127.0.0.1:<port>/health` 返回 200（`wait_ready`）。之后每次
+请求都按下面的方式保证"这一份数据可用"：
+
+1. `POST /v1/completions` → `raise_for_status()`：非 2xx 直接判失败；
+2. 响应里 `choices` 数量必须等于请求里的 prompt 数量（batch 请求会返回多个 choice）；
+3. 每个 choice 必须能对齐：`prompt_token_ids` 必须**逐 token 等于我们发出去的 ids**
+   （token-id prompt），`token_logprobs` 必须覆盖全部 prompt 位置且除第 0 位外都非空；
+   任何一条不满足就抛错，不会"带着坏数据继续算"；
+4. 单条 case 失败会重试 `--http-retries`（默认 3，退避 2s/4s/6s），仍失败则把该 case 记为
+   `{"error": ...}`，并在终端打印 `case: FAILED (...)`；summary 里该 case 是
+   `{"status": "missing results"}`。
+
+**注意**：目前 driver 对"部分 case 失败"仍以退出码 0 结束（这是已知限制，见"已知限制"一节），
+所以**不要只看退出码**，要看 `[compare]` 之后每个 case 是否都有指标行、以及
+`summary.json` 里有没有 `status: missing results`。
+
+### 3.2 怎么保证真的超过了 min_tokens
+
+`prompt_token_ids` 的**长度**（不是字符数、不是我们本地数出来的词数）就是服务端真正
+prefill 的 token 数：
+
+- 合成 token-id prompt：长度由我们给定（`--prompt-lens`），服务端原样回显；
+- 文本 prompt：长度是服务端 tokenizer 的结果，driver 从响应里读，不猜；
+- 每次查询都会打印 `case: N prompt(s) OK, prompt_tokens=[...]`；
+- 每个配置查完后打印 `[tokens] <config>: prompt_tokens per request = [...] (max=..., min_tokens=...)`；
+- **低于 `--cp-balance-min-tokens`（默认 2048，driver 会注入并写进指纹）的 case 会直接告警**：
+  `[warn] <case>: N prompt tokens < VLLM_ASCEND_CP_BALANCE_MIN_TOKENS=2048; zigzag stays off for
+  this case, so C is a copy of B here`——这种 case 的 `C-B` 恒为 ~0，不能当成"cp_balance 没问题"。
+- 另外运行时还会检查每条请求 `query_len >= 2 * tp_size`（TP=8 即 ≥16 token），
+  以及可比较位置数是否 ≥ `--run-len`（否则 `first_div` 打印告警而不是"无差异"）。
+
+### 3.3 用什么定位精度问题
+
+逐位置 `token_logprobs` 是最干净的信号：B/C 的目标 token 相同，所以
+`d[i] = lp_C[i] - lp_B[i]` 只包含数值差异，然后：
+
+| 看什么 | 说明 |
+| --- | --- |
+| `max|d|` / `p99|d|` | 差多大；先和 `B2-B` 噪声底比 |
+| `first_div_C-B` | 连续 `--run-len`（默认 8）个位置超过阈值（`max(--delta-threshold, 5×噪声 p99)`）的第一处 |
+| `block@first_div_C-B` | 这个位置落在哪个 rank 的哪一段，例如 `rank2/prev(b3072-3328)` |
+| `top1%C~B` / `top5_ovl%` | token 级是否翻转；近似并列时配合 top5 软重叠看 |
+| `gen_top1%C~B` | 首生成 token 是否一致，区分 prefill 主体 vs 模型出口/gather |
+| `runtime.C.forward` | 证明 C 真进了 zigzag（否则上面的对比无意义） |
+
+### 3.4 本地手工验证单次请求
+
+你给的 curl 只验证"服务通不通"，不能用于精度定位（没有 `echo`/`logprobs`）。
+要拿逐位置数据，用 driver 完全相同的形式：
+
+```bash
+curl -sS http://127.0.0.1:8034/v1/completions \
+  -H "Content-Type: application/json" \
+  -d '{
+        "model": "glm",
+        "prompt": [151644, 872, 198],
+        "max_tokens": 1,
+        "temperature": 0,
+        "echo": true,
+        "logprobs": 20,
+        "prompt_logprobs": 20,
+        "add_special_tokens": false
+      }' | python -m json.tool | head -40
+```
+
+要点：`echo=true` 才会回显 `prompt_token_ids`；`logprobs`/`prompt_logprobs` 才有逐位置
+logprob；`add_special_tokens=false` 保证"回显的 token 就是我们发的 token"；
+`max_tokens=1` 只为拿首生成 token 的 top-1。文本 prompt（如 `"你是什么模型"`）也能用，
+但"一个汉字是一个 token 还是多个"由服务端 tokenizer 决定，**以响应里的
+`prompt_token_ids` 长度为准**——先跑一次这条 curl 看清长度，再决定
+`--prompt-lens` / `--cp-balance-min-tokens`。
+
+## 4. 采集与指标
 
 每个位置请求 `/v1/completions`（`echo=true`、`logprobs=K`）：
 
-- `token_logprobs[i]`：第 i 个真实 prompt token 的 logprob。A/B/C 的目标 token 相同，
+- `token_logprobs[i]`：第 i 个真实 prompt token 的 logprob。B/C 的目标 token 相同，
   差值 `d[i] = lp_X[i] - lp_Y[i]` 就是纯数值信号；
 - `top_logprobs[i]`：top-K 分布，用于 top-1 一致率、top-5 软重叠。
 
@@ -188,7 +265,7 @@ python tools/cp_balance_compare/ab_cp_compare.py \
 
 ```text
 /dev/shm/cp_ab/
-├── results_A.json / results_B.json / results_C.json   # 原始逐位置数据
+├── results_B.json / results_C.json                    # 原始逐位置数据
 ├── results_all.json
 ├── summary.json                                       # 每个 case/请求的全部指标 + 噪声底
 ├── single_L2048_req0.png                              # 3 panel：曲线 / |Δ| / 滑窗 top-1 一致率
@@ -199,33 +276,36 @@ python tools/cp_balance_compare/ab_cp_compare.py \
 
 | 字段 | 含义 | 怎么用 |
 | --- | --- | --- |
-| `top1%B~A`、`top1%C~B` | top-1 token 一致率（%） | 结构性错误的直接指标，`C~B` 掉到 99% 以下要警惕 |
+| `top1%C~B` | top-1 token 一致率（%） | 结构性错误的直接指标，掉到 99% 以下要警惕 |
 | `top5_ovl%*` | top-5 互相包含率 | 排除近似并列 token 造成的假不一致 |
-| `p99|d|C-B`、`max|d|C-B` | 逐位置 logprob 差 | 与 `A2-A` 噪声底比较，超过 5×p99 才当 bug |
+| `p99|d|C-B`、`max|d|C-B` | 逐位置 logprob 差 | 与 `B2-B` 噪声底比较，超过 5×p99 才当 bug |
 | `first_div_C-B` | 连续 8 个位置超过阈值的第一处 | 与 `block@first_div_C-B` 一起定位 |
-| `block@first_div_C-B` | 该位置属于 `rankX/prev|next(bstart-bend)` | 直接指向某个 rank 的某段，例如 `rank0/next(b1024-1280)` |
-| `gen_top1%C~B` | 首生成 token 的 top-1 是否一致 | 判断问题在 prefill 主体还是模型出口/gather |
+| `block@first_div_C-B` | 该位置属于 `rankX/prev|next(bstart-bend)` | 直接指向某个 rank 的某段，例如 `rank2/prev(b3072-3328)`（仅 `single_*` case） |
+| `gen_top1%C~B` | 首生成 token 的 top-1 是否一致（0/1） | 判断问题在 prefill 主体还是模型出口/gather |
 
 `summary.json` 顶层的 `runtime` 记录每个配置的运行时证据：
 
 ```json
 "runtime": {
-  "C": {"metadata": true, "forward": true},
-  "B": {"metadata": false, "forward": false}
+  "B": {"metadata": false, "forward": false},
+  "C": {"metadata": true, "forward": true}
 }
 ```
 
 - `metadata=true`：`AscendSFAMetadataBuilder` 真的构建了 zigzag metadata；
 - `forward=true`：`set_ascend_forward_context` 真的把 `zigzag_cp_active` 置为 1；
-- 两个标记由 `VLLM_ASCEND_CP_BALANCE_DEBUG_LOG=1`（driver 自动为 A/B/C 导出）
-  触发的 `[CP_BALANCE]` 日志产生，默认关闭，对正常推理没有影响。
+- 两个标记由 `VLLM_ASCEND_CP_BALANCE_DEBUG_LOG=1`（driver 自动为 B/C 导出）
+  触发的 `[CP_BALANCE]` 日志产生，默认关闭，对正常推理没有影响；
+- 注意这是"进程内至少有一个 batch 进了 zigzag"的证据（日志用 `logger.info_once`），
+  不会逐个请求重复打印。
 
 `--config-check strict` 还会校验 launcher 打印的 `[cp-ab-cfg]`（逐字段对比
-additional_config），避免"改了 launcher 但 driver 用环境变量覆盖"这类静默不一致。
+additional_config），避免"改了 launcher 但 driver 用环境变量覆盖"这类静默不一致；
+指纹里的 `MIN_TOKENS` 保证 B/C 的 zigzag 激活门槛一致。
 
 配合 `--zigzag-check strict` 使用：如果 C 没有打出 forward 标记，driver 默认
-（`--on-zigzag-miss skip`）**不再拉起剩余配置**（例如 A2，省一次模型加载），
-但会把已经采到的 A/B/C 数据照常写出 `summary.json`/图，`summary.json.skipped`
+（`--on-zigzag-miss skip`）**不再拉起剩余配置**（例如 B2，省一次模型加载），
+但会把已经采到的 B/C 数据照常写出 `summary.json`/图，`summary.json.skipped`
 记录被跳过的配置，`summary.json.runtime.C.forward=false`，最后以非 0 退出。
 传 `--on-zigzag-miss continue` 可强制跑完全部配置。
 
@@ -236,12 +316,11 @@ additional_config），避免"改了 launcher 但 driver 用环境变量覆盖"�
 
 ```text
 [runtime] C: metadata_zigzag=True forward_zigzag=True
-[single_L4096.0] len=4096 top1% B~A=100.00 C~B=99.98 C~A=99.98 |
-  p99|d| B-A=8.1e-04 C-B=1.2e-03 C-A=1.7e-03 |
-  first_div C-B=3073 @ rank2/prev(b3072-3328) gen_top1% C~B=1
+[single_L4096.0] len=4096 top1% C~B=99.98 |
+  p99|d| C-B=1.2e-03 first_div C-B=3073 @ rank2/prev(b3072-3328) gen_top1% C~B=1
 ```
 
-## 4. 无 NPU 自测
+## 5. 无 NPU 自测
 
 ```bash
 python tools/cp_balance_compare/selftest_mock.py
@@ -251,37 +330,49 @@ pytest tools/cp_balance_compare/selftest_mock.py -q
 
 自测覆盖：token-id / 文本 prompt、`prompt_logprobs` 兜底解析、配置指纹校验（OK /
 mismatch / 缺失）、zigzag 激活日志解析、`--preflight` 逻辑与真实 bash launcher、
-JSONL 解析、以及 mock server 下的完整 A/B/C/A2 端到端流程。
+JSONL 解析、A 组被拒、`--configs` 行为、**请求契约校验（回显 token 被改写 / logprob 缺失 /
+条数不足都要报错）**、**min_tokens 告警**、两个真实 launcher 的指纹行完整性，
+以及 mock server 下的完整 B/C/B2 端到端流程。
 
-也可以手动起 mock server 调 driver：
+也可以手动起 mock server 调 driver（两个端口分别扮演 `CP_BALANCE=0/1`）：
 
 ```bash
-python tools/cp_balance_compare/mock_vllm_server.py --ports 18001,18002,18003 \
-  --offsets 0,1e-6,0.2
+python tools/cp_balance_compare/mock_vllm_server.py --ports 18034,18035 \
+  --offsets 1e-6,0.2
 python tools/cp_balance_compare/ab_cp_compare.py \
-  --urls A=http://127.0.0.1:18001,B=http://127.0.0.1:18002,C=http://127.0.0.1:18003 \
-  --prompt-lens 1024 --out /tmp/cp_ab
+  --urls B=http://127.0.0.1:18034,C=http://127.0.0.1:18035 \
+  --prompt-lens 1024 --cp-balance-min-tokens 512 --out /tmp/cp_ab
 ```
 
-## 5. 已知限制
+（mock 只有几十个 token，`--cp-balance-min-tokens` 要调小，否则会看到 3.2 的告警。）
 
-- **单机无法并行**：TP=N 的 server 独占 N 卡，driver 只能顺序拉起，一轮耗时 =
-  3~4 次模型加载 + 采集。先用小模型 / 3 层脚本 + 短 prompt 迭代；
-- **A 组不是"同一 kernel 换布局"**：A 关了 DSA-CP，`B-A` 只能当粗基线；判断
-  cp_balance 必须看 `C-B`；
+## 6. 已知限制
+
+- **104 单节点无法并行**：TP=8 的 server 独占 8 卡，driver 只能顺序拉起，一轮耗时 =
+  2~3 次模型加载 + 采集。先用 3 层脚本 + 短 prompt 迭代；
+- **部分 case 失败时退出码仍是 0**：只有 zigzag 未命中 / 启动失败才返回非 0；要判断是否
+  真的完整采集，看终端 `case: FAILED (...)` 和 `summary.json` 的 `status: missing results`
+  （见 3.1）；
+- **不看 DSA-CP 自身误差**：工具只对比 cp_balance 开/关，DSA-CP 始终打开，所以
+  `C-B` 里也包含 "DSA-CP 本身在两个布局下的固有差异"，无法再拆一层（要看那一层
+  得手工起一组 `enable_dsa_cp=false` 的 server 用 `--urls` 比）；
+- **`multi_*` case 的块定位只是近似**：运行时按"批量内每个请求各自的 16 块"排布，
+  driver 的 `block@first_div` 用单请求 plan 重建绝对位置，所以只在 `single_*` case 上有意义；
+- **`--urls` 模式下噪声底可能是 0**：B2 指回同一台 server 时 `B2-B ≡ 0`，不代表真实
+  跨加载噪声；
 - **top-1 在近似并列时会翻转**：同时看 `top5_ovl%`；
 - **超长 prompt 响应很大**（100k × 20 条 logprob）：建议对比时控制在 8k 以内；
-- **`C-B` 与 `A2-A` 同量级时不要下结论**：先看 `summary.json` 的
+- **`C-B` 与 `B2-B` 同量级时不要下结论**：先看 `summary.json` 的
   `runtime.C.forward`；只有它 `true` 才说明 C 真的走了 zigzag（可加
   `--zigzag-check strict` 强制校验）；
 - driver 只做 prefill 对比，不覆盖 decode / PD 传输。
 
-## 6. 常见报错
+## 7. 常见报错
 
-### 6.1 `recompute_scheduler_enable can only be enabled on PD-disaggregated D nodes`
+### 7.1 `recompute_scheduler_enable can only be enabled on PD-disaggregated D nodes`
 
 - **原因**：`vllm_ascend/platform.py` 规定 `recompute_scheduler_enable=true` 只允许
-  `kv_role='kv_consumer'`（PD 的 D 节点）。A/B/C 默认 `--no-kv-connector`，
+  `kv_role='kv_consumer'`（PD 的 D 节点）。B/C 默认 `--no-kv-connector`，
   `kv_transfer_config=None`，于是启动时直接抛
   `ValueError: ... got kv_role=None`。
 - **为什么改 launcher 没用**：driver 每次都会导出
@@ -292,14 +383,15 @@ python tools/cp_balance_compare/ab_cp_compare.py \
   - 默认：driver 的 `BASE_ADDITIONAL_CONFIG` 已移除 `recompute_scheduler_enable`，
     直接重跑即可；
   - 临时加回 / 覆盖其它键：`--extra-additional-config '{"recompute_scheduler_enable": true}'`
-    （merge 进基础配置，A/B/C 三组一致）；
+    （merge 进基础配置，B/C 两组一致）；
   - 整体替换成你们的真实 additional_config：
     `--env VLLM_ASCEND_ADDITIONAL_CONFIG='{...}'`（driver 的 `--env` 优先级最高）。
-- **怎么确认 launcher 最终吃到的配置**：`--config-check strict` 除了 5 个开关指纹，
+- **怎么确认 launcher 最终吃到的配置**：`--config-check strict` 除了 6 个开关指纹
+  （`CP_BALANCE` / `DSA_CP` / `MIN_TOKENS` / `EMBED_LOCAL` / `SPEC` / `KV`），
   还会校验 launcher 打印的 `[cp-ab-cfg]` 行；不一致时会把 expected / launcher 两份
   JSON 都打出来。
 
-### 6.2 `[preflight] ... FAILED` / `server exited`
+### 7.2 `[preflight] ... FAILED` / `server exited`
 
 - `MODEL_PATH does not exist` / `vllm not found in PATH`：按提示修 launcher 的
   `MODEL_PATH`、`source /root/.bashrc`；
@@ -308,17 +400,17 @@ python tools/cp_balance_compare/ab_cp_compare.py \
 - 某个配置 `server exited`：多半是 8 卡未释放或端口被占，`npu-smi info` +
   `ps -ef | grep "[v]llm serve"` 后重跑，或 `--restart-wait 90`。
 
-### 6.3 拉起后长时间没输出，driver 怎么判断"可以发请求了"
+### 7.3 拉起后长时间没输出，driver 怎么判断"可以发请求了"
 
 就绪判定只有一个：`GET http://127.0.0.1:<port>/health` 返回 200。
 
 ```
-launch  ->  [wait] B: polling http://127.0.0.1:12800/health (startup timeout=3600s)
+launch  ->  [wait] B: polling http://127.0.0.1:8034/health (startup timeout=3600s)
             [wait] B: /health not ready yet (elapsed=30s/3600s, last=ConnectionError)
             ...
             [ready] B: /health -> 200 (elapsed=420s)     ← 从这里才开始
             [check] B fingerprint OK: {...}              ← 校验 launcher 实际配置
-            [query] B -> http://127.0.0.1:12800          ← 真正开始发请求
+            [query] B -> http://127.0.0.1:8034           ← 真正开始发请求
 ```
 
 - 轮询间隔 3s，上限 `--startup-timeout`（默认 3600s）；每 `--wait-log-every`（默认 30s）
@@ -334,9 +426,9 @@ launch  ->  [wait] B: polling http://127.0.0.1:12800/health (startup timeout=360
 tail -f /dev/shm/cp_ab/logs/server_B.log
 npu-smi info                     # 8 张卡是否被 8 个进程占用
 
-# 2) 端口是否真的监听（应与 launcher 的 --port 一致）
-ss -ltnp | grep 12800
-curl --noproxy '*' -sv http://127.0.0.1:12800/health
+# 2) 端口是否真的监听（应与 launcher 的 --port 一致，默认 8034）
+ss -ltnp | grep 8034
+curl --noproxy '*' -sv http://127.0.0.1:8034/health
 
 # 3) 代理问题（driver 已用 trust_env=False 规避；如果你用旧版 driver 才有此问题）
 env | grep -i proxy
@@ -345,7 +437,26 @@ env | grep -i proxy
 心跳里 `last=` 的含义：`ConnectionError` = 端口还没监听（多在加载）；`ProxyError` =
 请求被代理劫持（旧版 driver）；`Timeout` = 服务响应慢。
 
-## 7. 相关代码
+### 7.4 C 组没有进 zigzag（`forward_zigzag=False` / `--on-zigzag-miss skip`）
+
+C 和 B 输出逐位完全一致时，第一件事是确认 C 真的走了 zigzag。运行时的门控都在
+`vllm_ascend/layers/cp_zigzag.py: can_enable_zigzag_for_batch`：
+
+- `VLLM_ASCEND_CP_BALANCE=1`（C 组由 driver 注入）；
+- `num_actual_tokens >= VLLM_ASCEND_CP_BALANCE_MIN_TOKENS`：**最常见的原因**。
+  driver 现在会显式注入并按 `MIN_TOKENS` 校验指纹（默认 2048），所以把
+  `--prompt-lens` 设得比它更小就会命中；
+- 每条请求 `query_len >= 2 * tp_size`（TP=8 时即 ≥16 token）；
+- `SP-padded token 数` 是 `2 * tp_size` 的倍数（driver 用相同公式重建，一般自动满足）；
+- 纯 prefill 状态、无 MTP draft、非 V2 model runner、`dp_size == 1`、
+  `dcp_replicated=False`、且 `full_o_proj`（`kv_transfer_config is None` 或 kv_producer）——
+  注意 `--kv-transfer-config` 给成 `kv_consumer` 会让 C 永远退回连续切块。
+
+排查顺序：先看 `summary.json.runtime.C`，再看
+`grep '\[CP_BALANCE\]' /dev/shm/cp_ab/logs/server_C.log`（driver 会自动设
+`VLLM_ASCEND_CP_BALANCE_DEBUG_LOG=1`），最后回到上面这几条门控。
+
+## 8. 相关代码
 
 - `vllm_ascend/layers/cp_zigzag.py`：zigzag plan / shard / gather
 - `vllm_ascend/attention/sfa_v1.py`：`DSACPContext`、merged metadata、KV/indexer 写回

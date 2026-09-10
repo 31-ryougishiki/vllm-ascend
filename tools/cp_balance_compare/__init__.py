@@ -12,10 +12,10 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 # This file is a part of the vllm-ascend project.
-"""A/B/C prefill precision comparison tooling for DSA-CP cp_balance.
+"""B/C prefill precision comparison tooling for DSA-CP cp_balance.
 
 The package keeps every knob in one place (``ab_cp_compare.py``), ships a
-reference launcher that honours the A/B/C environment overrides
+reference launcher that honours the B/C environment overrides
 (``launcher_template.sh``) and a mock-server self test
 (``selftest_mock.py``) so the driver can be validated without an NPU.
 """

@@ -17,8 +17,8 @@
 Used by ``selftest_mock.py`` to validate ``ab_cp_compare.py`` without an NPU,
 and usable manually to exercise the driver end to end::
 
-    python tools/cp_balance_compare/mock_vllm_server.py --ports 18001,18002,18003 \\
-        --offsets 0,1e-6,0.2
+    python tools/cp_balance_compare/mock_vllm_server.py --ports 18034,18035 \\
+        --offsets 1e-6,0.2
 
 Every served response is deterministic: the logprob of a token is
 ``-0.5 - 0.001 * (token % 100) + offset`` so different ports behave like
@@ -43,17 +43,18 @@ def fake_tokenize(text: str) -> list[int]:
 
 
 def normalize_prompts(prompt: Any) -> list[Any]:
+    """Return one entry per completion choice, like the vLLM completions API."""
     if isinstance(prompt, str):
         return [prompt]
     if isinstance(prompt, list):
         if not prompt:
             return []
         if all(isinstance(item, str) for item in prompt):
-            return list(prompt)
+            return list(prompt)  # batch of text prompts -> one choice each
         if all(isinstance(item, int) for item in prompt):
-            return [prompt]
+            return [prompt]  # a single token-id prompt
         if all(isinstance(item, list) for item in prompt):
-            return list(prompt)
+            return [list(item) for item in prompt]  # batch of token-id prompts
     raise ValueError(f"unsupported prompt payload: {type(prompt)}")
 
 
@@ -63,25 +64,76 @@ def ids_for(prompt: Any) -> list[int]:
     return [int(token) for token in prompt]
 
 
-def make_choice(index: int, prompt: Any, top_k: int, offset: float, echo: bool) -> dict[str, Any]:
+def make_choice(
+    index: int,
+    prompt: Any,
+    top_k: int,
+    offset: float,
+    echo: bool,
+    break_mode: str = "",
+    echo_ids: list[int] | None = None,
+    key_style: str = "text",
+) -> dict[str, Any]:
+    """Build one choice.
+
+    ``key_style`` mirrors the server's ``top_logprobs`` key format:
+    ``"text"`` (vLLM default: decoded token text, e.g. ``"Redux"``),
+    ``"ids"`` (``return_tokens_as_token_ids=True`` -> ``token_id:N``), or
+    ``"numeric"`` (plain ids).
+    """
     ids = ids_for(prompt)
-    num_prompt = len(ids)
+    if not ids:
+        raise ValueError("empty prompt")
+    scored = list(ids)
+    if break_mode == "rewrite":
+        # Simulate a server that prepends BOS even though add_special_tokens=False.
+        scored = [0] + scored
+    num_scored = len(scored)  # logprob array length == echoed prompt length
+    prompt_ids = list(scored)
+    if break_mode == "truncate":
+        # Echo one id fewer than the request carried, as if the last token had
+        # been dropped, while still scoring the full prompt length.
+        prompt_ids = prompt_ids[:-1] or prompt_ids
+    if echo_ids is not None:
+        # Serve ``echo_ids`` as the echoed prompt while still scoring
+        # ``num_scored`` positions: what a server that rewrote the token
+        # sequence (swapped ids) looks like on the wire.
+        prompt_ids = [int(token) for token in echo_ids]
+        if not prompt_ids:
+            raise ValueError("echo_ids must not be empty")
+
+    def key_for(step: int, candidate: int) -> str:
+        if key_style == "ids":
+            return f"token_id:{candidate}"
+        if key_style == "numeric":
+            return str(candidate)
+        return f"tok{step}_{candidate - 1}"
+
     token_logprobs: list[float | None] = [None]
     top_logprobs: list[dict[str, float] | None] = [None]
     prompt_logprobs: list[dict[str, float] | None] = [None]
-    for position in range(1, num_prompt + 1):
-        token = ids[position] if position < num_prompt else (ids[-1] + 1 if ids else 1)
+    for position in range(1, num_scored + 1):
+        # Position `position` scores the prompt token at that index; the last
+        # entry stands for the first generated token (last prompt id + 1).
+        token = scored[position] if position < num_scored else (scored[-1] + 1)
         logprob = -0.5 - 0.001 * (token % 100) + offset
-        candidates = {str(token + delta): logprob - 0.1 * delta for delta in range(top_k)}
+        candidates = {
+            key_for(position, token + delta): logprob - 0.1 * delta for delta in range(top_k)
+        }
         token_logprobs.append(logprob)
         top_logprobs.append(candidates)
-        if position < num_prompt:
+        if position < num_scored:
             prompt_logprobs.append(candidates)
+    if break_mode == "no_logprobs":
+        # Simulate a server that forgot to return logprobs (only echo + ids).
+        token_logprobs = [None] * (num_scored + 1)
+        top_logprobs = [None] * (num_scored + 1)
+        prompt_logprobs = [None] * (num_scored + 1)
     choice: dict[str, Any] = {
         "index": index,
         "text": "",
         "finish_reason": "length",
-        "prompt_token_ids": ids,
+        "prompt_token_ids": prompt_ids,
         "prompt_logprobs": prompt_logprobs,
     }
     if echo:
@@ -127,7 +179,12 @@ class _Handler(BaseHTTPRequestHandler):
         top_k = max(1, top_k)
         offset = float(getattr(self.server, "offset", 0.0))
         echo = bool(getattr(self.server, "echo_mode", True))
-        choices = [make_choice(i, prompt, top_k, offset, echo) for i, prompt in enumerate(prompts)]
+        break_mode = str(getattr(self.server, "break_mode", ""))
+        key_style = str(getattr(self.server, "key_style", "text"))
+        choices = [
+            make_choice(index, prompt, top_k, offset, echo, break_mode, None, key_style)
+            for index, prompt in enumerate(prompts)
+        ]
         self._send(200, {"choices": choices})
 
 
@@ -149,6 +206,10 @@ def start_mock_servers(
         server = ThreadingHTTPServer(("127.0.0.1", bind_port), _Handler)
         server.offset = offset  # type: ignore[attr-defined]
         server.echo_mode = True  # type: ignore[attr-defined]
+        server.break_mode = ""  # type: ignore[attr-defined]
+        # vLLM's default is decoded-text keys; the self test flips this to
+        # "ids"/"numeric" to cover the placeholder and plain-id formats too.
+        server.key_style = "text"  # type: ignore[attr-defined]
         thread = threading.Thread(target=server.serve_forever, daemon=True)
         thread.start()
         servers.append(server)
@@ -165,8 +226,8 @@ def stop_mock_servers(servers: list[ThreadingHTTPServer]) -> None:
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--ports", default="18001,18002,18003")
-    parser.add_argument("--offsets", default="0,1e-6,0.2")
+    parser.add_argument("--ports", default="18034,18035")
+    parser.add_argument("--offsets", default="1e-6,0.2")
     return parser.parse_args()
 
 

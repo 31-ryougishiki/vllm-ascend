@@ -17,7 +17,7 @@
 # Reference launcher for tools/cp_balance_compare/ab_cp_compare.py.
 #
 # The driver starts this script as `bash launcher_template.sh <port>` and
-# injects the A/B/C environment variables:
+# injects the B/C environment variables:
 #
 #   VLLM_ASCEND_CP_BALANCE             0 = continuous CP, 1 = zigzag
 #   VLLM_ASCEND_ADDITIONAL_CONFIG      full additional_config JSON
@@ -35,7 +35,7 @@
 
 set -euo pipefail
 
-port="${1:-12800}"
+port="${1:-8034}"
 : "${MODEL_PATH:?set MODEL_PATH to the checkpoint directory}"
 
 # Optional site specific environment (e.g. HCCL ifnames, vendor set_env.bash).
@@ -50,11 +50,15 @@ fi
 
 export VLLM_ASCEND_ENABLE_FLASHCOMM1="${VLLM_ASCEND_ENABLE_FLASHCOMM1:-1}"
 export VLLM_ASCEND_CP_BALANCE="${VLLM_ASCEND_CP_BALANCE:-1}"
+# Zigzag only turns on at/above this token count.  The driver pins
+# VLLM_ASCEND_CP_BALANCE_MIN_TOKENS for every config and verifies it in the
+# fingerprint, so the value here is just a fallback for manual runs (the
+# vllm_ascend source default is 8192).
 export VLLM_ASCEND_CP_BALANCE_MIN_TOKENS="${VLLM_ASCEND_CP_BALANCE_MIN_TOKENS:-2048}"
 export VLLM_ASCEND_CP_BALANCE_EMBED_LOCAL="${VLLM_ASCEND_CP_BALANCE_EMBED_LOCAL:-0}"
 
 # NOTE: no PD-only knobs here. `recompute_scheduler_enable=true` is rejected by
-# vllm_ascend.platform unless kv_role='kv_consumer', and the A/B/C comparison by
+# vllm_ascend.platform unless kv_role='kv_consumer', and the B/C comparison by
 # default runs without the PD connector.
 DEFAULT_ADDITIONAL_CONFIG='{"enable_cpu_binding": "True", "multistream_overlap_shared_expert": "True", "enable_sparse_sfa_c8": true, "enable_sparse_li_c8": true, "enable_dsa_cp": true}'
 additional_config="${VLLM_ASCEND_ADDITIONAL_CONFIG:-${DEFAULT_ADDITIONAL_CONFIG}}"
@@ -82,7 +86,7 @@ spec_flag=0
 if [ -n "${spec_config}" ]; then spec_flag=1; fi
 kv_flag=0
 if [ -n "${kv_config}" ]; then kv_flag=1; fi
-echo "[cp-ab] CP_BALANCE=${VLLM_ASCEND_CP_BALANCE} DSA_CP=${dsa_cp} EMBED_LOCAL=${VLLM_ASCEND_CP_BALANCE_EMBED_LOCAL} SPEC=${spec_flag} KV=${kv_flag}"
+echo "[cp-ab] CP_BALANCE=${VLLM_ASCEND_CP_BALANCE} DSA_CP=${dsa_cp} MIN_TOKENS=${VLLM_ASCEND_CP_BALANCE_MIN_TOKENS} EMBED_LOCAL=${VLLM_ASCEND_CP_BALANCE_EMBED_LOCAL} SPEC=${spec_flag} KV=${kv_flag}"
 # Effective additional_config, verified verbatim by ab_cp_compare.py --config-check.
 echo "[cp-ab-cfg] ${additional_config}"
 
