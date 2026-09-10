@@ -17,10 +17,15 @@
 Configurations (same weights, same TP size and the same additional_config
 except ``enable_dsa_cp``):
 
-* ``A``  : DSA-CP off                            -> non-CP prefill baseline
-* ``B``  : DSA-CP on  + ``VLLM_ASCEND_CP_BALANCE=0`` -> continuous context parallel
+* ``A``  : DSA-CP off                            -> golden non-CP anchor (optional)
+* ``B``  : DSA-CP on  + ``VLLM_ASCEND_CP_BALANCE=0`` -> DSA-CP continuous baseline
 * ``C``  : DSA-CP on  + ``VLLM_ASCEND_CP_BALANCE=1`` -> zigzag cp_balance
-* ``A2`` : optional repeat of ``A``              -> noise floor (``--repeat-a``)
+* ``<ref>2`` : optional repeat of the first config -> noise floor (``--repeat-a``)
+
+The decisive comparison is ``C-B`` (same DSA-CP path, only the token layout
+differs).  ``A`` only separates "DSA-CP's own error" (``B-A``) from cp_balance;
+when B (``CP_BALANCE=0``) is already the trusted baseline, run
+``--configs B,C --repeat-a`` and use ``B2-B`` as the noise floor.
 
 For every prompt the driver calls ``/v1/completions`` with ``echo=true`` and
 ``logprobs=K`` and records, for every token position:
@@ -131,9 +136,15 @@ def additional_config(enable_dsa_cp: bool, extra_json: str = "") -> str:
     return json.dumps(cfg)
 
 
+def config_spec(name: str) -> tuple[bool, str]:
+    """(enable_dsa_cp, VLLM_ASCEND_CP_BALANCE) for a config, incl. ``A2``/``B2``."""
+    base = name[:-1] if name.endswith("2") and name[:-1] in CONFIGS else name
+    return CONFIGS[base]
+
+
 def resolved_config(name: str, args: argparse.Namespace) -> dict[str, str]:
     """Effective env for one config, including ``--env`` overrides."""
-    enable_dsa_cp, cp_balance = CONFIGS["A" if name == "A2" else name]
+    enable_dsa_cp, cp_balance = config_spec(name)
     resolved = {
         "VLLM_ASCEND_CP_BALANCE": cp_balance,
         "VLLM_ASCEND_ADDITIONAL_CONFIG": additional_config(enable_dsa_cp, args.extra_additional_config),
@@ -442,7 +453,9 @@ def check_zigzag_activation(
     print(f"[runtime] {name}: metadata_zigzag={state['metadata']} forward_zigzag={state['forward']}")
     if args.zigzag_check == "off":
         return None
-    if name == "C":
+    enable_dsa_cp, cp_balance = config_spec(name)
+    expects_zigzag = enable_dsa_cp and cp_balance == "1"
+    if expects_zigzag:
         if state["forward"]:
             return None
         message = (
@@ -605,16 +618,20 @@ def query_all(url: str, args: argparse.Namespace, cases: list[PromptCase]) -> di
 
 
 def build_pairs(names: list[str]) -> list[tuple[str, str]]:
-    """Ordered pairs ``(newer, older)`` so deltas read as e.g. ``C-B``."""
-    pairs = []
-    if "B" in names and "A" in names:
-        pairs.append(("B", "A"))
-    if "C" in names and "B" in names:
-        pairs.append(("C", "B"))
-    if "C" in names and "A" in names:
-        pairs.append(("C", "A"))
-    if "A2" in names and "A" in names:
-        pairs.append(("A2", "A"))
+    """Ordered ``(newer, older)`` pairs so deltas read as e.g. ``C-B``.
+
+    For ``[A, B, C]`` this is exactly ``(B,A), (C,B), (C,A)``; for ``[B, C]``
+    it is just ``(C,B)``; a repeated config ``B2`` adds ``(B2,B)``.
+    """
+    base = [name for name in names if not (name.endswith("2") and name[:-1] in names)]
+    pairs: list[tuple[str, str]] = []
+    for index in range(1, len(base)):
+        pairs.append((base[index], base[index - 1]))
+    for index in range(2, len(base)):
+        pairs.append((base[index], base[0]))
+    for name in names:
+        if name.endswith("2") and name[:-1] in base:
+            pairs.append((name, name[:-1]))
     return pairs
 
 
@@ -965,36 +982,42 @@ def preflight(args: argparse.Namespace, names: list[str]) -> int:
 
 
 def print_metrics(metrics: dict[str, Any]) -> None:
-    def get(key, default=float("nan")):
-        return metrics.get(key, default)
-
+    top1_pairs = sorted(key[len("top1%"):] for key in metrics if key.startswith("top1%"))
+    delta_pairs = sorted(key[len("p99|d|"):] for key in metrics if key.startswith("p99|d|"))
+    top1 = " ".join(f"{pair}={metrics['top1%' + pair]:.2f}" for pair in top1_pairs)
+    deltas = " ".join(f"{pair}={metrics['p99|d|' + pair]:.2e}" for pair in delta_pairs)
+    focus = "C-B" if "C-B" in delta_pairs else (delta_pairs[-1] if delta_pairs else "")
+    first = metrics.get(f"first_div_{focus}", "-") if focus else "-"
+    block = metrics.get(f"block@first_div_{focus}", "-") if focus else "-"
+    gen_pairs = sorted(key[len("gen_top1%"):] for key in metrics if key.startswith("gen_top1%"))
+    gen = " ".join(f"{pair}={metrics['gen_top1%' + pair]}" for pair in gen_pairs)
     print(
         f"[{metrics['case']}.{metrics['req']}] len={metrics['length']} "
-        f"top1% B~A={get('top1%B~A'):.2f} C~B={get('top1%C~B'):.2f} C~A={get('top1%C~A'):.2f} | "
-        f"p99|d| B-A={get('p99|d|B-A'):.2e} C-B={get('p99|d|C-B'):.2e} C-A={get('p99|d|C-A'):.2e} | "
-        f"first_div C-B={metrics.get('first_div_C-B', '-')} "
-        f"@ {metrics.get('block@first_div_C-B', '-')} "
-        f"gen_top1% C~B={get('gen_top1%C~B', '-')}"
+        f"top1% {top1} | p99|d| {deltas} | "
+        f"first_div {focus}={first} @ {block} {gen}"
     )
 
 
 def compute_noise(results: dict, names: list[str]) -> dict[str, float]:
-    if "A2" not in names:
+    """Noise floor from any repeated config (``X2`` vs ``X``)."""
+    repeats = [(name, name[:-1]) for name in names if name.endswith("2") and name[:-1] in names]
+    if not repeats:
         return {}
+    repeat_name, base_name = repeats[0]
     diffs = []
-    for case_id, prompts in results["A"].items():
+    for case_id, prompts in results[base_name].items():
         for req, entry in enumerate(prompts):
-            if "error" in entry or req >= len(results["A2"].get(case_id, [])):
+            if "error" in entry or req >= len(results[repeat_name].get(case_id, [])):
                 continue
             x = as_float(entry["tok_lp"])
-            y = as_float(results["A2"][case_id][req]["tok_lp"])
+            y = as_float(results[repeat_name][case_id][req]["tok_lp"])
             size = min(x.size, y.size)
             diffs.append(np.abs(x[1:size] - y[1:size]))
     if not diffs:
         return {}
     delta = np.concatenate(diffs)
     noise = {"p99": float(np.nanpercentile(delta, 99)), "max": float(np.nanmax(delta))}
-    print(f"[noise] A vs A2: p99={noise['p99']:.3e} max={noise['max']:.3e}")
+    print(f"[noise] {repeat_name} vs {base_name}: p99={noise['p99']:.3e} max={noise['max']:.3e}")
     return noise
 
 
@@ -1030,7 +1053,7 @@ def collect_sequential(args, names, cases, out_dir, log_dir):
                 if args.on_zigzag_miss == "skip" and index + 1 < len(names):
                     skipped = names[index + 1:]
                     print(
-                        f"[warn] skipping remaining configs {skipped}: C did not enter zigzag, "
+                        f"[warn] skipping remaining configs {skipped}: {name} did not enter zigzag, "
                         "so the rest cannot answer the precision question "
                         "(pass --on-zigzag-miss continue to force the full run)"
                     )
@@ -1053,7 +1076,16 @@ def collect_from_urls(args, names, cases):
 
 
 def run(args: argparse.Namespace) -> int:
-    names = ["A", "B", "C"] + (["A2"] if args.repeat_a else [])
+    requested = [item.strip().upper() for item in args.configs.split(",") if item.strip()]
+    unknown = [item for item in requested if item not in CONFIGS]
+    if unknown:
+        raise SystemExit(f"--configs has unknown entries {unknown}; choose from {sorted(CONFIGS)}")
+    if len(requested) < 2:
+        raise SystemExit("--configs needs at least two configs, e.g. 'B,C' or 'A,B,C'")
+    names = list(requested)
+    if args.repeat_a:
+        # Repeat the reference (first) config as <ref>2 to measure the noise floor.
+        names.append(f"{requested[0]}2")
     if args.preflight:
         return preflight(args, names)
 
@@ -1113,6 +1145,12 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         help="server launcher command template; {port} is substituted",
     )
     parser.add_argument("--urls", default="", help="A=http://..,B=http://..,C=http://.. (skip launching)")
+    parser.add_argument(
+        "--configs",
+        default="A,B,C",
+        help="comma-separated configs to run; the first one is the reference. "
+        "Use 'B,C' to compare the DSA-CP baseline directly against cp_balance.",
+    )
     parser.add_argument("--base-port", type=int, default=12800)
     parser.add_argument("--model", default="glm")
     parser.add_argument("--prompt-lens", default="2048,2049,4096", help="comma-separated synthetic prompt lengths")
@@ -1138,7 +1176,11 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         "(e.g. '{\"recompute_scheduler_enable\": false}')",
     )
     parser.add_argument("--env", action="append", default=[], metavar="K=V", help="extra env override")
-    parser.add_argument("--repeat-a", action="store_true", help="run A twice as A2 for the noise floor")
+    parser.add_argument(
+        "--repeat-a",
+        action="store_true",
+        help="also run the first/reference config again as <ref>2 for the noise floor",
+    )
     parser.add_argument("--config-check", choices=("off", "warn", "strict"), default="warn")
     parser.add_argument(
         "--zigzag-check",

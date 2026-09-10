@@ -224,6 +224,56 @@ def test_base_additional_config_has_no_pd_only_knobs() -> None:
     assert merged["enable_dsa_cp"] is True
 
 
+def test_build_pairs_for_subsets() -> None:
+    assert driver.build_pairs(["A", "B", "C"]) == [("B", "A"), ("C", "B"), ("C", "A")]
+    assert driver.build_pairs(["B", "C"]) == [("C", "B")]
+    assert driver.build_pairs(["B", "C", "B2"]) == [("C", "B"), ("B2", "B")]
+    assert driver.build_pairs(["A", "B", "C", "A2"]) == [
+        ("B", "A"),
+        ("C", "B"),
+        ("C", "A"),
+        ("A2", "A"),
+    ]
+
+
+def test_end_to_end_with_b_c_configs() -> None:
+    """Baseline = B: --configs B,C --repeat-a uses B2 as the noise floor."""
+    out = _temp_dir("cp_ab_bc_")
+    servers, urls = mock.start_mock_servers({"B": 1e-6, "C": 0.2})
+    try:
+        prompts = out / "prompts.jsonl"
+        prompts.write_text(json.dumps({"case": "ids", "prompt": [11, 22, 33]}) + "\n")
+        results_dir = out / "results"
+        argv = [
+            "--out",
+            str(results_dir),
+            "--urls",
+            f"B={urls['B']},C={urls['C']},B2={urls['B']}",
+            "--configs",
+            "B,C",
+            "--repeat-a",
+            "--prompts-file",
+            str(prompts),
+            "--no-plot",
+            "--topk",
+            "3",
+        ]
+        captured = io.StringIO()
+        with redirect_stdout(captured):
+            rc = driver.run(driver.parse_args(argv))
+        assert rc == 0, captured.getvalue()
+        summary = json.loads((results_dir / "summary.json").read_text(encoding="utf-8"))
+        assert summary["noise"]["p99"] == 0.0
+        metrics = summary["cases"][0]["metrics"][0]
+        assert "p99|d|C-B" in metrics
+        assert "top1%C~B" in metrics
+        assert abs(metrics["p99|d|C-B"] - 0.2) < 1e-3
+        assert "top1%B~A" not in metrics
+    finally:
+        mock.stop_mock_servers(servers)
+        shutil.rmtree(out, ignore_errors=True)
+
+
 def test_zigzag_state_from_log() -> None:
     out = _temp_dir("cp_ab_zigzag_log_")
     try:

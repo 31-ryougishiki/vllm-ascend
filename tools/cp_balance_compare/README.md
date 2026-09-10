@@ -5,16 +5,26 @@
 
 配合 `vllm-ascend` 上的 `enable_dsa_cp` / `VLLM_ASCEND_CP_BALANCE` 两个开关，跑三组配置：
 
-| 配置 | 含义 | 作用 |
+| 配置 | 含义 | 角色 |
 | --- | --- | --- |
-| `A` | `enable_dsa_cp=false` | 非 CP prefill 基线（金标准） |
-| `B` | `enable_dsa_cp=true` + `VLLM_ASCEND_CP_BALANCE=0` | 连续切块 DSA-CP，隔离"CP 本身"的误差 |
+| `A` | `enable_dsa_cp=false` | 完全不走 DSA-CP 的"金标准"锚点（可选） |
+| `B` | `enable_dsa_cp=true` + `VLLM_ASCEND_CP_BALANCE=0` | **基线**：同 DSA-CP、同 kernel、连续切块 |
 | `C` | `enable_dsa_cp=true` + `VLLM_ASCEND_CP_BALANCE=1` | zigzag cp_balance，待排查对象 |
-| `A2` | 再跑一遍 A（`--repeat-a`） | 测 bf16/fp8 prefill 的噪声底 |
+| `B2` | 再跑一遍 B（`--repeat-a`） | **优选噪声底**（同配置重复，最有可比性） |
 
-判断标准：**`C-B` 才是 cp_balance 的账**。如果 `C-B` 和 `A-A2` 同量级，说明之前看到的
-差异只是归约顺序噪声；如果 `C-B` 出现结构性大偏差、且 `first_div` 落在某个 rank 的
-`prev/next` 块上，才说明布局/边界有 bug。
+判断标准：
+
+- **`C-B` 才是 cp_balance 的账**（同 DSA-CP、同 SP、同 C8，只差 token 布局）。如果
+  `C-B` 和 `B2-B` 同量级，说明看到的差异只是归约顺序噪声；
+- `A` 只有一个用途：把"DSA-CP 本身的误差"（`B-A`）和"cp_balance 的误差"（`C-B`）
+  分开。如果你已确认 `CP_BALANCE=0`（B）就是正确基线，**可以只跑 B/C**，用 B2 当噪声底，
+  省掉 A 的一次 8 卡加载：
+
+  ```bash
+  --configs B,C --repeat-a
+  ```
+
+- 只有 `--configs A,B,C`（默认）时才会有 `B-A`/`C-A` 这两列。
 
 ## 1. 目录内容
 
@@ -52,18 +62,23 @@ python tools/cp_balance_compare/ab_cp_compare.py \
   --no-kv-connector
 # 期望输出：[preflight] A: OK ... [preflight] all configs OK
 
-# 1) A/B/C + A/A 噪声底。默认关 MTP、关 PD connector，先隔离变量
-#    --zigzag-check strict：C 没进 zigzag 直接判失败（默认跳过剩下的 A2，避免白加载）
+# 1) 基线(B) vs zigzag(C) + B/B2 噪声底。默认关 MTP、关 PD connector，先隔离变量
+#    --configs B,C   ：只跑 DSA-CP 基线 B 和 cp_balance C，省掉 A 的一次加载
+#    --zigzag-check strict：C 没进 zigzag 直接判失败（默认跳过剩下的配置，避免白加载）
 python tools/cp_balance_compare/ab_cp_compare.py \
   --out /dev/shm/cp_ab \
   --repo-root /home/z30055003/vllm-ascend \
   --launcher "bash tools/cp_balance_compare/launcher_glm52_w4a4c8_mxfp4.sh x {port}" \
+  --configs B,C \
   --config-check strict \
   --zigzag-check strict \
   --prompt-lens 2048,2049,4096 \
   --multi-lens "2048,2048;3000,1500" \
   --repeat-a \
   --no-kv-connector
+
+# 1b) 需要 "不开 DSA-CP" 的金标准锚点（区分 DSA-CP 自身误差）时再加 A：
+#     --configs A,B,C（A 会多一次加载；A/A2 可选）
 
 # 2) 结果、曲线、CSV
 ls /dev/shm/cp_ab
