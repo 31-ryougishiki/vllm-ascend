@@ -375,22 +375,27 @@ def zigzag_state_from_log(log_path: Path) -> dict[str, bool]:
     return {key: marker in text for key, marker in ZIGZAG_MARKERS.items()}
 
 
-def check_zigzag_activation(name: str, args: argparse.Namespace, state: dict[str, bool], log_path: Path) -> None:
+def check_zigzag_activation(
+    name: str, args: argparse.Namespace, state: dict[str, bool], log_path: Path
+) -> str | None:
+    """Return a failure message when the strict zigzag check fails."""
     print(f"[runtime] {name}: metadata_zigzag={state['metadata']} forward_zigzag={state['forward']}")
     if args.zigzag_check == "off":
-        return
+        return None
     if name == "C":
         if state["forward"]:
-            return
+            return None
         message = (
             f"{name} did not log '{ZIGZAG_MARKERS['forward']}'; it may have fallen back to the "
             f"continuous-slice path (see {log_path})"
         )
         if args.zigzag_check == "strict":
-            raise SystemExit(f"[error] {message}")
+            print(f"[error] {message}")
+            return message
         print(f"[warn] {message}")
     elif state["forward"]:
         print(f"[warn] {name} unexpectedly logged zigzag_active=1")
+    return None
 
 
 # --------------------------------------------------------------------------- #
@@ -916,7 +921,9 @@ def compute_noise(results: dict, names: list[str]) -> dict[str, float]:
 def collect_sequential(args, names, cases, out_dir, log_dir):
     results = {}
     runtimes: dict[str, dict[str, bool]] = {}
-    for name in names:
+    failures: list[str] = []
+    skipped: list[str] = []
+    for index, name in enumerate(names):
         proc, port, log, log_path = launch_server(args, name, log_dir)
         if args.dry_run:
             if log is not None:
@@ -937,10 +944,20 @@ def collect_sequential(args, names, cases, out_dir, log_dir):
             results[name] = query_all(url, args, cases)
             (out_dir / f"results_{name}.json").write_text(json.dumps(results[name], ensure_ascii=False))
             runtimes[name] = zigzag_state_from_log(log_path)
-            check_zigzag_activation(name, args, runtimes[name], log_path)
+            failure = check_zigzag_activation(name, args, runtimes[name], log_path)
+            if failure is not None:
+                failures.append(failure)
+                if args.on_zigzag_miss == "skip" and index + 1 < len(names):
+                    skipped = names[index + 1:]
+                    print(
+                        f"[warn] skipping remaining configs {skipped}: C did not enter zigzag, "
+                        "so the rest cannot answer the precision question "
+                        "(pass --on-zigzag-miss continue to force the full run)"
+                    )
+                    break
         finally:
             stop_server(proc, log, args.restart_wait)
-    return results, runtimes
+    return results, runtimes, failures, skipped
 
 
 def collect_from_urls(args, names, cases):
@@ -975,22 +992,32 @@ def run(args: argparse.Namespace) -> int:
             print("[warn] --urls mode cannot read server logs; skipping the zigzag activation check")
         results = collect_from_urls(args, names, cases)
         runtimes: dict[str, dict[str, bool]] = {}
+        failures: list[str] = []
+        skipped: list[str] = []
     else:
-        results, runtimes = collect_sequential(args, names, cases, out_dir, log_dir)
+        results, runtimes, failures, skipped = collect_sequential(args, names, cases, out_dir, log_dir)
     if args.dry_run:
         return 0
 
+    # Compare only the configs that were actually collected, so an early stop
+    # (zigzag miss) still produces the A/B/C deltas instead of an empty summary.
+    collected = [name for name in names if name in results]
+    print(f"[compare] configs: {collected}" + (f" (skipped {skipped})" if skipped else ""))
     (out_dir / "results_all.json").write_text(json.dumps(results, ensure_ascii=False))
-    noise = compute_noise(results, names)
+    noise = compute_noise(results, collected)
     summaries = []
     for case in cases:
-        summary = compare_case(results, case[0], names, args, noise, out_dir)
+        summary = compare_case(results, case[0], collected, args, noise, out_dir)
         summaries.append(summary)
         for metrics in summary.get("metrics", []):
             print_metrics(metrics)
-    summary_payload = {"noise": noise, "runtime": runtimes, "cases": summaries}
+    summary_payload = {"noise": noise, "runtime": runtimes, "skipped": skipped, "cases": summaries}
     (out_dir / "summary.json").write_text(json.dumps(summary_payload, ensure_ascii=False, indent=2))
     print(f"[done] results in {out_dir}")
+    if failures:
+        for failure in failures:
+            print(f"[error] {failure}")
+        return 1
     return 0
 
 
@@ -1032,6 +1059,13 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         choices=("off", "warn", "strict"),
         default="warn",
         help="check the C server log for the zigzag activation marker",
+    )
+    parser.add_argument(
+        "--on-zigzag-miss",
+        choices=("skip", "continue"),
+        default="skip",
+        help="when strict zigzag check fails: stop launching remaining configs, "
+        "still write results/summary and exit non-zero (skip), or run everything (continue)",
     )
     parser.add_argument(
         "--preflight",

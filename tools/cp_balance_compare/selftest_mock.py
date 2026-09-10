@@ -163,6 +163,35 @@ def _bash_usable() -> bool:
         return False
 
 
+def test_compare_case_with_subset_of_configs() -> None:
+    """A zigzag miss stops after C; B/C-only comparison must still work."""
+
+    def entry(n_prompt: int) -> dict:
+        tok_lp = [None] + [-1.0] * (n_prompt - 1) + [-1.0]
+        top1 = [None] + [10] * (n_prompt - 1) + [11]
+        return {
+            "prompt_token_ids": list(range(n_prompt)),
+            "n_prompt": n_prompt,
+            "n_out": n_prompt + 1,
+            "tok_lp": tok_lp,
+            "top1": top1,
+            "top1_lp": tok_lp,
+            "top5": [[] for _ in range(n_prompt + 1)],
+        }
+
+    results = {"B": {"c": [entry(16)]}, "C": {"c": [entry(16)]}}
+    args = driver.parse_args(["--out", "/tmp/cp_ab_subset", "--no-plot", "--no-annotate-plan"])
+    out = _temp_dir("cp_ab_subset_")
+    try:
+        summary = driver.compare_case(results, "c", ["B", "C"], args, {}, out)
+        metrics = summary["metrics"][0]
+        assert "p99|d|C-B" in metrics
+        assert "first_div_C-B" in metrics
+        assert "top1%C~B" in metrics
+    finally:
+        shutil.rmtree(out, ignore_errors=True)
+
+
 def test_zigzag_state_from_log() -> None:
     out = _temp_dir("cp_ab_zigzag_log_")
     try:

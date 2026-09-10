@@ -53,11 +53,13 @@ python tools/cp_balance_compare/ab_cp_compare.py \
 # 期望输出：[preflight] A: OK ... [preflight] all configs OK
 
 # 1) A/B/C + A/A 噪声底。默认关 MTP、关 PD connector，先隔离变量
+#    --zigzag-check strict：C 没进 zigzag 直接判失败（默认跳过剩下的 A2，避免白加载）
 python tools/cp_balance_compare/ab_cp_compare.py \
   --out /dev/shm/cp_ab \
   --repo-root /home/z30055003/vllm-ascend \
   --launcher "bash tools/cp_balance_compare/launcher_glm52_w4a4c8_mxfp4.sh x {port}" \
   --config-check strict \
+  --zigzag-check strict \
   --prompt-lens 2048,2049,4096 \
   --multi-lens "2048,2048;3000,1500" \
   --repeat-a \
@@ -203,8 +205,14 @@ python tools/cp_balance_compare/ab_cp_compare.py \
 - 两个标记由 `VLLM_ASCEND_CP_BALANCE_DEBUG_LOG=1`（driver 自动为 A/B/C 导出）
   触发的 `[CP_BALANCE]` 日志产生，默认关闭，对正常推理没有影响。
 
-配合 `--zigzag-check strict` 使用：如果 C 没有打出 forward 标记，driver 直接报错，
-避免"C 其实静默回退到连续路径、却因为 C-B 一致被误判成修复成功"。
+配合 `--zigzag-check strict` 使用：如果 C 没有打出 forward 标记，driver 默认
+（`--on-zigzag-miss skip`）**不再拉起剩余配置**（例如 A2，省一次模型加载），
+但会把已经采到的 A/B/C 数据照常写出 `summary.json`/图，`summary.json.skipped`
+记录被跳过的配置，`summary.json.runtime.C.forward=false`，最后以非 0 退出。
+传 `--on-zigzag-miss continue` 可强制跑完全部配置。
+
+这样既避免"C 其实静默回退到连续路径、却因为 C-B 一致被误判成修复成功"，
+也不浪费一次加载、不丢已采数据。
 
 终端会直接打印一行汇总：
 
