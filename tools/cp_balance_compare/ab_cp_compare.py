@@ -82,6 +82,10 @@ except ImportError:  # pragma: no cover
 
 
 FINGERPRINT_PREFIX = "[cp-ab]"
+ZIGZAG_MARKERS = {
+    "metadata": "[CP_BALANCE] metadata zigzag=1",
+    "forward": "[CP_BALANCE] forward zigzag_active=1",
+}
 
 BASE_ADDITIONAL_CONFIG: dict[str, Any] = {
     "enable_cpu_binding": "True",
@@ -123,6 +127,9 @@ def resolved_config(name: str, args: argparse.Namespace) -> dict[str, str]:
         "VLLM_ASCEND_SPEC_CONFIG": args.spec_config,
         "VLLM_ASCEND_KV_TRANSFER_CONFIG": "" if args.no_kv_connector else args.kv_transfer_config,
         "VLLM_ASCEND_CP_BALANCE_EMBED_LOCAL": args.embed_local,
+        # Lets the driver prove from the server log that C really entered the
+        # zigzag path instead of silently falling back to continuous slices.
+        "VLLM_ASCEND_CP_BALANCE_DEBUG_LOG": "1",
     }
     for key, value in args.env_override:
         resolved[key] = value
@@ -357,6 +364,33 @@ def tail(path: Path, lines: int = 40) -> str:
     except OSError:
         return ""
     return "\n".join(content[-lines:])
+
+
+def zigzag_state_from_log(log_path: Path) -> dict[str, bool]:
+    """Whether the server log shows the zigzag metadata / forward marker."""
+    try:
+        text = log_path.read_text(errors="replace") if log_path.exists() else ""
+    except OSError:
+        text = ""
+    return {key: marker in text for key, marker in ZIGZAG_MARKERS.items()}
+
+
+def check_zigzag_activation(name: str, args: argparse.Namespace, state: dict[str, bool], log_path: Path) -> None:
+    print(f"[runtime] {name}: metadata_zigzag={state['metadata']} forward_zigzag={state['forward']}")
+    if args.zigzag_check == "off":
+        return
+    if name == "C":
+        if state["forward"]:
+            return
+        message = (
+            f"{name} did not log '{ZIGZAG_MARKERS['forward']}'; it may have fallen back to the "
+            f"continuous-slice path (see {log_path})"
+        )
+        if args.zigzag_check == "strict":
+            raise SystemExit(f"[error] {message}")
+        print(f"[warn] {message}")
+    elif state["forward"]:
+        print(f"[warn] {name} unexpectedly logged zigzag_active=1")
 
 
 # --------------------------------------------------------------------------- #
@@ -881,6 +915,7 @@ def compute_noise(results: dict, names: list[str]) -> dict[str, float]:
 
 def collect_sequential(args, names, cases, out_dir, log_dir):
     results = {}
+    runtimes: dict[str, dict[str, bool]] = {}
     for name in names:
         proc, port, log, log_path = launch_server(args, name, log_dir)
         if args.dry_run:
@@ -901,9 +936,11 @@ def collect_sequential(args, names, cases, out_dir, log_dir):
             print(f"[query] {name} -> {url}")
             results[name] = query_all(url, args, cases)
             (out_dir / f"results_{name}.json").write_text(json.dumps(results[name], ensure_ascii=False))
+            runtimes[name] = zigzag_state_from_log(log_path)
+            check_zigzag_activation(name, args, runtimes[name], log_path)
         finally:
             stop_server(proc, log, args.restart_wait)
-    return results
+    return results, runtimes
 
 
 def collect_from_urls(args, names, cases):
@@ -934,9 +971,12 @@ def run(args: argparse.Namespace) -> int:
     if args.urls:
         if args.config_check != "off":
             print("[warn] --urls mode cannot read server logs; skipping the config fingerprint check")
+        if args.zigzag_check != "off":
+            print("[warn] --urls mode cannot read server logs; skipping the zigzag activation check")
         results = collect_from_urls(args, names, cases)
+        runtimes: dict[str, dict[str, bool]] = {}
     else:
-        results = collect_sequential(args, names, cases, out_dir, log_dir)
+        results, runtimes = collect_sequential(args, names, cases, out_dir, log_dir)
     if args.dry_run:
         return 0
 
@@ -948,7 +988,7 @@ def run(args: argparse.Namespace) -> int:
         summaries.append(summary)
         for metrics in summary.get("metrics", []):
             print_metrics(metrics)
-    summary_payload = {"noise": noise, "cases": summaries}
+    summary_payload = {"noise": noise, "runtime": runtimes, "cases": summaries}
     (out_dir / "summary.json").write_text(json.dumps(summary_payload, ensure_ascii=False, indent=2))
     print(f"[done] results in {out_dir}")
     return 0
@@ -987,6 +1027,12 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--env", action="append", default=[], metavar="K=V", help="extra env override")
     parser.add_argument("--repeat-a", action="store_true", help="run A twice as A2 for the noise floor")
     parser.add_argument("--config-check", choices=("off", "warn", "strict"), default="warn")
+    parser.add_argument(
+        "--zigzag-check",
+        choices=("off", "warn", "strict"),
+        default="warn",
+        help="check the C server log for the zigzag activation marker",
+    )
     parser.add_argument(
         "--preflight",
         action="store_true",

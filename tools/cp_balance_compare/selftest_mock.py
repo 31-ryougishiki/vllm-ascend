@@ -163,6 +163,23 @@ def _bash_usable() -> bool:
         return False
 
 
+def test_zigzag_state_from_log() -> None:
+    out = _temp_dir("cp_ab_zigzag_log_")
+    try:
+        log = out / "server_C.log"
+        log.write_text("no marker here\n")
+        assert driver.zigzag_state_from_log(log) == {"metadata": False, "forward": False}
+        log.write_text(
+            "[CP_BALANCE] metadata zigzag=1 rank=0 cp_size=8 num_tokens_pad=2064\n"
+            "[CP_BALANCE] forward zigzag_active=1 num_tokens=2064 local_tokens=258\n"
+        )
+        assert driver.zigzag_state_from_log(log) == {"metadata": True, "forward": True}
+        missing = driver.zigzag_state_from_log(out / "missing.log")
+        assert missing == {"metadata": False, "forward": False}
+    finally:
+        shutil.rmtree(out, ignore_errors=True)
+
+
 def test_preflight_logic_with_stubbed_launcher() -> None:
     """--preflight compares the launcher fingerprint against the expected config."""
 

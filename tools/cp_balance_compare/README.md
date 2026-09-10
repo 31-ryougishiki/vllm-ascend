@@ -189,9 +189,27 @@ python tools/cp_balance_compare/ab_cp_compare.py \
 | `block@first_div_C-B` | 该位置属于 `rankX/prev|next(bstart-bend)` | 直接指向某个 rank 的某段，例如 `rank0/next(b1024-1280)` |
 | `gen_top1%C~B` | 首生成 token 的 top-1 是否一致 | 判断问题在 prefill 主体还是模型出口/gather |
 
+`summary.json` 顶层的 `runtime` 记录每个配置的运行时证据：
+
+```json
+"runtime": {
+  "C": {"metadata": true, "forward": true},
+  "B": {"metadata": false, "forward": false}
+}
+```
+
+- `metadata=true`：`AscendSFAMetadataBuilder` 真的构建了 zigzag metadata；
+- `forward=true`：`set_ascend_forward_context` 真的把 `zigzag_cp_active` 置为 1；
+- 两个标记由 `VLLM_ASCEND_CP_BALANCE_DEBUG_LOG=1`（driver 自动为 A/B/C 导出）
+  触发的 `[CP_BALANCE]` 日志产生，默认关闭，对正常推理没有影响。
+
+配合 `--zigzag-check strict` 使用：如果 C 没有打出 forward 标记，driver 直接报错，
+避免"C 其实静默回退到连续路径、却因为 C-B 一致被误判成修复成功"。
+
 终端会直接打印一行汇总：
 
 ```text
+[runtime] C: metadata_zigzag=True forward_zigzag=True
 [single_L4096.0] len=4096 top1% B~A=100.00 C~B=99.98 C~A=99.98 |
   p99|d| B-A=8.1e-04 C-B=1.2e-03 C-A=1.7e-03 |
   first_div C-B=3073 @ rank2/prev(b3072-3328) gen_top1% C~B=1
@@ -206,7 +224,8 @@ pytest tools/cp_balance_compare/selftest_mock.py -q
 ```
 
 自测覆盖：token-id / 文本 prompt、`prompt_logprobs` 兜底解析、配置指纹校验（OK /
-mismatch / 缺失）、JSONL 解析、以及 mock server 下的完整 A/B/C/A2 端到端流程。
+mismatch / 缺失）、zigzag 激活日志解析、`--preflight` 逻辑与真实 bash launcher、
+JSONL 解析、以及 mock server 下的完整 A/B/C/A2 端到端流程。
 
 也可以手动起 mock server 调 driver：
 
@@ -226,7 +245,9 @@ python tools/cp_balance_compare/ab_cp_compare.py \
   cp_balance 必须看 `C-B`；
 - **top-1 在近似并列时会翻转**：同时看 `top5_ovl%`；
 - **超长 prompt 响应很大**（100k × 20 条 logprob）：建议对比时控制在 8k 以内；
-- **`C-B` 与 `A2-A` 同量级时不要下结论**：那只是不同的 reduce / 量化顺序；
+- **`C-B` 与 `A2-A` 同量级时不要下结论**：先看 `summary.json` 的
+  `runtime.C.forward`；只有它 `true` 才说明 C 真的走了 zigzag（可加
+  `--zigzag-check strict` 强制校验）；
 - driver 只做 prefill 对比，不覆盖 decode / PD 传输。
 
 ## 6. 相关代码

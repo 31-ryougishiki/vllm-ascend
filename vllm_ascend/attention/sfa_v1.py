@@ -24,6 +24,7 @@ from vllm.v1.kv_cache_interface import AttentionSpec
 from vllm.v1.utils import record_function_or_nullcontext
 from vllm.v1.worker.utils import select_common_block_size
 
+from vllm_ascend import envs as ascend_envs
 from vllm_ascend.ascend_config import get_ascend_config
 from vllm_ascend.ascend_forward_context import _EXTRA_CTX
 from vllm_ascend.attention.attention_mask import AttentionMaskBuilder
@@ -732,6 +733,21 @@ class AscendSFAMetadataBuilder(MLACommonMetadataBuilder[AscendSFAMetadata]):
                 block_table_zigzag = torch.cat([block_table, block_table], dim=0)
             else:
                 block_table_zigzag = None
+
+            if zigzag is not None and ascend_envs.VLLM_ASCEND_CP_BALANCE_DEBUG_LOG:
+                # Runtime proof for tools/cp_balance_compare: the zigzag metadata
+                # was really built for this batch (not silently falling back to
+                # the continuous-slice path).
+                logger.info_once(
+                    "[CP_BALANCE] metadata zigzag=1 rank=%s cp_size=%s "
+                    "num_tokens_pad=%s num_actual_tokens=%s num_reqs=%s local_tokens=%s",
+                    get_tp_group().rank_in_group,
+                    global_tp_size,
+                    num_tokens_pad,
+                    num_actual_tokens,
+                    num_reqs,
+                    zigzag["zigzag_index"].shape[0],
+                )
 
             if zigzag is not None:
                 # Position-based rotary lookup: cos[zigzag_index] on the

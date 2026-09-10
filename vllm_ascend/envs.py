@@ -95,6 +95,13 @@ env_variables: dict[str, Callable[[], Any]] = {
     "VLLM_ASCEND_CP_BALANCE_EMBED_LOCAL": lambda: bool(
         int(os.getenv("VLLM_ASCEND_CP_BALANCE_EMBED_LOCAL", "0"))
     ),
+    # Debug switch for tools/cp_balance_compare: log once per process when the
+    # zigzag CP metadata is built and when the forward context activates it.
+    # This is how the A/B/C driver proves that configuration C did not silently
+    # fall back to the continuous-slice path.
+    "VLLM_ASCEND_CP_BALANCE_DEBUG_LOG": lambda: bool(
+        int(os.getenv("VLLM_ASCEND_CP_BALANCE_DEBUG_LOG", "0"))
+    ),
     # Whether to enable weight cast format to FRACTAL_NZ.
     # 0: close nz;
     # 1: only quant case enable nz;
