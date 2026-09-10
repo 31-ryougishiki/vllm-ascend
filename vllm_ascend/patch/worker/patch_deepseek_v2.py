@@ -37,6 +37,7 @@ from vllm.model_executor.models.deepseek_v2 import (
 from vllm.model_executor.models.utils import extract_layer_index
 from vllm.sequence import IntermediateTensors
 
+from vllm_ascend import envs as ascend_envs
 from vllm_ascend.layers.cp_zigzag import (
     zigzag_shard_positions,
     zigzag_shard_tensor,
@@ -320,7 +321,11 @@ def _patched_forward(
     zigzag_active = bool(_EXTRA_CTX.zigzag_cp_active)
 
     hidden_is_zigzag_local = False
-    use_embed_local = zigzag_active and hasattr(self.embed_tokens, "forward_zigzag_local")
+    use_embed_local = (
+        zigzag_active
+        and ascend_envs.VLLM_ASCEND_CP_BALANCE_EMBED_LOCAL
+        and hasattr(self.embed_tokens, "forward_zigzag_local")
+    )
     tp_size = get_tensor_model_parallel_world_size()
     tp_rank = get_tp_group().rank_in_group
     expected_local_tokens = positions.shape[0] // tp_size if zigzag_active else None
@@ -332,20 +337,19 @@ def _patched_forward(
             if input_ids is None:
                 raise ValueError("Either input_ids or inputs_embeds must be provided to DeepseekV2Model.forward")
             if use_embed_local:
-                # Optimal path: shard token ids first, then embed only the
-                # rank-local zigzag rows.  AscendVocabParallelEmbedding
-                # computes the vocab-shard partial for those local rows and
-                # all-reduces them locally, avoiding the full-token embedding
-                # lookup and the FlashComm reduce_scatter + all_gather pair.
-                local_input_ids = zigzag_shard_tensor(input_ids)
-                if local_input_ids.shape[0] != expected_local_tokens:
+                # Experimental path (VLLM_ASCEND_CP_BALANCE_EMBED_LOCAL=1):
+                # every rank feeds the same full SP-padded token ids to the
+                # vocab-parallel embedding, which all-reduces the sharded
+                # partials into complete embeddings and returns only this
+                # rank's zigzag rows.  Never pass the rank-local ids here: the
+                # TP all-reduce would sum embeddings of different tokens.
+                if input_ids.shape[0] != positions.shape[0]:
                     raise RuntimeError(
                         f"[CP_BALANCE][EMBED] rank={tp_rank} zigzag "
-                        f"input_ids shard shape {tuple(local_input_ids.shape)} "
-                        f"!= expected {expected_local_tokens} "
-                        f"(positions={tuple(positions.shape)}, tp={tp_size})"
+                        f"input_ids shape {tuple(input_ids.shape)} is not the "
+                        f"full padded stream {tuple(positions.shape)}"
                     )
-                hidden_states = self.embed_tokens.forward_zigzag_local(local_input_ids)
+                hidden_states = self.embed_tokens.forward_zigzag_local(input_ids)
                 hidden_is_zigzag_local = True
             else:
                 hidden_states = self.embed_input_ids(input_ids)

@@ -88,6 +88,13 @@ env_variables: dict[str, Callable[[], Any]] = {
     # kernel launches cost more than the attention imbalance they save. Tune
     # this on the target hardware: 8192 is a conservative default.
     "VLLM_ASCEND_CP_BALANCE_MIN_TOKENS": lambda: int(os.getenv("VLLM_ASCEND_CP_BALANCE_MIN_TOKENS", "8192")),
+    # Experimental A/B knob for the zigzag embedding entry. Disabled by
+    # default: 0 uses the validated model-boundary fallback (full embedding ->
+    # all-gather -> zigzag shard), 1 lets the vocab-parallel embedding consume
+    # the full token ids and return only the rank-local zigzag rows.
+    "VLLM_ASCEND_CP_BALANCE_EMBED_LOCAL": lambda: bool(
+        int(os.getenv("VLLM_ASCEND_CP_BALANCE_EMBED_LOCAL", "0"))
+    ),
     # Whether to enable weight cast format to FRACTAL_NZ.
     # 0: close nz;
     # 1: only quant case enable nz;

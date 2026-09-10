@@ -170,21 +170,35 @@ class AscendVocabParallelEmbedding(VocabParallelEmbedding):
     def forward_zigzag_local(self, input_):
         """Embedding entry for model-level zigzag CP.
 
-        ``input_`` is already the rank-local ``[prev_blocks, next_blocks]``
-        token-id tensor (length ``num_tokens_pad / tp_size``).  Each rank
-        computes only its local rows for its vocab shard and then all-reduces
-        the local partial embeddings across TP.  This avoids the
-        FlashComm/SP embedding path's full-token lookup + reduce_scatter,
-        which would first shrink the tensor to a continuous local slice and
-        then require an all-gather + advanced index to recover the zigzag
-        layout.
+        ``input_`` is the full SP-padded natural-order token-id stream (the
+        same rows on every TP rank).  Each rank computes the partial embedding
+        of its own vocabulary shard for these rows, the TP all-reduce turns
+        them into the complete per-row embeddings, and only this rank's local
+        ``[prev_blocks, next_blocks]`` zigzag rows are returned.
+
+        The full row set is mandatory for correctness: the embedding weight is
+        sharded across TP, so an all-reduce only reconstructs the complete
+        embedding when every rank contributes the partials of the *same* token
+        ids.  Feeding rank-local ids (different tokens on every rank) into the
+        lookup and all-reducing would sum embeddings of different tokens.
+
+        Compared with the model-boundary fallback (full embedding followed by
+        all-gather + ``zigzag_shard_tensor``) this trades the hidden-state
+        all-gather for a TP all-reduce of the full hidden states, so it is
+        kept behind the ``VLLM_ASCEND_CP_BALANCE_EMBED_LOCAL`` switch.
         """
         if self.forward_type == "embed_tp":
             raise NotImplementedError(
                 "forward_zigzag_local is not supported together with "
                 "fine-grained embedding TP"
             )
-        return self._forward_origin(input_, already_sequence_parallel=True)
+        from vllm_ascend.layers.cp_zigzag import zigzag_shard_tensor
+
+        if self.tp_size == 1:
+            # Zigzag CP requires cp_size > 1, so this is only a safety net.
+            return self._forward_origin(input_)
+        output = tensor_model_parallel_all_reduce(self._embed_partial(input_))
+        return zigzag_shard_tensor(output)
 
     def _forward_embed_tp(self, input_):
         num_tokens = input_.shape[0]
@@ -245,7 +259,8 @@ class AscendVocabParallelEmbedding(VocabParallelEmbedding):
         # Strip padding rows; preserve the original return shape.
         return self._embed_rs_out_buf[:num_tokens].view(num_tokens, -1)
 
-    def _forward_origin(self, input_, already_sequence_parallel: bool = False):
+    def _embed_partial(self, input_):
+        """Look up this rank's vocabulary shard for ``input_`` (no TP reduce)."""
         if self.tp_size > 1:
             # Build the mask.
             masked_input, input_mask = self._mask_input_for_vocab_range(
@@ -263,16 +278,13 @@ class AscendVocabParallelEmbedding(VocabParallelEmbedding):
         # Mask the output embedding.
         if self.tp_size > 1:
             output_parallel.masked_fill_(input_mask.unsqueeze(-1), 0)
-        if already_sequence_parallel:
-            # The input rows are already the rank-local sequence shard, so the
-            # partial vocab-shard embeddings only need an all-reduce to become
-            # the complete per-row embeddings.  Do NOT reduce-scatter here:
-            # that would shrink the token dimension a second time.
-            output = tensor_model_parallel_all_reduce(output_parallel)
-        else:
-            # Reduce across all the model parallel GPUs (SP reduces/scatters
-            # the token dimension under FlashComm).
-            output = torch.ops.vllm.maybe_pad_and_reduce(output_parallel)
+        return output_parallel
+
+    def _forward_origin(self, input_):
+        output_parallel = self._embed_partial(input_)
+        # Reduce across all the model parallel GPUs (SP reduces/scatters the
+        # token dimension under FlashComm).
+        output = torch.ops.vllm.maybe_pad_and_reduce(output_parallel)
         return output
 
 

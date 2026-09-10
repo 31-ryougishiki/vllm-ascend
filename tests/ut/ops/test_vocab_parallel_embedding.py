@@ -201,6 +201,52 @@ class TestCustomVocabParallelEmbedding(unittest.TestCase):
                     output = layer.forward(input_)
                 self.assertEqual(output.shape, expected_shape)
 
+    def test_forward_zigzag_local_reduces_the_full_row_set(self):
+        """The zigzag embedding entry must reduce partials of the same rows.
+
+        The embedding weight is vocab-sharded across TP, so a TP all-reduce
+        only reconstructs complete embeddings when every rank contributes the
+        partials of the *same* token ids.  Passing the rank-local zigzag rows
+        and all-reducing sums embeddings of different tokens; therefore the
+        lookup/reduction must run on the full SP-padded row set and only the
+        final shard may be rank-local.
+        """
+        layer = self._create_layer()
+        layer.tp_size = 2
+
+        # Full SP-padded natural-order token ids (same on every TP rank).
+        full_input_ids = torch.tensor([15, 35, 25, 45])
+        embedding_inputs = []
+
+        def fake_embedding(_, x):
+            embedding_inputs.append(tuple(x.shape))
+            return torch.arange(
+                x.shape[0] * layer.embedding_dim, dtype=torch.float32
+            ).view(x.shape[0], layer.embedding_dim)
+
+        layer.quant_method.embedding = MagicMock(side_effect=fake_embedding)
+        reduced_shapes = []
+
+        with (
+            patch(
+                "vllm_ascend.ops.vocab_parallel_embedding.tensor_model_parallel_all_reduce",
+                side_effect=lambda x: (reduced_shapes.append(tuple(x.shape)), x)[1],
+            ) as mock_all_reduce,
+            patch(
+                "vllm_ascend.layers.cp_zigzag.zigzag_shard_tensor",
+                side_effect=lambda x: x[:2].clone(),
+            ) as mock_shard,
+        ):
+            output = layer.forward_zigzag_local(full_input_ids)
+
+        # Lookup and reduction cover all four rows, never the local two-row
+        # subset that the broken variant would have used.
+        self.assertEqual(embedding_inputs, [(4,)])
+        self.assertEqual(reduced_shapes, [(4, layer.embedding_dim)])
+        mock_all_reduce.assert_called_once()
+        mock_shard.assert_called_once()
+        self.assertEqual(output.shape, (2, layer.embedding_dim))
+
 
 class TestAscendLogitsProcessor(unittest.TestCase):
     def setUp(self):
