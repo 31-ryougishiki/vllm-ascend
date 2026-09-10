@@ -39,13 +39,15 @@ port="${1:-8034}"
 : "${MODEL_PATH:?set MODEL_PATH to the checkpoint directory}"
 
 # Optional site specific environment (e.g. HCCL ifnames, vendor set_env.bash).
+# Site rc files are not written for `set -u` (e.g. /etc/bashrc reads
+# BASHRCSOURCED unguarded), so relax `-u` while sourcing and restore it after.
 if [ -n "${PRE_LAUNCH_SCRIPT:-}" ] && [ -f "${PRE_LAUNCH_SCRIPT}" ]; then
   # shellcheck disable=SC1090
-  source "${PRE_LAUNCH_SCRIPT}"
+  set +u; source "${PRE_LAUNCH_SCRIPT}"; set -u
 fi
 if [ -f /root/.bashrc ]; then
   # shellcheck disable=SC1091
-  source /root/.bashrc
+  set +u; source /root/.bashrc; set -u
 fi
 
 export VLLM_ASCEND_ENABLE_FLASHCOMM1="${VLLM_ASCEND_ENABLE_FLASHCOMM1:-1}"

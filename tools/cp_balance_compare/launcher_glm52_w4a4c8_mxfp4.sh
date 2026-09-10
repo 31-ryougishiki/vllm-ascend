@@ -45,7 +45,9 @@ unset https_proxy HTTPS_PROXY
 unset http_proxy HTTP_PROXY
 if [ -f /root/.bashrc ]; then
   # shellcheck disable=SC1091
-  source /root/.bashrc
+  # Site rc files are not written for `set -u` (e.g. /etc/bashrc reads
+  # BASHRCSOURCED unguarded): relax -u while sourcing, restore it after.
+  set +u; source /root/.bashrc; set -u
 fi
 export PROMETHEUS_MULTIPROC_DIR=/dev/shm/vllm_metrics
 mkdir -p "${PROMETHEUS_MULTIPROC_DIR}"
@@ -81,7 +83,8 @@ export ASCEND_PROCESS_LOG_PATH="${plog_dir}"
 export VLLM_USE_FASTOKENS="${VLLM_USE_FASTOKENS:-1}"
 if [ -f "${VENDOR_SET_ENV}" ]; then
   # shellcheck disable=SC1090
-  source "${VENDOR_SET_ENV}"
+  # Vendor setup scripts may also reference unset variables.
+  set +u; source "${VENDOR_SET_ENV}"; set -u
 fi
 
 export VLLM_DISABLE_COMPILE_CACHE=1
