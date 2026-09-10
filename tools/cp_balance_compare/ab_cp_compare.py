@@ -782,6 +782,69 @@ def parse_urls(spec: str) -> dict[str, str]:
     return urls
 
 
+def _launcher_dry_run(args: argparse.Namespace, name: str, timeout: float = 60.0):
+    """Run the launcher with DRY_RUN=1 and return (rc, stdout, stderr)."""
+    env = os.environ.copy()
+    env.update(config_env(name, args))
+    env["DRY_RUN"] = "1"
+    cmd = args.launcher.format(port=args.base_port)
+    proc = subprocess.Popen(
+        ["bash", "-lc", cmd],
+        cwd=args.repo_root,
+        env=env,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+        start_new_session=True,
+    )
+    try:
+        out, err = proc.communicate(timeout=timeout)
+        return proc.returncode, out, err
+    except subprocess.TimeoutExpired:
+        # The launcher ignores DRY_RUN and started a real server: kill the group.
+        try:
+            os.killpg(os.getpgid(proc.pid), signal.SIGTERM)
+        except ProcessLookupError:
+            pass
+        try:
+            out, err = proc.communicate(timeout=20)
+        except subprocess.TimeoutExpired:
+            try:
+                os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
+            except ProcessLookupError:
+                pass
+            out, err = proc.communicate(timeout=20)
+        return None, out, err
+
+
+def preflight(args: argparse.Namespace, names: list[str]) -> int:
+    """Validate launcher / env / fingerprint for every config without a model load."""
+    failed = []
+    for name in names:
+        rc, out, err = _launcher_dry_run(args, name)
+        line = next((item for item in out.splitlines() if FINGERPRINT_PREFIX in item), None)
+        actual = parse_fingerprint(line) if line else {}
+        expected = expected_fingerprint(name, args)
+        if rc is None:
+            status = "FAILED (launcher ignored DRY_RUN; add DRY_RUN support)"
+        elif rc != 0:
+            last_err = err.strip().splitlines()[-1] if err.strip() else ""
+            status = f"FAILED (rc={rc}) {last_err}"
+        elif actual != expected:
+            status = f"FAILED fingerprint expected={expected} actual={actual}"
+        else:
+            status = "OK"
+        if status != "OK":
+            failed.append(name)
+        dry_line = next((item for item in out.splitlines() if "dry-run" in item), "")
+        print(f"[preflight] {name}: {status} {dry_line}".rstrip())
+    if failed:
+        print(f"[preflight] FAILED configs: {failed}")
+        return 1
+    print("[preflight] all configs OK (env overrides + fingerprint + vllm/model path reachable)")
+    return 0
+
+
 def print_metrics(metrics: dict[str, Any]) -> None:
     def get(key, default=float("nan")):
         return metrics.get(key, default)
@@ -830,12 +893,16 @@ def collect_sequential(args, names, cases, out_dir, log_dir):
                 state = "exited" if proc is not None and proc.poll() is not None else "not ready"
                 print(f"[error] {name} server {state}; log tail:\n{tail(log_path)}")
                 raise SystemExit(1)
-            verify_config(name, args, log_path)
+            try:
+                verify_config(name, args, log_path)
+            except RuntimeError as exc:
+                print(f"[error] {exc}")
+                raise SystemExit(1)
             print(f"[query] {name} -> {url}")
             results[name] = query_all(url, args, cases)
             (out_dir / f"results_{name}.json").write_text(json.dumps(results[name], ensure_ascii=False))
         finally:
-            stop_server(proc, log)
+            stop_server(proc, log, args.restart_wait)
     return results
 
 
@@ -852,6 +919,10 @@ def collect_from_urls(args, names, cases):
 
 
 def run(args: argparse.Namespace) -> int:
+    names = ["A", "B", "C"] + (["A2"] if args.repeat_a else [])
+    if args.preflight:
+        return preflight(args, names)
+
     out_dir = Path(args.out)
     out_dir.mkdir(parents=True, exist_ok=True)
     log_dir = out_dir / "logs"
@@ -859,7 +930,6 @@ def run(args: argparse.Namespace) -> int:
 
     cases = build_cases(args)
     print(f"[cases] {[case[0] for case in cases]}")
-    names = ["A", "B", "C"] + (["A2"] if args.repeat_a else [])
 
     if args.urls:
         if args.config_check != "off":
@@ -917,6 +987,17 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--env", action="append", default=[], metavar="K=V", help="extra env override")
     parser.add_argument("--repeat-a", action="store_true", help="run A twice as A2 for the noise floor")
     parser.add_argument("--config-check", choices=("off", "warn", "strict"), default="warn")
+    parser.add_argument(
+        "--preflight",
+        action="store_true",
+        help="only validate launcher/env/fingerprint with DRY_RUN=1 (no model load)",
+    )
+    parser.add_argument(
+        "--restart-wait",
+        type=float,
+        default=30.0,
+        help="seconds to wait after killing a server before launching the next one",
+    )
     parser.add_argument("--startup-timeout", type=float, default=3600)
     parser.add_argument("--http-timeout", type=float, default=900)
     parser.add_argument("--http-retries", type=int, default=3)

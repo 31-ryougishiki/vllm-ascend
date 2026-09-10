@@ -44,6 +44,14 @@ cd /home/z30055003/vllm-ascend
 # 0) 先在节点上自检 driver（不需要 NPU）
 python tools/cp_balance_compare/selftest_mock.py
 
+# 0.5) preflight：用 DRY_RUN 校验 launcher/env/指纹/vllm/模型路径，不加载模型
+python tools/cp_balance_compare/ab_cp_compare.py \
+  --preflight \
+  --repo-root /home/z30055003/vllm-ascend \
+  --launcher "bash tools/cp_balance_compare/launcher_glm52_w4a4c8_mxfp4.sh x {port}" \
+  --no-kv-connector
+# 期望输出：[preflight] A: OK ... [preflight] all configs OK
+
 # 1) A/B/C + A/A 噪声底。默认关 MTP、关 PD connector，先隔离变量
 python tools/cp_balance_compare/ab_cp_compare.py \
   --out /dev/shm/cp_ab \
@@ -52,7 +60,8 @@ python tools/cp_balance_compare/ab_cp_compare.py \
   --config-check strict \
   --prompt-lens 2048,2049,4096 \
   --multi-lens "2048,2048;3000,1500" \
-  --repeat-a
+  --repeat-a \
+  --no-kv-connector
 
 # 2) 结果、曲线、CSV
 ls /dev/shm/cp_ab
@@ -72,6 +81,13 @@ python tools/cp_balance_compare/ab_cp_compare.py \
 一轮 A/B/C 的耗时 ≈ 4 次模型加载 + 采集；`--max-num-batched-tokens 16384` 下
 `--prompt-lens 2048,2049,4096`、`--multi-lens "2048,2048;3000,1500"` 都能一次装下。
 先用 `--prompt-lens 2048,2049 --repeat-a` 快速跑一轮定位，再扩长度。
+
+单节点顺序拉起时，driver 杀掉上一个 server 后会等待 `--restart-wait`（默认 30s）再起下一个。
+如果看到某个配置 `server exited`（通常是 HCCL/HBM 还没释放），把等待时间加大即可：
+
+```bash
+python tools/cp_balance_compare/ab_cp_compare.py ... --restart-wait 90
+```
 
 ### 2.2 复用自己的启动脚本
 

@@ -28,6 +28,7 @@ import importlib.util
 import io
 import json
 import shutil
+import subprocess
 import sys
 from contextlib import redirect_stdout
 from pathlib import Path
@@ -147,6 +148,100 @@ def test_load_prompts_file() -> None:
         json_array = out / "prompts.json"
         json_array.write_text(json.dumps([{"case": "a", "prompt": "x"}]))
         assert driver.load_prompts_file(str(json_array)) == [("a", ["x"])]
+    finally:
+        shutil.rmtree(out, ignore_errors=True)
+
+
+def _bash_usable() -> bool:
+    if shutil.which("bash") is None:
+        return False
+    try:
+        probe = subprocess.run(["bash", "-c", "exit 0"], capture_output=True, timeout=20)
+        return probe.returncode == 0
+    except (OSError, subprocess.SubprocessError):
+        # Sandboxed dev hosts can block subprocess/named-pipe creation.
+        return False
+
+
+def test_preflight_logic_with_stubbed_launcher() -> None:
+    """--preflight compares the launcher fingerprint against the expected config."""
+
+    def make_dry_run(flip: bool):
+        def _dry_run(args, name, timeout=60.0):
+            fingerprint = dict(driver.expected_fingerprint(name, args))
+            if flip:
+                fingerprint["CP_BALANCE"] = 1 - fingerprint["CP_BALANCE"]
+            line = "[cp-ab] " + " ".join(f"{key}={value}" for key, value in fingerprint.items())
+            return 0, line + "\n[cp-ab][dry-run] OK\n", ""
+
+        return _dry_run
+
+    out = _temp_dir("cp_ab_preflight_logic_")
+    try:
+        argv = ["--out", str(out / "results"), "--preflight"]
+        original = driver._launcher_dry_run
+        try:
+            driver._launcher_dry_run = make_dry_run(flip=False)
+            captured = io.StringIO()
+            with redirect_stdout(captured):
+                rc = driver.run(driver.parse_args(argv))
+            assert rc == 0, captured.getvalue()
+
+            driver._launcher_dry_run = make_dry_run(flip=True)
+            captured = io.StringIO()
+            with redirect_stdout(captured):
+                rc = driver.run(driver.parse_args(argv))
+            assert rc == 1, captured.getvalue()
+        finally:
+            driver._launcher_dry_run = original
+    finally:
+        shutil.rmtree(out, ignore_errors=True)
+
+
+def test_preflight_with_fake_launcher() -> None:
+    if not _bash_usable():
+        print("[skip] bash not usable on this host")
+        return
+    import shlex
+
+    out = _temp_dir("cp_ab_preflight_")
+    try:
+        launcher = out / "fake_launcher.sh"
+        launcher.write_text(
+            "\n".join(
+                [
+                    "#!/usr/bin/env bash",
+                    "dsa=1",
+                    "if printf '%s' \"$VLLM_ASCEND_ADDITIONAL_CONFIG\" | "
+                    "grep -q '\"enable_dsa_cp\": false'; then dsa=0; fi",
+                    "spec=0",
+                    "if [ -n \"$VLLM_ASCEND_SPEC_CONFIG\" ]; then spec=1; fi",
+                    "kv=0",
+                    "if [ -n \"$VLLM_ASCEND_KV_TRANSFER_CONFIG\" ]; then kv=1; fi",
+                    "echo \"[cp-ab] CP_BALANCE=${VLLM_ASCEND_CP_BALANCE} DSA_CP=${dsa} "
+                    "EMBED_LOCAL=${VLLM_ASCEND_CP_BALANCE_EMBED_LOCAL} SPEC=${spec} KV=${kv}\"",
+                    "if [ -n \"${DRY_RUN:-}\" ]; then echo '[cp-ab][dry-run] OK'; exit 0; fi",
+                    "echo 'should not reach here' >&2; exit 9",
+                ]
+            )
+            + "\n"
+        )
+        args = driver.parse_args(
+            [
+                "--out",
+                str(out / "results"),
+                "--launcher",
+                f"bash {shlex.quote(launcher.as_posix())} {{port}}",
+                "--preflight",
+            ]
+        )
+        captured = io.StringIO()
+        with redirect_stdout(captured):
+            rc = driver.run(args)
+        text = captured.getvalue()
+        assert rc == 0, text
+        assert text.count("[preflight]") >= 3, text
+        assert "FAILED" not in text, text
     finally:
         shutil.rmtree(out, ignore_errors=True)
 
