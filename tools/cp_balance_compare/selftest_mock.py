@@ -192,6 +192,38 @@ def test_compare_case_with_subset_of_configs() -> None:
         shutil.rmtree(out, ignore_errors=True)
 
 
+def test_verify_config_checks_additional_config() -> None:
+    out = _temp_dir("cp_ab_cfg_")
+    try:
+        strict = driver.parse_args(["--out", str(out), "--config-check", "strict"])
+        log = out / "server_C.log"
+        flags = driver.expected_fingerprint("C", strict)
+        flag_line = "[cp-ab] " + " ".join(f"{key}={value}" for key, value in flags.items()) + "\n"
+
+        cfg_ok = json.dumps(driver.expected_additional_config("C", strict), ensure_ascii=False)
+        log.write_text(flag_line + f"[cp-ab-cfg] {cfg_ok}\n")
+        assert driver.verify_config("C", strict, log)
+
+        log.write_text(flag_line + '[cp-ab-cfg] {"enable_dsa_cp": false}\n')
+        _expect_runtime_error(lambda: driver.verify_config("C", strict, log))
+
+        # Old launchers without the cfg line stay compatible: flags only.
+        log.write_text(flag_line)
+        assert driver.verify_config("C", strict, log)
+    finally:
+        shutil.rmtree(out, ignore_errors=True)
+
+
+def test_base_additional_config_has_no_pd_only_knobs() -> None:
+    assert "recompute_scheduler_enable" not in driver.BASE_ADDITIONAL_CONFIG
+    args = driver.parse_args(
+        ["--out", "/tmp/cp_ab_cfg_extra", "--extra-additional-config", '{"recompute_scheduler_enable": true}']
+    )
+    merged = json.loads(driver.resolved_config("C", args)["VLLM_ASCEND_ADDITIONAL_CONFIG"])
+    assert merged["recompute_scheduler_enable"] is True
+    assert merged["enable_dsa_cp"] is True
+
+
 def test_zigzag_state_from_log() -> None:
     out = _temp_dir("cp_ab_zigzag_log_")
     try:
@@ -266,6 +298,7 @@ def test_preflight_with_fake_launcher() -> None:
                     "if [ -n \"$VLLM_ASCEND_KV_TRANSFER_CONFIG\" ]; then kv=1; fi",
                     "echo \"[cp-ab] CP_BALANCE=${VLLM_ASCEND_CP_BALANCE} DSA_CP=${dsa} "
                     "EMBED_LOCAL=${VLLM_ASCEND_CP_BALANCE_EMBED_LOCAL} SPEC=${spec} KV=${kv}\"",
+                    "echo \"[cp-ab-cfg] ${VLLM_ASCEND_ADDITIONAL_CONFIG}\"",
                     "if [ -n \"${DRY_RUN:-}\" ]; then echo '[cp-ab][dry-run] OK'; exit 0; fi",
                     "echo 'should not reach here' >&2; exit 9",
                 ]

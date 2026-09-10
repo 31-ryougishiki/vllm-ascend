@@ -53,7 +53,10 @@ export VLLM_ASCEND_CP_BALANCE="${VLLM_ASCEND_CP_BALANCE:-1}"
 export VLLM_ASCEND_CP_BALANCE_MIN_TOKENS="${VLLM_ASCEND_CP_BALANCE_MIN_TOKENS:-2048}"
 export VLLM_ASCEND_CP_BALANCE_EMBED_LOCAL="${VLLM_ASCEND_CP_BALANCE_EMBED_LOCAL:-0}"
 
-DEFAULT_ADDITIONAL_CONFIG='{"enable_cpu_binding": "True", "multistream_overlap_shared_expert": "True", "recompute_scheduler_enable": "True", "enable_sparse_sfa_c8": true, "enable_sparse_li_c8": true, "enable_dsa_cp": true}'
+# NOTE: no PD-only knobs here. `recompute_scheduler_enable=true` is rejected by
+# vllm_ascend.platform unless kv_role='kv_consumer', and the A/B/C comparison by
+# default runs without the PD connector.
+DEFAULT_ADDITIONAL_CONFIG='{"enable_cpu_binding": "True", "multistream_overlap_shared_expert": "True", "enable_sparse_sfa_c8": true, "enable_sparse_li_c8": true, "enable_dsa_cp": true}'
 additional_config="${VLLM_ASCEND_ADDITIONAL_CONFIG:-${DEFAULT_ADDITIONAL_CONFIG}}"
 spec_config="${VLLM_ASCEND_SPEC_CONFIG-}"
 kv_config="${VLLM_ASCEND_KV_TRANSFER_CONFIG-}"
@@ -80,6 +83,8 @@ if [ -n "${spec_config}" ]; then spec_flag=1; fi
 kv_flag=0
 if [ -n "${kv_config}" ]; then kv_flag=1; fi
 echo "[cp-ab] CP_BALANCE=${VLLM_ASCEND_CP_BALANCE} DSA_CP=${dsa_cp} EMBED_LOCAL=${VLLM_ASCEND_CP_BALANCE_EMBED_LOCAL} SPEC=${spec_flag} KV=${kv_flag}"
+# Effective additional_config, verified verbatim by ab_cp_compare.py --config-check.
+echo "[cp-ab-cfg] ${additional_config}"
 
 # DRY_RUN=1: validate the environment without touching the NPUs (used by
 # `ab_cp_compare.py --preflight`).

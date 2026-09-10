@@ -82,15 +82,20 @@ except ImportError:  # pragma: no cover
 
 
 FINGERPRINT_PREFIX = "[cp-ab]"
+CFG_JSON_PREFIX = "[cp-ab-cfg]"
 ZIGZAG_MARKERS = {
     "metadata": "[CP_BALANCE] metadata zigzag=1",
     "forward": "[CP_BALANCE] forward zigzag_active=1",
 }
 
+# Minimal, self-consistent additional_config for a single PD-less prefill node.
+# PD-only knobs must not be set here: `recompute_scheduler_enable=true` is
+# rejected by vllm_ascend.platform when kv_role is not 'kv_consumer', which is
+# exactly the case when the comparison runs with --no-kv-connector.
+# Use --extra-additional-config to add or override keys per run.
 BASE_ADDITIONAL_CONFIG: dict[str, Any] = {
     "enable_cpu_binding": "True",
     "multistream_overlap_shared_expert": "True",
-    "recompute_scheduler_enable": "True",
     "enable_sparse_sfa_c8": True,
     "enable_sparse_li_c8": True,
     "enable_dsa_cp": True,
@@ -112,9 +117,17 @@ PromptCase = tuple[str, list[Prompt]]
 # --------------------------------------------------------------------------- #
 
 
-def additional_config(enable_dsa_cp: bool) -> str:
+def additional_config(enable_dsa_cp: bool, extra_json: str = "") -> str:
     cfg = dict(BASE_ADDITIONAL_CONFIG)
     cfg["enable_dsa_cp"] = enable_dsa_cp
+    if extra_json:
+        try:
+            extra = json.loads(extra_json)
+        except json.JSONDecodeError as exc:
+            raise SystemExit(f"--extra-additional-config is not valid JSON: {exc}") from exc
+        if not isinstance(extra, dict):
+            raise SystemExit("--extra-additional-config must be a JSON object")
+        cfg.update(extra)
     return json.dumps(cfg)
 
 
@@ -123,7 +136,7 @@ def resolved_config(name: str, args: argparse.Namespace) -> dict[str, str]:
     enable_dsa_cp, cp_balance = CONFIGS["A" if name == "A2" else name]
     resolved = {
         "VLLM_ASCEND_CP_BALANCE": cp_balance,
-        "VLLM_ASCEND_ADDITIONAL_CONFIG": additional_config(enable_dsa_cp),
+        "VLLM_ASCEND_ADDITIONAL_CONFIG": additional_config(enable_dsa_cp, args.extra_additional_config),
         "VLLM_ASCEND_SPEC_CONFIG": args.spec_config,
         "VLLM_ASCEND_KV_TRANSFER_CONFIG": "" if args.no_kv_connector else args.kv_transfer_config,
         "VLLM_ASCEND_CP_BALANCE_EMBED_LOCAL": args.embed_local,
@@ -134,6 +147,14 @@ def resolved_config(name: str, args: argparse.Namespace) -> dict[str, str]:
     for key, value in args.env_override:
         resolved[key] = value
     return resolved
+
+
+def expected_additional_config(name: str, args: argparse.Namespace) -> dict[str, Any]:
+    resolved = resolved_config(name, args)
+    try:
+        return json.loads(resolved["VLLM_ASCEND_ADDITIONAL_CONFIG"])
+    except json.JSONDecodeError:
+        return {"__unparsable__": resolved["VLLM_ASCEND_ADDITIONAL_CONFIG"]}
 
 
 def config_env(name: str, args: argparse.Namespace) -> dict[str, str]:
@@ -185,13 +206,33 @@ def last_fingerprint(log_path: Path) -> str | None:
     return None
 
 
+def additional_config_from_log(log_path: Path) -> dict[str, Any] | None:
+    """Parse the launcher's effective additional_config from ``[cp-ab-cfg]``."""
+    if not log_path.exists():
+        return None
+    try:
+        lines = log_path.read_text(errors="replace").splitlines()
+    except OSError:
+        return None
+    for line in reversed(lines):
+        if CFG_JSON_PREFIX in line:
+            payload = line.split(CFG_JSON_PREFIX, 1)[1].strip()
+            try:
+                parsed = json.loads(payload)
+            except json.JSONDecodeError:
+                return None
+            return parsed if isinstance(parsed, dict) else None
+    return None
+
+
 def verify_config(name: str, args: argparse.Namespace, log_path: Path) -> bool:
     """Make sure the launcher really applied this config's env overrides.
 
     A launcher that silently ignores ``VLLM_ASCEND_ADDITIONAL_CONFIG`` makes
     A/B/C all run the same configuration, which would look like a perfect
     precision match.  The launcher therefore prints a ``[cp-ab]`` fingerprint
-    line that is compared here.
+    line and a ``[cp-ab-cfg]`` line with the effective additional_config; both
+    are compared here.
     """
     if args.config_check == "off":
         return True
@@ -219,6 +260,25 @@ def verify_config(name: str, args: argparse.Namespace, log_path: Path) -> bool:
             raise RuntimeError(message)
         print(f"[warn] {message}")
         return False
+
+    expected_cfg = expected_additional_config(name, args)
+    actual_cfg = additional_config_from_log(log_path)
+    if actual_cfg is None:
+        print(
+            f"[warn] {name}: launcher did not log {CFG_JSON_PREFIX}; "
+            "additional_config content was not verified (only the 5 flags were)"
+        )
+    elif actual_cfg != expected_cfg:
+        message = (
+            f"{name} additional_config mismatch:\n"
+            f"  expected: {json.dumps(expected_cfg, ensure_ascii=False)}\n"
+            f"  launcher: {json.dumps(actual_cfg, ensure_ascii=False)}"
+        )
+        if args.config_check == "strict":
+            raise RuntimeError(message)
+        print(f"[warn] {message}")
+        return False
+
     print(f"[check] {name} fingerprint OK: {actual}")
     return True
 
@@ -864,6 +924,23 @@ def preflight(args: argparse.Namespace, names: list[str]) -> int:
         line = next((item for item in out.splitlines() if FINGERPRINT_PREFIX in item), None)
         actual = parse_fingerprint(line) if line else {}
         expected = expected_fingerprint(name, args)
+        cfg_line = next((item for item in out.splitlines() if CFG_JSON_PREFIX in item), None)
+        cfg_note = ""
+        cfg_failed = False
+        if cfg_line:
+            try:
+                actual_cfg = json.loads(cfg_line.split(CFG_JSON_PREFIX, 1)[1].strip())
+            except json.JSONDecodeError:
+                actual_cfg = None
+            expected_cfg = expected_additional_config(name, args)
+            if actual_cfg != expected_cfg:
+                cfg_failed = True
+                cfg_note = (
+                    f"additional_config mismatch: expected={json.dumps(expected_cfg, ensure_ascii=False)} "
+                    f"launcher={json.dumps(actual_cfg, ensure_ascii=False)}"
+                )
+        else:
+            cfg_note = f"(no {CFG_JSON_PREFIX} line: additional_config not verified)"
         if rc is None:
             status = "FAILED (launcher ignored DRY_RUN; add DRY_RUN support)"
         elif rc != 0:
@@ -871,12 +948,15 @@ def preflight(args: argparse.Namespace, names: list[str]) -> int:
             status = f"FAILED (rc={rc}) {last_err}"
         elif actual != expected:
             status = f"FAILED fingerprint expected={expected} actual={actual}"
+        elif cfg_failed:
+            status = f"FAILED {cfg_note}"
         else:
             status = "OK"
         if status != "OK":
             failed.append(name)
         dry_line = next((item for item in out.splitlines() if "dry-run" in item), "")
-        print(f"[preflight] {name}: {status} {dry_line}".rstrip())
+        suffix = f"{dry_line} {cfg_note}".strip()
+        print(f"[preflight] {name}: {status} {suffix}".rstrip())
     if failed:
         print(f"[preflight] FAILED configs: {failed}")
         return 1
@@ -1051,6 +1131,12 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--no-kv-connector", action="store_true", help="force-disable the PD connector")
     parser.add_argument("--embed-local", default="0", help="VLLM_ASCEND_CP_BALANCE_EMBED_LOCAL for all configs")
     parser.add_argument("--multi-mode", choices=("batch", "concurrent"), default="batch")
+    parser.add_argument(
+        "--extra-additional-config",
+        default="",
+        help="JSON object merged into the base additional_config for every config "
+        "(e.g. '{\"recompute_scheduler_enable\": false}')",
+    )
     parser.add_argument("--env", action="append", default=[], metavar="K=V", help="extra env override")
     parser.add_argument("--repeat-a", action="store_true", help="run A twice as A2 for the noise floor")
     parser.add_argument("--config-check", choices=("off", "warn", "strict"), default="warn")

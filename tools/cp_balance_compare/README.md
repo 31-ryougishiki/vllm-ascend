@@ -205,6 +205,9 @@ python tools/cp_balance_compare/ab_cp_compare.py \
 - 两个标记由 `VLLM_ASCEND_CP_BALANCE_DEBUG_LOG=1`（driver 自动为 A/B/C 导出）
   触发的 `[CP_BALANCE]` 日志产生，默认关闭，对正常推理没有影响。
 
+`--config-check strict` 还会校验 launcher 打印的 `[cp-ab-cfg]`（逐字段对比
+additional_config），避免"改了 launcher 但 driver 用环境变量覆盖"这类静默不一致。
+
 配合 `--zigzag-check strict` 使用：如果 C 没有打出 forward 标记，driver 默认
 （`--on-zigzag-miss skip`）**不再拉起剩余配置**（例如 A2，省一次模型加载），
 但会把已经采到的 A/B/C 数据照常写出 `summary.json`/图，`summary.json.skipped`
@@ -258,7 +261,39 @@ python tools/cp_balance_compare/ab_cp_compare.py \
   `--zigzag-check strict` 强制校验）；
 - driver 只做 prefill 对比，不覆盖 decode / PD 传输。
 
-## 6. 相关代码
+## 6. 常见报错
+
+### 6.1 `recompute_scheduler_enable can only be enabled on PD-disaggregated D nodes`
+
+- **原因**：`vllm_ascend/platform.py` 规定 `recompute_scheduler_enable=true` 只允许
+  `kv_role='kv_consumer'`（PD 的 D 节点）。A/B/C 默认 `--no-kv-connector`，
+  `kv_transfer_config=None`，于是启动时直接抛
+  `ValueError: ... got kv_role=None`。
+- **为什么改 launcher 没用**：driver 每次都会导出
+  `VLLM_ASCEND_ADDITIONAL_CONFIG` / `VLLM_ASCEND_SPEC_CONFIG` /
+  `VLLM_ASCEND_KV_TRANSFER_CONFIG`，launcher 里的默认值只在环境变量"未设置"时生效；
+  改 launcher 的 `DEFAULT_ADDITIONAL_CONFIG` 不会影响 driver 拉起的进程。
+- **正确做法**：
+  - 默认：driver 的 `BASE_ADDITIONAL_CONFIG` 已移除 `recompute_scheduler_enable`，
+    直接重跑即可；
+  - 临时加回 / 覆盖其它键：`--extra-additional-config '{"recompute_scheduler_enable": true}'`
+    （merge 进基础配置，A/B/C 三组一致）；
+  - 整体替换成你们的真实 additional_config：
+    `--env VLLM_ASCEND_ADDITIONAL_CONFIG='{...}'`（driver 的 `--env` 优先级最高）。
+- **怎么确认 launcher 最终吃到的配置**：`--config-check strict` 除了 5 个开关指纹，
+  还会校验 launcher 打印的 `[cp-ab-cfg]` 行；不一致时会把 expected / launcher 两份
+  JSON 都打出来。
+
+### 6.2 `[preflight] ... FAILED` / `server exited`
+
+- `MODEL_PATH does not exist` / `vllm not found in PATH`：按提示修 launcher 的
+  `MODEL_PATH`、`source /root/.bashrc`；
+- `additional_config mismatch`：driver 传入的配置和 launcher 实际使用的不同，
+  按打印的两份 JSON 调整 launcher 或改用 `--extra-additional-config`；
+- 某个配置 `server exited`：多半是 8 卡未释放或端口被占，`npu-smi info` +
+  `ps -ef | grep "[v]llm serve"` 后重跑，或 `--restart-wait 90`。
+
+## 7. 相关代码
 
 - `vllm_ascend/layers/cp_zigzag.py`：zigzag plan / shard / gather
 - `vllm_ascend/attention/sfa_v1.py`：`DSACPContext`、merged metadata、KV/indexer 写回
