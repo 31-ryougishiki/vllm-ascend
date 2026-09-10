@@ -150,7 +150,6 @@ from vllm_ascend.spec_decode.utils import (
     correct_optimistic_seq_lens_cpu,
     update_num_computed_tokens_for_batch_change,
 )
-from vllm_ascend import envs as ascend_envs
 from vllm_ascend.utils import (
     AscendDeviceType,
     calc_split_factor,
@@ -2611,10 +2610,6 @@ class NPUModelRunner(GPUModelRunner):
             or getattr(forward_context, "zigzag_cp_active", False)
         ) and not isinstance(hidden_states, IntermediateTensors):
             if getattr(forward_context, "zigzag_cp_active", False):
-                logger.info_once(
-                    "[CP_BALANCE] model output gather via "
-                    "zigzag_gather_hidden_states_and_aux"
-                )
                 hidden_states = zigzag_gather_hidden_states_and_aux(hidden_states)
             else:
                 hidden_states = self._all_gather_hidden_states_and_aux(hidden_states)
@@ -2635,25 +2630,12 @@ class NPUModelRunner(GPUModelRunner):
         if num_scheduled_tokens_np is None or num_scheduled_tokens_np.size == 0:
             return False
         tp_size = self.vllm_config.parallel_config.tensor_parallel_size
-        dsa_cp_enabled = enable_dsa_cp_for_config(self.vllm_config)
-        if not dsa_cp_enabled or tp_size <= 1:
-            logger.info(
-                "[CP_BALANCE] runner-side zigzag check disabled: "
-                "dsa_cp=%s, tp_size=%s",
-                dsa_cp_enabled,
-                tp_size,
-            )
+        if not enable_dsa_cp_for_config(self.vllm_config) or tp_size <= 1:
             return False
 
         query_lens = [int(x) for x in num_scheduled_tokens_np]
         num_actual_tokens = int(sum(query_lens))
         if num_actual_tokens != num_scheduled_tokens:
-            logger.info(
-                "[CP_BALANCE] runner-side zigzag skipped: "
-                "actual_tokens=%s != scheduled_tokens=%s",
-                num_actual_tokens,
-                num_scheduled_tokens,
-            )
             return False
         num_tokens_pad = round_up(num_actual_tokens, 2 * tp_size)
 
@@ -2696,40 +2678,6 @@ class NPUModelRunner(GPUModelRunner):
             dcp_replicated=enable_sfa_dcp_replicated_indexer(self.vllm_config),
             full_o_proj=full_o_proj,
         )
-        if zigzag_enabled:
-            logger.info(
-                "[CP_BALANCE] runner-side zigzag padding eligible: "
-                "num_actual_tokens=%s, num_tokens_pad=%s, tp_size=%s, "
-                "num_reqs=%s, attn_state=%s, local_cos=%s, "
-                "full_pad_scatter=%s",
-                num_actual_tokens,
-                num_tokens_pad,
-                tp_size,
-                len(query_lens),
-                getattr(self, "attn_state", None),
-                ascend_envs.VLLM_ASCEND_CP_BALANCE_LOCAL_COS,
-                ascend_envs.VLLM_ASCEND_CP_BALANCE_FULL_PAD_SCATTER,
-            )
-        else:
-            logger.info(
-                "[CP_BALANCE] runner-side zigzag NOT eligible: "
-                "attn_state=%s, num_actual_tokens=%s, num_tokens_pad=%s, "
-                "min_query_len=%s, is_prefilling=%s, dp_size=%s, "
-                "full_o_proj=%s, v2_runner=%s, cp_balance_env=%s, "
-                "min_tokens_env=%s, local_cos=%s, full_pad_scatter=%s",
-                getattr(self, "attn_state", None),
-                num_actual_tokens,
-                num_tokens_pad,
-                min(query_lens),
-                is_prefilling,
-                self.vllm_config.parallel_config.data_parallel_size,
-                full_o_proj,
-                envs_vllm.VLLM_USE_V2_MODEL_RUNNER,
-                ascend_envs.VLLM_ASCEND_CP_BALANCE,
-                ascend_envs.VLLM_ASCEND_CP_BALANCE_MIN_TOKENS,
-                ascend_envs.VLLM_ASCEND_CP_BALANCE_LOCAL_COS,
-                ascend_envs.VLLM_ASCEND_CP_BALANCE_FULL_PAD_SCATTER,
-            )
         return zigzag_enabled
 
     def _pad_for_sequence_parallelism(
@@ -2752,12 +2700,6 @@ class NPUModelRunner(GPUModelRunner):
             ):
                 align_size *= 2
             return round_up(num_scheduled_tokens, align_size)
-        logger.info(
-            "[CP_BALANCE] _pad_for_sequence_parallelism: "
-            "enable_sp=%s, enable_sp_by_pass=%s -> zigzag check skipped",
-            sp_enabled,
-            enable_sp_by_pass(),
-        )
         return num_scheduled_tokens
 
     # These functions from upstream vllm handle PP+SP. Ascend's flashcomm1 SP

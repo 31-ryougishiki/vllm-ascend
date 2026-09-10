@@ -13,7 +13,7 @@ from vllm_ascend.attention.sfa_v1 import (
     _can_zigzag,
     _supports_npu_advanced_index,
 )
-from vllm_ascend.attention.sfa_v1 import ascend_envs
+from vllm_ascend import envs as ascend_envs
 from vllm_ascend.ascend_forward_context import (
     _disable_zigzag_metadata_for_fallback,
 )

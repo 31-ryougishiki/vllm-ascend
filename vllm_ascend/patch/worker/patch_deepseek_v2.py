@@ -10,7 +10,7 @@ from vllm.distributed import (
     tensor_model_parallel_all_gather,
     tensor_model_parallel_all_reduce,
 )
-from vllm.logger import logger
+from vllm.distributed.parallel_state import get_tp_group
 from vllm.model_executor.layers.layernorm import RMSNorm
 from vllm.model_executor.layers.linear import (
     ColumnParallelLinear,
@@ -318,29 +318,33 @@ def _patched_forward(
     from vllm_ascend.ascend_forward_context import _EXTRA_CTX
 
     zigzag_active = bool(_EXTRA_CTX.zigzag_cp_active)
-    if zigzag_active:
-        logger.info_once(
-            "[CP_BALANCE] DeepseekV2Model boundary zigzag active: "
-            "pp_rank=%s, first_pp_rank=%s, last_pp_rank=%s",
-            get_pp_group().rank_in_group,
-            get_pp_group().is_first_rank,
-            get_pp_group().is_last_rank,
-        )
 
     hidden_is_zigzag_local = False
+    use_embed_local = zigzag_active and hasattr(self.embed_tokens, "forward_zigzag_local")
+    tp_size = get_tensor_model_parallel_world_size()
+    tp_rank = get_tp_group().rank_in_group
+    expected_local_tokens = positions.shape[0] // tp_size if zigzag_active else None
+
     if get_pp_group().is_first_rank:
         if inputs_embeds is not None:
             hidden_states = inputs_embeds
         else:
             if input_ids is None:
                 raise ValueError("Either input_ids or inputs_embeds must be provided to DeepseekV2Model.forward")
-            if zigzag_active and hasattr(self.embed_tokens, "forward_zigzag_local"):
+            if use_embed_local:
                 # Optimal path: shard token ids first, then embed only the
                 # rank-local zigzag rows.  AscendVocabParallelEmbedding
                 # computes the vocab-shard partial for those local rows and
                 # all-reduces them locally, avoiding the full-token embedding
                 # lookup and the FlashComm reduce_scatter + all_gather pair.
                 local_input_ids = zigzag_shard_tensor(input_ids)
+                if local_input_ids.shape[0] != expected_local_tokens:
+                    raise RuntimeError(
+                        f"[CP_BALANCE][EMBED] rank={tp_rank} zigzag "
+                        f"input_ids shard shape {tuple(local_input_ids.shape)} "
+                        f"!= expected {expected_local_tokens} "
+                        f"(positions={tuple(positions.shape)}, tp={tp_size})"
+                    )
                 hidden_states = self.embed_tokens.forward_zigzag_local(local_input_ids)
                 hidden_is_zigzag_local = True
             else:
@@ -359,6 +363,12 @@ def _patched_forward(
                 # double gather when embedding already returns full rows.
                 hidden_states = tensor_model_parallel_all_gather(hidden_states, 0)
             hidden_states = zigzag_shard_tensor(hidden_states)
+            if hidden_states.shape[0] != expected_local_tokens:
+                raise RuntimeError(
+                    f"[CP_BALANCE][EMBED] rank={tp_rank} zigzag hidden "
+                    f"shard shape {tuple(hidden_states.shape)} != expected "
+                    f"{expected_local_tokens}"
+                )
     else:
         assert intermediate_tensors is not None
         hidden_states = intermediate_tensors["hidden_states"]
@@ -367,7 +377,12 @@ def _patched_forward(
 
     if zigzag_active:
         positions = zigzag_shard_positions(positions)
-
+        if positions.shape[0] != expected_local_tokens:
+            raise RuntimeError(
+                f"[CP_BALANCE][EMBED] rank={tp_rank} zigzag positions "
+                f"shape {tuple(positions.shape)} != expected "
+                f"{expected_local_tokens}"
+            )
     llama_4_scaling_config = getattr(self.config, "llama_4_scaling", None)
     llama_4_scaling: torch.Tensor | None
     if llama_4_scaling_config is not None:
