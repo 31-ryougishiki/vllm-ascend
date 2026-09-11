@@ -3517,6 +3517,108 @@ class NPUModelRunner(GPUModelRunner):
             # collect eplb heat for all requests.
             self.eplb_heat_collection_status =  True
 
+    def _install_cp_balance_mlp_dumps(self) -> None:
+        """Trace the MLP boundary of selected layers (CP_BALANCE diagnostics).
+
+        ``VLLM_ASCEND_CP_BALANCE_DUMP=mlp:0,1,2`` makes every listed layer's
+        ``mlp`` module dump its **input** (the hidden states it receives, i.e.
+        after the pre-MLP norm) and its **output** (before the residual is added)
+        once, keyed by the same token positions the ``act`` trace uses.
+
+        Why a hook here and not inside the model code: the token layout under
+        ``cp_balance`` (zigzag) is decided in this repo, while the layer/MLP
+        implementation lives in vLLM (installed as a package).  Hooking
+        ``named_modules()`` by name works for any model class, dense MLP or MoE
+        alike, and turns "attention output is identical, next layer's input is
+        not" into "checked inside the MLP or before it".
+
+        Together with the ``act`` trace this bisects one layer into three steps::
+
+            attention out  --(pre-MLP norm)-->  **mlp in**  --(MLP/MoE)-->  **mlp out**
+                            --(residual)-->  next layer's attention in
+        """
+        try:
+            from vllm_ascend.attention.sfa_v1 import (
+                _dump_dir,
+                _parse_dump_spec,
+                _zigzag_dump,
+            )
+            from vllm_ascend import envs as ascend_envs
+        except Exception as exc:  # pragma: no cover - diagnostics only
+            logger.warning("[CP_BALANCE][dump] mlp trace unavailable: %s", exc)
+            return
+        layers = _parse_dump_spec(ascend_envs.VLLM_ASCEND_CP_BALANCE_DUMP).get("mlp")
+        if not layers:
+            return
+
+        import torch
+        from vllm_ascend.ascend_forward_context import _EXTRA_CTX
+
+        dump_dir = _dump_dir()
+        done: set[tuple[int, str]] = set()
+
+        def _positions(rows: int):
+            """Token position (cache slot) of every row, or None when unknown."""
+            ctx = getattr(_EXTRA_CTX, "zigzag_cp_context", None)
+            slots = getattr(ctx, "slot_mapping_cp", None) if ctx is not None else None
+            if isinstance(slots, torch.Tensor) and slots.numel() >= rows:
+                return slots[:rows].detach().to("cpu").to(torch.int64)
+            return None
+
+        def _summarise(name: str, layer_idx: int, op: str, value) -> None:
+            if (layer_idx, op) in done:
+                return
+            if getattr(_EXTRA_CTX, "in_profile_run", False):
+                return
+            if not isinstance(value, torch.Tensor) or value.ndim != 2:
+                return
+            positions = _positions(int(value.shape[0]))
+            if positions is None:
+                # Decode steps, non-zigzag batches and the all-gathered (padded)
+                # row set cannot be keyed by token; skip instead of writing a
+                # dump that no two layouts could be compared on.
+                return
+            done.add((layer_idx, op))
+            rows = int(positions.numel())
+            payload = {
+                "kind": "mlp",
+                "op": op,
+                "layer_name": name,
+                "layer_idx": layer_idx,
+                "positions": positions[:rows],
+                "act": value.detach()[:rows].to("cpu"),
+            }
+            _zigzag_dump(payload, layer_idx, f"mlp{op}", dump_dir)
+
+        def _make_hook(layer_idx: int, name: str):
+            def hook(module, args, output):  # noqa: ANN001 - torch hook signature
+                if args:
+                    _summarise(name, layer_idx, "in", args[0])
+                if isinstance(output, tuple):
+                    output = output[0] if output else None
+                _summarise(name, layer_idx, "out", output)
+
+            return hook
+
+        installed = []
+        for name, module in self.model.named_modules():
+            for layer_idx in layers:
+                if name.endswith(f"layers.{layer_idx}.mlp"):
+                    module.register_forward_hook(_make_hook(layer_idx, name))
+                    installed.append((layer_idx, name))
+        if installed:
+            logger.info(
+                "[CP_BALANCE][dump] mlp trace armed for %s -> %s",
+                sorted(installed),
+                dump_dir,
+            )
+        else:
+            logger.warning(
+                "[CP_BALANCE][dump] mlp trace requested for layers %s but no "
+                "'layers.<L>.mlp' module matched",
+                sorted(layers),
+            )
+
     def load_model(self) -> None:
         load_model_start_time = time.perf_counter()
         logger.info("Starting to load model %s...", self.model_config.model)
@@ -3596,6 +3698,8 @@ class NPUModelRunner(GPUModelRunner):
                 self.model = self.load_lora_model(self.model, self.vllm_config, self.device)
         self.model_memory_usage = m.consumed_memory
         logger.info("Loading model weights took %.4f GB", m.consumed_memory / float(2**30))
+
+        self._install_cp_balance_mlp_dumps()
 
         get_offloader().post_init()
 

@@ -206,7 +206,7 @@ def _dump_dir() -> str:
     return os.getenv("VLLM_ASCEND_CP_BALANCE_DUMP_DIR", "").strip() or SFA_ZIGZAG_DUMP_DIR
 
 
-_ZIGZAG_DUMP_KINDS = ("topk", "kv", "act")
+_ZIGZAG_DUMP_KINDS = ("topk", "kv", "act", "mlp")
 _ZIGZAG_ALL_LAYERS = set(range(1 << 20))
 _ZIGZAG_WARNED_KEYS: set[str] = set()
 

@@ -170,17 +170,44 @@ grep -o '"routed_experts": *"[^"]\{0,40\}' /dev/shm/cp_single/response_*.txt | h
 - server 起不来并报 `--enable-return-routed-experts is incompatible with ...` ⇒ 把报错原文贴回来
   （PP/KV connector/context parallel 的哪一条）；KV connector 那条用上面的 `VLLM_ASCEND_KV_TRANSFER_CONFIG=""` 解决。
 
-### 4.2 （预检通过后）路由对比轮：MoE 是"离散跳变"还是"分组相关"
+### 4.2 op 级激活剖面（`probe` 模式，**已实现**，2 次模型加载 ≈ 20 分钟）——**当前这一步**
 
-一轮 B/C（无 B2，2 次加载），两个配置都带上 `--enable-return-routed-experts`，把响应里的
-`routed_experts` 落盘后逐 token 比较。判据（届时实现成 `compare_routing.py`，一条命令 + 一行结论）：
+目的：把"哪一步先不等"细化到 **attention 内部 / pre-MLP 段 / MLP 内部**，全精度。
+默认一轮带四样东西：`act:0,1,2`（attention in/out）、`mlp:0,1,2`（MLP/MoE 边界 in/out，本轮新增）、
+`topk:0`（layer 0 索引表，按 token 位置比集合与顺序）、`kv:0,1`（参考）。
 
-| 读数 | 含义 | 下一步 |
-| --- | --- | --- |
-| 路由**逐层逐 token 完全相同** | MoE 的专家选择与排布无关 ⇒ 1e-2 的差异来自**专家计算**（激活量化粒度 / 分组归约顺序 / all-to-all 归约） | 去查 `ops/fused_moe` 的 w4a4 量化与 combine 顺序，或用 `act` 的思路在 MoE 前后各打一次点 |
-| 某些层/某些 token 路由不同（离散） | 路由 op 的 tie-break 或 hash 表的对齐与排布有关 | 看是 hash 层（`tid2eid`）还是打分层（`moe_gating_top_k`），并检查 `input_ids` 的 zigzag 重排 |
+```bash
+unset DUMP_DIR                      # 避免被 sweep 留下的 DUMP_DIR 吸走（见 §6.10）
+bash tools/cp_balance_compare/run_cp_diag.sh probe            # B/C 无 B2 → /root/cp_probe
+python tools/cp_balance_compare/check_zigzag_dumps.py --dir /root/cp_probe \
+    --kind act --summary-only --block-size 128 2>&1 | tee tools/cp_balance_compare/log.log
+```
 
-### 4.3 （已完成，留档）分段比较 packed KV 行
+**判据**（每层四行的紧凑表 + 一行结论；一行 = 一个 op，顺序 in → out → mlp_in → mlp_out）：
+
+| 结论 | 含义 |
+| --- | --- |
+| `op=out` 先不等 | 差异在本层 **attention 内部**（indexer/SFA/o_proj） |
+| `op=mlp_in` 先不等（同层 `out` 相同） | 差异在「attention 输出 → MLP 输入」之间：**pre-MLP norm / 残差 / 跨 rank 归约** |
+| `op=mlp_out` 先不等（同层 `mlp_in` 相同） | 差异在本层 **MLP/MoE 内部**：激活量化 / GEMM 分组与内核 tiling / 专家计算 |
+| `op=in` 先不等（上一层 `mlp_out` 相同） | 差异在层与层之间（残差 / 下一层 pre-attention norm） |
+| `none` | 这几层全精度逐字节相同 → `export DUMP_SPEC=act:3,4,mlp:3,4` 再跑一轮 |
+
+`mlp` 打点挂在哪里（换模型也适用，重要）：vLLM 在本站是**装好的包**（`/usr/local/python3.11.10/lib/python3.11/site-packages/vllm`，0.26.0），
+而 `glm_moe_dsa`（GLM-5.2）用的是 `vllm/models/deepseek_v32/nvidia/model.py` 的 `DeepseekV32DecoderLayer/Model`，
+**不是** vllm-ascend `patch/worker/patch_deepseek_v2.py` patch 的 `DeepseekV2DecoderLayer/Model`
+⇒ 那些 patch 对本模型不生效。所以打点不写模型代码，而是在 worker 里按模块名挂 hook：
+`worker/model_runner_v1.py::_install_cp_balance_mlp_dumps()` 给每个 `layers.<L>.mlp` 注册 forward hook，
+dump 输入/输出，位置键仍取 `_EXTRA_CTX.zigzag_cp_context.slot_mapping_cp`（dense MLP 与 MoE 同一套钩子 ✓）。
+
+### 4.3 路由抓取（预检**已通过**，留作 ≥layer 3 的 MoE 用）
+
+`--enable-return-routed-experts` 可用（现场实测响应里有 `"routed_experts":"k05VTVBZA…"`，npy `uint8`，
+形状 `(num_tokens-1, num_layers, num_experts_per_tok)`），但 **layer 0/1/2 是 dense MLP（没有专家）**，
+且本模型 `scoring_func="sigmoid"`（不走 `sqrtsoftplus`+`tid2eid` 的 hash 路由），所以它**不是**当前的定位手段；
+等 4.2 把分歧钉到某一层之后，再用它验证那一层（若 ≥3）的专家选择是否随排布变化。
+
+### 4.4 （已完成，留档）分段比较 packed KV 行
 
 §2.5 已经知道"整行按 fp8 解码后 layer 1 起有 ~1000 行不同、从 token 256 开始"，但**整行按 fp8 解码是错的**：
 一行 656 字节里只有前 512 字节是真 fp8，后 144 字节是 bf16 rope + fp32 scale 借道运输。

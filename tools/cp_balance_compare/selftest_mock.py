@@ -959,6 +959,56 @@ def test_check_zigzag_act_positions_are_slots_not_token_indices() -> None:
         shutil.rmtree(out, ignore_errors=True)
 
 
+def test_check_zigzag_act_covers_mlp_boundary() -> None:
+    """`--kind act` must also report the MLP boundary (mlpin/mlpout files).
+
+    The MLP dump is what bisects one layer into three steps: attention out
+    (identical) -> MLP in -> MLP out -> next layer's attention in.  With the MLP
+    output already different while its input is identical, the verdict must name
+    ``op=mlp_out`` and point inside the MLP/MoE -- not at attention.
+    """
+    if checker is None:
+        print("[skip] torch not available (check_zigzag_dumps needs it)")
+        return
+    import argparse
+
+    import torch
+
+    out = _temp_dir("cp_ab_mlp_")
+    try:
+        torch.manual_seed(51)
+        base = torch.randn(8, 4).to(torch.bfloat16)
+        shifted = base.clone()
+        shifted[4:] = (shifted[4:].float() + 0.25).to(torch.bfloat16)
+        positions = list(range(8))
+        for kind, data in (
+            ("actin", base), ("actout", base),          # attention: identical
+            ("mlpin", base),                            # MLP input: identical
+            ("mlpout", shifted),                        # MLP output: differs from token 4
+        ):
+            for cpbal, payload in ((0, base), (1, data)):
+                torch.save(
+                    {
+                        "kind": "mlp" if kind.startswith("mlp") else "act",
+                        "positions": torch.tensor(positions, dtype=torch.int32),
+                        "act": payload.clone(),
+                        "num_actual_tokens": 8,
+                    },
+                    out / f"{kind}_cpbal{cpbal}_layer0_rank0_pid100_{1000 + cpbal}.pt",
+                )
+        buffer, errors = io.StringIO(), io.StringIO()
+        with redirect_stdout(buffer), redirect_stderr(errors):
+            rc = checker.check_act(argparse.Namespace(dir=str(out), summary_only=True, block_size=4))
+        text = buffer.getvalue()
+        assert rc == 1, text + errors.getvalue()
+        ops = [line.split()[2] for line in text.splitlines() if line.startswith("[act]     0 ")]
+        assert ops == ["in", "out", "mlp_in", "mlp_out"], ops
+        assert "FIRST DIVERGENCE (act): layer 0 op=mlp_out at token 4" in text, text
+        assert "MLP/MoE **内部**" in text, text
+    finally:
+        shutil.rmtree(out, ignore_errors=True)
+
+
 def test_load_prompts_file() -> None:
     out = Path(_temp_dir("cp_ab_pf_"))
     try:

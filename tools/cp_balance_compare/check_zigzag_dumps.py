@@ -65,17 +65,27 @@ except ImportError:  # pragma: no cover - the target host always has torch
     raise
 
 NAME_RE = re.compile(
-    r"(?P<kind>topk|kv|actin|actout)_cpbal(?P<cpbal>\d+)_layer(?P<layer>-?\d+)_rank(?P<rank>\d+)_pid(?P<pid>\d+)_(?P<ts>\d+)\.pt$"
+    r"(?P<kind>topk|kv|actin|actout|mlpin|mlpout)_cpbal(?P<cpbal>\d+)_layer(?P<layer>-?\d+)"
+    r"_rank(?P<rank>\d+)_pid(?P<pid>\d+)_(?P<ts>\d+)\.pt$"
 )
 
-# ``act`` is one logical kind with two ops in the file name; the other kinds map
-# to themselves so ``--kind kv``/``--kind act`` glob exactly their own files.
+# ``act`` is one logical kind with several ops in the file name (attention in/out
+# plus the MLP boundary of the same layers); the other kinds map to themselves so
+# ``--kind kv``/``--kind act`` glob exactly their own files.
 _KIND_GLOBS = {
     "topk": ("topk_*.pt",),
     "kv": ("kv_*.pt",),
-    "act": ("actin_*.pt", "actout_*.pt"),
+    "act": ("actin_*.pt", "actout_*.pt", "mlpin_*.pt", "mlpout_*.pt"),
 }
-_ACT_OP_ORDER = {"in": 0, "out": 1}
+# Row order inside one layer: attention input/output first, then the MLP boundary
+# (the MLP sits between attention out and the next layer's attention input).
+_ACT_OP_ORDER = {"in": 0, "out": 1, "mlp_in": 2, "mlp_out": 3}
+_FILE_KIND_OP = {
+    "actin": "in",
+    "actout": "out",
+    "mlpin": "mlp_in",
+    "mlpout": "mlp_out",
+}
 
 
 def _load(path: str, warn: bool = True) -> dict | None:
@@ -124,7 +134,7 @@ def _iter_dumps(dump_dir: str, kind: str):
             if match is None:
                 continue
             file_kind = match.group("kind")
-            if file_kind == kind or (kind == "act" and file_kind.startswith("act")):
+            if file_kind == kind or (kind == "act" and file_kind in _FILE_KIND_OP):
                 yield path, match.groupdict()
 
 
@@ -922,7 +932,7 @@ def check_act(args) -> int:
     ignored = 0
     for key in sorted(latest, key=lambda k: (int(k[1]), k[0], int(k[2]), int(k[3]))):
         file_kind, layer, rank, cpbal = key
-        op = "in" if file_kind == "actin" else "out"
+        op = _FILE_KIND_OP.get(file_kind, "in")
         if counts[key] > 1:
             ignored += counts[key] - 1
         groups[(layer, op)][cpbal].append(latest[key][0])
@@ -1002,6 +1012,13 @@ def check_act(args) -> int:
             print(f"[act] -> layer {layer} 的 attention 输入（= layer {layer - 1} 的输出）先不等，"
                   f"而 attention 输出尚未确认；差异是在 layer {layer - 1} 的 MoE/MLP（或其间 norm/残差）里进入的。"
                   f"下一步：对比该 layer 的 attention 输出（op=out）以确认")
+    elif op == "mlp_in":
+        print(f"[act] -> layer {layer} 的 **MLP 输入**先不等，而同一层的 attention 输出相同"
+              "（见同层 op=out 那一行）⇒ 分歧产生在「attention 输出 → MLP 输入」之间："
+              "pre-MLP 的 norm / 残差 / 跨 rank 归约（不是 MLP 本身，也不是 attention）")
+    elif op == "mlp_out":
+        print(f"[act] -> layer {layer} 的 **MLP/MoE 输出**先不等，而它的输入相同（见同层 mlp_in 那一行）"
+              "⇒ 分歧产生在这一层的 MLP/MoE **内部**：激活量化 / GEMM 分组与内核 tiling / 专家计算")
     else:
         print(f"[act] -> layer {layer} 的 attention 输出先不等（输入见 op=in 那一行）："
               "差异在这一层的 attention 内部产生（indexer 选点顺序 / SFA 归约顺序 / o_proj），"
