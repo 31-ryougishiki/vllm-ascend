@@ -1104,6 +1104,23 @@ def test_check_zigzag_act_qin_separates_quant_from_gemm() -> None:
             save("guq", cpbal, payload)
         text = run()
         assert "[act] PROVENANCE" in text and "fused=False(B) vs True(C)" in text, text
+
+        # 4) a payload whose width differs between layouts (here: the scale is
+        #    present on one side only) must be reported, never crash numpy and
+        #    never be read as "identical".
+        for cpbal, payload in ((0, qin(q_same, s_same)), (1, {"kind": "qin", "op": "gu_q", "q": q_same.clone()})):
+            save("guq", cpbal, payload)
+        for kind in ("mlpin", "guout"):
+            for cpbal in (0, 1):
+                (out / f"{kind}_cpbal{cpbal}_layer0_rank0_pid100_{1000 + cpbal}.pt").unlink(missing_ok=True)
+        buffer, errors = io.StringIO(), io.StringIO()
+        with redirect_stdout(buffer), redirect_stderr(errors):
+            rc = checker.check_act(
+                argparse.Namespace(dir=str(out), summary_only=True, block_size=4)
+            )
+        text, errs = buffer.getvalue(), errors.getvalue()
+        assert "payload width differs" in errs, errs
+        assert rc == 2, f"rc={rc}\n{text}{errs}"
     finally:
         shutil.rmtree(out, ignore_errors=True)
 

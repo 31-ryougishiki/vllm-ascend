@@ -1035,10 +1035,25 @@ def check_act(args) -> int:
         left = _act_table(variants["0"])
         right = _act_table(variants["1"])
         if left is None or right is None:
-            print(f"[act] layer={layer} op={op}: no usable rows on one side", file=sys.stderr)
+            note = f"layer={layer} op={op}: no usable rows on one side"
+            incomplete.append(note)
+            print(f"[act] {note}", file=sys.stderr)
             continue
         pos_l, raw_l, fp_l, itemsize = left
         pos_r, raw_r, fp_r, _ = right
+        if raw_l.shape[1] != raw_r.shape[1]:
+            # Row-wise byte comparison needs the same payload width on both sides.
+            # A ``qin`` dump carries the fp8 codes plus (optionally) the scale, so
+            # "scale present on one layout only" lands here: report it instead of
+            # letting numpy raise on broadcast.
+            note = (
+                f"layer={layer} op={op}: payload width differs "
+                f"({raw_l.shape[1]} vs {raw_r.shape[1]}) -- usually the scale is "
+                "present on one layout only; not comparable"
+            )
+            incomplete.append(note)
+            print(f"[act] {note}", file=sys.stderr)
+            continue
         index_l = {int(p): i for i, p in enumerate(pos_l)}
         index_r = {int(p): i for i, p in enumerate(pos_r)}
         common = sorted(set(index_l) & set(index_r))
@@ -1062,9 +1077,15 @@ def check_act(args) -> int:
                 first_at = int(where[0])
                 stats["first_pos"] = common[first_at] - base
                 delta = np.abs(fp_l[rows_l[where]] - fp_r[rows_r[where]])
-                stats["max_abs"] = float(delta.max())
-                scale = float(np.abs(fp_l[rows_l[where]]).max()) or 1.0
-                stats["max_rel"] = stats["max_abs"] / scale
+                # NaN-safe: a NaN payload (or NaN produced by the subtraction) must
+                # not turn the magnitude columns into "nan" -- the old
+                # ``max(0.0, nan) == 0.0`` trap made a real difference look clean.
+                finite = np.isfinite(delta)
+                stats["max_abs"] = float(delta[finite].max()) if finite.any() else float("inf")
+                magnitude = np.abs(fp_l[rows_l[where]])
+                magnitude = magnitude[np.isfinite(magnitude)]
+                scale = float(magnitude.max()) if magnitude.size else 1.0
+                stats["max_rel"] = stats["max_abs"] / (scale or 1.0)
                 row_l = raw_l[rows_l[first_at]]
                 row_r = raw_r[rows_r[first_at]]
                 cols = np.nonzero(row_l != row_r)[0]
@@ -1093,6 +1114,12 @@ def check_act(args) -> int:
             print(f"[act] PROVENANCE (B/C 采样方式不同 -- 这本身可能就是根因，别当成普通数值差) {note}")
     print()
     if layer is None:
+        if not rows and incomplete:
+            # Nothing was comparable: saying "bit-identical" here would turn a
+            # missing/failed sample into a clean verdict, which is the one mistake
+            # this whole tool exists to prevent.
+            print("[act] RESULT: 没有任何可比较的 (layer, op) 采样点；上面的 INCOMPLETE 就是原因（不是\"相同\"）")
+            return 2
         print("[act] RESULT: traced activations are bit-identical across layouts")
         return 0
     # Sibling rows of the same layer: the verdict can then say whether the step
