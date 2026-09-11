@@ -69,14 +69,6 @@ def _temp_dir(prefix: str) -> Path:
     raise RuntimeError(f"cannot create a scratch dir under {base}")
 
 
-def _expect_runtime_error(func) -> None:
-    try:
-        func()
-    except RuntimeError:
-        return
-    raise AssertionError("expected RuntimeError")
-
-
 def test_wait_ready_stops_when_launcher_exited() -> None:
     proc = subprocess.Popen([sys.executable, "-c", "pass"])
     proc.wait(timeout=30)
@@ -190,15 +182,37 @@ def test_fingerprint_verification() -> None:
             f"[cp-ab-cfg] {json.dumps(driver.expected_additional_config('C', strict))}\n",
             encoding="utf-8",
         )
-        assert driver.verify_config("C", strict, log)
+        def verify(args_) -> tuple[object, str]:
+            """``(result_or_exception, captured_output)`` for one verify_config call.
+
+            The negative cases below print on purpose (``[warn] C config mismatch``);
+            letting that text reach the console makes it indistinguishable from a
+            *real* round's configuration failure -- which is exactly how it was
+            misread once.  Capture it and assert on it instead.
+            """
+            buffer = io.StringIO()
+            try:
+                with redirect_stdout(buffer):
+                    result = driver.verify_config("C", args_, log)
+            except Exception as exc:  # noqa: BLE001
+                return exc, buffer.getvalue()
+            return result, buffer.getvalue()
+
+        result, text = verify(strict)
+        assert result is True, (result, text)
+        assert "fingerprint OK" in text, text
 
         log.write_text("[cp-ab] CP_BALANCE=0 DSA_CP=1 EMBED_LOCAL=0 SPEC=0 KV=0\n")
-        _expect_runtime_error(lambda: driver.verify_config("C", strict, log))
-        assert driver.verify_config("C", warn, log) is False
+        result, text = verify(strict)
+        assert isinstance(result, RuntimeError), (result, text)  # strict aborts a round
+        result, text = verify(warn)
+        assert result is False and "config mismatch" in text, (result, text)
 
         log.write_text("no fingerprint in this log\n")
-        _expect_runtime_error(lambda: driver.verify_config("C", strict, log))
-        assert driver.verify_config("C", warn, log) is False
+        result, text = verify(strict)
+        assert isinstance(result, RuntimeError), (result, text)
+        result, text = verify(warn)
+        assert result is False and "has no [cp-ab] fingerprint" in text, (result, text)
     finally:
         shutil.rmtree(out, ignore_errors=True)
 
@@ -1275,16 +1289,31 @@ def test_verify_config_checks_additional_config() -> None:
         flags = driver.expected_fingerprint("C", strict)
         flag_line = "[cp-ab] " + " ".join(f"{key}={value}" for key, value in flags.items()) + "\n"
 
+        def verify() -> tuple[object, str]:
+            """Same output capture as test_fingerprint_verification (see there)."""
+            buffer = io.StringIO()
+            try:
+                with redirect_stdout(buffer):
+                    result = driver.verify_config("C", strict, log)
+            except Exception as exc:  # noqa: BLE001
+                return exc, buffer.getvalue()
+            return result, buffer.getvalue()
+
         cfg_ok = json.dumps(driver.expected_additional_config("C", strict), ensure_ascii=False)
         log.write_text(flag_line + f"[cp-ab-cfg] {cfg_ok}\n")
-        assert driver.verify_config("C", strict, log)
+        result, text = verify()
+        assert result is True, (result, text)
 
         log.write_text(flag_line + '[cp-ab-cfg] {"enable_dsa_cp": false}\n')
-        _expect_runtime_error(lambda: driver.verify_config("C", strict, log))
+        result, text = verify()
+        assert isinstance(result, RuntimeError) and "additional_config mismatch" in str(result), (result, text)
 
-        # Old launchers without the cfg line stay compatible: flags only.
+        # Old launchers without the cfg line stay compatible: flags only (and the
+        # compatibility warning is asserted here instead of leaking to the log).
         log.write_text(flag_line)
-        assert driver.verify_config("C", strict, log)
+        result, text = verify()
+        assert result is True, (result, text)
+        assert "did not log [cp-ab-cfg]" in text, text
     finally:
         shutil.rmtree(out, ignore_errors=True)
 
