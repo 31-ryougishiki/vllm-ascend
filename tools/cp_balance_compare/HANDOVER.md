@@ -41,8 +41,8 @@ in ──attention──▶ out ──pre-MLP norm──▶ mlp_in ══gate_up
 | --- | --- |
 | 站点 | `LOCAL_IP=141.61.133.104`、`VLLM_ASCEND_REPO=/home/z30055003/vllm-ascend`、`MODEL_PATH=/mnt/share/weights/GLM-5.2-w4a4c8-mxfp4` |
 | TP / cp_size | **8**（zigzag 的 `cp_size` 就是 TP；SP padding 到 `2*tp`） |
-| 代码 | 本仓库 `glm52_cp_balance_v3`；改动在 `tools/cp_balance_compare/`、`vllm_ascend/attention/sfa_v1.py`、`vllm_ascend/worker/model_runner_v1.py`、`vllm_ascend/layers/cp_zigzag.py`、`vllm_ascend/ascend_forward_context.py` |
-| vLLM | **装好的包**（`site-packages/vllm`，0.26.0），不是源码 checkout；模型层代码在包里改不到（→ 打点走 hook，见 §2.4） |
+| 代码 | 本仓库 `glm52_cp_balance_v3`。**诊断改动**只在本目录 + `vllm_ascend/attention/sfa_v1.py`、`vllm_ascend/worker/model_runner_v1.py`；**被测实现**在 `vllm_ascend/layers/cp_zigzag.py`、`vllm_ascend/attention/context_parallel/`、`vllm_ascend/ascend_forward_context.py` |
+| vLLM | **装好的包**（`site-packages/vllm`，0.26.0），不是源码 checkout；模型层代码不在本仓库（→ 打点走 hook，见 §2.4） |
 | 现场数据 | `/root/cp_dump`（KV 全层 + 早期 act）、`/root/cp_probe`（probe 轮：act/mlp/topk/kv）、`/dev/shm/cp_ab*/<round>/`（summary/logs） |
 
 ### 2.2 模型结构里与本题相关的字段（`config.json`）
@@ -55,6 +55,11 @@ in ──attention──▶ out ──pre-MLP norm──▶ mlp_in ══gate_up
 | `n_routed_experts` / `num_experts_per_tok` | 256 / 8 | 后续若查 MoE 层，用 `--enable-return-routed-experts` 抓路由 |
 | `hidden_size` / `kv_lora_rank` / `qk_rope_head_dim` | 6144 / 512 / 64 | **packed KV 一行 = 512(fp8) + 128(64×bf16) + 16(4×fp32) = 656 字节** —— 整行按 fp8 解码是错的 |
 | `index_topk` | 2048 | 2048-token prompt 下 indexer 走"全选"路径（identity），故 topk 断言在长 prompt 下信息量低 |
+
+⚠️ 这张表取自**同架构的本地 `GLM-5.2-w8a8c8-mxfp8/config.json`**：架构类字段（`first_k_dense_replace`、
+`mlp_layer_types`、`scoring_func`、专家数、`hidden_size`/`kv_lora_rank`/`qk_rope_head_dim`）与远端
+w4a4c8 权重应一致，但**量化相关字段不同**（mxfp8 vs mxfp4）——凡结论依赖"用了哪条量化路径"的，必须先在远端确认
+（`python -c "import json;print(json.load(open('/mnt/share/weights/GLM-5.2-w4a4c8-mxfp4/config.json')).get('quantization_config'))"`）。
 
 ### 2.3 `CP_BALANCE=1`（zigzag）触发条件与它到底改了什么
 
@@ -80,7 +85,7 @@ KV 写 slot 映射、attention/indexer 调用形状、模型边界 gather/rerang
 | SFA/indexer 的 zigzag 分支、KV dump、act dump | `vllm_ascend/attention/sfa_v1.py`（`zigzag_active`、`_maybe_dump_*`、`_token_positions`） |
 | 当前 forward 的 zigzag 状态与 DSA ctx | `vllm_ascend/ascend_forward_context.py`（**注意**：`zigzag_cp_context` 只在 zigzag 生效时才有值） |
 | MoE aux 重排（`input_ids`/`mc2_mask`） | `ascend_forward_context.set_ascend_forward_context` + `cp_zigzag.zigzag_reorder_moe_aux` |
-| MLP 边界打点（本模型唯一可行的挂钩方式） | `vllm_ascend/worker/model_runner_v1.py::_install_cp_balance_mlp_dumps`（按模块名 `layers.<L>.mlp[.gate_up_proj\|.down_proj]` 挂 forward hook） |
+| MLP 边界打点（**在本仓库内**可行的挂钩方式；模型代码在 site-packages 里） | `vllm_ascend/worker/model_runner_v1.py::_install_cp_balance_mlp_dumps`（按模块名 `layers.<L>.mlp[.gate_up_proj\|.down_proj]` 挂 forward hook） |
 | ⚠️ 误导项 | `vllm_ascend/patch/worker/patch_deepseek_v2.py` 里的 `_zigzag_layer_forward` / `_patched_forward` **对本模型不生效**：它 patch 的是 `DeepseekV2DecoderLayer/Model`，而本模型用 `DeepseekV32DecoderLayer/Model`（无继承关系） |
 
 ## 3. 已确认的事实（带数字，可直接引用）
@@ -153,6 +158,11 @@ KV 写 slot 映射、attention/indexer 调用形状、模型边界 gather/rerang
 不是按 token 独立算的**（按批/按 rank 局部行集算），于是"同一 token 在不同排布下拿到不同的量化 scale"，
 输出系统性偏移 ~1e-3。这一条用 `gu_out` 一点即可证真/证伪。
 
+⚠️ 但要注意一个**反向证据**：本仓库 `vllm_ascend/quantization/methods/w4a4_mxfp4.py::apply` 里，w4a4 线性层用的是
+`npu_dynamic_mx_quant(...)`（MX 量化，按**行**、每 32 元素一个块）——若该路径真的生效，A-quant 就与批无关，
+上面的猜想要换方向（例如 GEMM 内核按 M/workspace 选 tiling、或 flashcomm 的 gather 与 quant 的先后）。
+**本站实际实例化的是哪个量化类尚未核实**（见 §2.2 的提醒）。所以 `gu_out` 这一步同时也是对"到底走了哪条量化路径"的检验。
+
 ## 5. 下一步（一步一条命令 + 判据）
 
 ### 5.1 当前这一步：把 layer 0 的 MLP 再切三段
@@ -170,6 +180,9 @@ python tools/cp_balance_compare/check_zigzag_dumps.py --dir /root/cp_probe \
 ```
 [CP_BALANCE][dump] mlp trace armed for [(0,'model.layers.0.mlp'), (0,'…mlp.gate_up_proj'), (0,'…mlp.down_proj'), (1,…), (2,…)]
 ```
+
+结束时应有 `dump: +N file(s)`（N≈336 = 每层 6 个采样点 × 3 层 × 8 rank × 2 配置 + `topk:0` 16 + `kv:0,1` 32）。
+若打印的是 `mlp trace requested … but no 'layers.<L>.mlp*' module matched`，说明模块名不匹配 → 把该行贴回来。
 
 判读表每层 6 行，**取最早不等的那一行**：
 
@@ -212,7 +225,7 @@ python tools/cp_balance_compare/check_zigzag_dumps.py --dir /root/cp_probe \
 
 **协作约定（务必遵守）**
 
-1. **代码只在本仓库改、改完立刻 commit**：轮次靠 `git rev-parse HEAD` 对齐版本；未提交的改动会让"这轮结果对应哪份代码"无法追溯。每提交一次会被推到 `origin`（本机 reflog 显示 `update by push`），远端只需同步到同一 commit。
+1. **代码只在本仓库改、改完立刻 commit**：轮次靠 `git rev-parse HEAD` 对齐版本；未提交的改动会让"这轮结果对应哪份代码"无法追溯。**提交后确认 origin 跟上**：`git rev-parse --short HEAD origin/glm52_cp_balance_v3` 两行相同才算同步就绪；不同就 `git push origin glm52_cp_balance_v3`（本会话观察：多数提交会被自动 push，最新一两次是手动推的，所以**每次都查一下**）。
 2. **每一步都要有判据**：脚本必须打印"期望看到什么"；不给判据的命令视为未完成。
 3. **一次只给一步**：上一步结果确认后再给下一步，不预先罗列后续步骤。
 4. **远端执行 = 用户的手**：我给命令 + 判据；用户跑完把 `log.log`（或屏幕输出）贴回来。**新的打点代码必须先同步再跑**，同步后建议先 `python tools/cp_balance_compare/selftest_mock.py`（末行 `SELFTEST OK`）。
@@ -238,10 +251,12 @@ python tools/cp_balance_compare/check_zigzag_dumps.py --dir /root/cp_probe \
 
 | commit | 内容 |
 | --- | --- |
+| `c8f863dbe` | 本文档与 README 重构（目标/结论/机制/易错点/工作流程） |
 | `0877aa35a` | MLP 内部再切三段：`gate_up_proj`/`down_proj` 打点（`gu_out`/`dn_in`） |
 | `dc5748126` | 修"MLP 打点只写出 C 侧"（B 侧拿不到位置键被静默跳过）+ 单侧缺失报 `INCOMPLETE` |
 | `94baf11ed` | MLP 边界打点（worker 按模块名挂 hook）+ probe 默认带 `mlp:` |
 | `b0c105974` | `positions` 是 slot 不是 token 序号（旧版丢尾部、起点偏移一个 base） |
+| `c7244089e` | `topk` dump 带 token 位置 + 跨排布索引表对比（`[topk/cross]`） |
 | `d78349625` | probe 判读结论（分歧诞生在 layer 0 的 MLP 段）+ launcher 支持 `EXTRA_SERVE_ARGS` |
 | `28d9b40f3` / `298bbff36` | `[kv/fp]` 拆字节/数值；修 `max\|d\|` 的 NaN 陷阱并纠正错误结论 |
 | `7b838e5ea` | op 级激活剖面（`act` dump + `--kind act` + `probe` 模式） |

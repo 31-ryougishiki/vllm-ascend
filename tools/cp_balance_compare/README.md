@@ -19,8 +19,9 @@
 ## 二、工作流程
 
 ```
-① 改代码（本仓库，改完立刻 commit；会自动 push 到 origin）
-        ↓ 用户在远端同步到同一 commit
+① 改代码（本仓库，改完立刻 commit）
+        ↓ 确认 origin 跟上：git rev-parse --short HEAD origin/glm52_cp_balance_v3（不同则 git push origin glm52_cp_balance_v3）
+        ↓ 用户在远端同步到同一 commit（同步后建议先跑 selftest_mock.py）
 ② 远端跑一轮（NPU 独占整机：B、C 顺序起停，每次约 10 分钟加载）
         ↓ 产物：<round>/summary.json + logs/server_*.log，dump 落在 DUMP_DIR
 ③ CPU 侧判读（几秒~十几秒，不需要 NPU）
@@ -73,7 +74,8 @@ python tools/cp_balance_compare/check_zigzag_dumps.py --dir /root/cp_probe \
 
 常用覆盖：`PROMPT_LENS`、`MIN_TOKENS`、`TP_SIZE`、`CP_SIZE`、`REPEAT_A=0`/`--no-repeat`（省一次加载）、`OUT_ROOT`、
 `DUMP_SPEC`（如 `act:0,1,2,3,mlp:0,1,2,3`、`kv:all`；置空=不 dump）、`DUMP_DIR`（**writer 与 checker 共用一个旋钮**）、`KIND`、`LAUNCHER`。
-launcher 还支持 `EXTRA_SERVE_ARGS="--enable-return-routed-experts"`（空格分隔，透传额外 `vllm serve` 参数）。
+launcher 还支持 `EXTRA_SERVE_ARGS="--enable-return-routed-experts"`（空格分隔，透传额外 `vllm serve` 参数；
+该 flag 要求 **PP=1 且不能用 KV connector**——driver 与 `run_single.py` 默认都已经关掉 KV connector ✓）。
 
 已有 server 在跑时可跳过拉起：`ab_cp_compare.py --urls B=…,C=… --repeat-a`（此模式读不到 server 日志，指纹/zigzag 检查会被跳过）。
 每轮都要 `source` 两次很慢时：先 `source tools/cp_balance_compare/prepare_env.sh`（判据：日志出现 `CP_AB_SKIP_SOURCE=1` 与 `env check: ASCEND_HOME_PATH=…`，**必须确认路径是你那套环境**）。
@@ -100,8 +102,8 @@ in ─attention─▶ out ─pre-MLP norm─▶ mlp_in ─gate_up_proj─▶ gu_
 
 - **`positions` 是 KV cache slot，不是 token 序号**（请求块表可能从 block 1 起 ⇒ slot = token+128）。判读按 B/C 公共 base 归一化成 token 序号；`--block-size 128` 会把首个分歧标到第几个 zigzag 块。
 - `kv` 的 `rows_val>0` ⇒ 存储**数值**不同（真差异）；`rows_val=0` 而 `rows_byte>0` ⇒ 只有量化零点符号位翻转（**亚量化**，差异小于一个量化步）；两者都为 0 ⇒ 逐位相同。
-- `--summary-only` 用于多层扫描：每层一行、进度打到 stderr（全层 1248 文件约十几秒）。
-- 退出码：发现差异/违规 1，找不到 dump 2，干净 0。
+- `--summary-only` 用于多层扫描：进度打到 stderr（kv 每层一行、act 每层 6 行；全层 1248 文件约十几秒）。
+- 退出码：**1** = 发现真差异/违规（kv 数值不同、topk 集合不同、dump 与因果窗口不符）；**0** = 干净（含"只翻零点符号位"的亚量化）；**2** = 找不到 dump。
 
 其它工具：`compare_cp_rounds.py <轮1>=<目录> <轮2>=<目录>` 并排多轮指标（回到噪声级 rc=0、仍超阈 1、无可比 case 2）；
 `selfcheck.py` 首跑/换机器时跑一次即可（**日常迭代不要重复跑**）。
