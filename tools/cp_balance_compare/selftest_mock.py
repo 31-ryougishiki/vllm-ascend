@@ -785,6 +785,46 @@ def test_check_zigzag_kv_separates_bytes_from_values() -> None:
         shutil.rmtree(out, ignore_errors=True)
 
 
+def test_check_zigzag_kv_reports_nan_difference_instead_of_zero() -> None:
+    """A NaN must never be summarised as ``max|d| = 0.000e+00``.
+
+    The packed KV row is not a pure fp8 array: on a sparse-C8 site the last
+    bytes are a bf16 rope payload and fp32 scales transported through an
+    fp8-typed tensor, so reading the whole row as fp8 yields NaNs (0x7F/0xFF
+    patterns).  ``delta.max()`` is then NaN and plain ``max(0.0, nan)`` returns
+    ``0.0`` -- that is exactly how a real divergence in this project was
+    reported as ``max|d| = 0.000e+00``.  The magnitude must stay finite and the
+    one-sided NaN must be visible.
+    """
+    if checker is None:
+        print("[skip] torch not available (check_zigzag_dumps needs it)")
+        return
+    import argparse
+
+    import torch
+
+    out = _temp_dir("cp_ab_nan_")
+    try:
+        torch.manual_seed(31)
+        left = torch.randn(8, 4).to(torch.bfloat16)
+        right = left.clone()
+        right[4:, 0] = float("nan")
+        for rank in range(2):
+            torch.save({"kv_fp_nat": left.clone()}, out / f"kv_cpbal0_layer0_rank{rank}_pid{rank}_1000.pt")
+            torch.save({"kv_fp_nat": right.clone()}, out / f"kv_cpbal1_layer0_rank{rank}_pid{rank}_1001.pt")
+        buffer = io.StringIO()
+        with redirect_stdout(buffer):
+            rc = checker.check_kv(argparse.Namespace(dir=str(out), summary_only=True))
+        text = buffer.getvalue()
+        assert rc == 1, text
+        fp_row = next(line for line in text.splitlines() if line.startswith("[kv/fp  ]     0"))
+        assert "0.000e+00" not in fp_row, fp_row  # never hide a NaN difference as zero
+        assert "NaN-only pair(s)" in fp_row, fp_row
+        assert "rows_val" in text and "4-4" in fp_row, fp_row
+    finally:
+        shutil.rmtree(out, ignore_errors=True)
+
+
 def test_load_prompts_file() -> None:
     out = Path(_temp_dir("cp_ab_pf_"))
     try:

@@ -369,21 +369,35 @@ def _fp_diff(left: dict, right: dict) -> dict | None:
     per_row_value = value_diff.any(axis=1)
     delta = np.abs(lf - rf)
     delta[both_nan] = 0.0
+    # A NaN on one side only stays NaN in `delta`; ``delta.max()`` would then be
+    # NaN, and ``max(0.0, nan)`` returns 0.0 in plain Python -- which is how a
+    # real divergence once got reported as "max|d| = 0.000e+00".  Keep the
+    # magnitude meaningful: the finite maximum when there is one, ``inf`` when
+    # the only differences are NaN-vs-number, and count those pairs separately.
+    finite_diff = np.isfinite(delta) & value_diff
+    unilateral_nan = int((np.isnan(lf) ^ np.isnan(rf)).sum())
+    if finite_diff.any():
+        max_abs = float(delta[finite_diff].max())
+    elif per_row_value.any():
+        max_abs = float("inf")
+    else:
+        max_abs = 0.0
     stats = {
         "rows_bytes": int(per_row_bytes.sum()),
         "rows_value": int(per_row_value.sum()),
         "first_bytes": int(np.argmax(per_row_bytes)) if per_row_bytes.any() else None,
         "first_value": int(np.argmax(per_row_value)) if per_row_value.any() else None,
-        "max_abs": float(delta.max()) if per_row_value.any() else 0.0,
+        "max_abs": max_abs,
         "max_rel": 0.0,
+        "unilateral_nan": unilateral_nan,
         # elements that differ as bytes but not as values: sign of zero (or a
         # NaN payload) -- the fingerprint of a sub-quantization difference.
-        "byte_only": int((byte_diff & ~value_diff).sum()),    }
+        "byte_only": int((byte_diff & ~value_diff).sum()),
+    }
     if stats["max_abs"]:
-        scale = float(np.abs(lf).max()) or 1.0
+        scale = float(np.nanmax(np.abs(lf))) or 1.0
         stats["max_rel"] = stats["max_abs"] / scale
     return stats
-
 
 def _summary_verdict(per_layer: dict[int, dict]) -> tuple[int | None, str]:
     """First layer whose KV differs, judged on the FP copy when it exists.
@@ -444,9 +458,10 @@ def _print_kv_summary(per_layer: dict[int, dict], ignored: int) -> None:
             byte_span = f"{min(byte_rows)}-{max(byte_rows)}" if byte_rows else "-"
             first_val = "-" if stats["fp_first_value"] is None else str(stats["fp_first_value"])
             first_byte = "-" if stats["fp_first_byte"] is None else str(stats["fp_first_byte"])
+            suffix = f"  [{stats['fp_nan_only']} NaN-only pair(s)]" if stats["fp_nan_only"] else ""
             print(f"[kv/fp  ] {layer:>5}  {stats['fp_differ']:>4}/{stats['compared']:<4}  {val_span:>10}  "
                   f"{first_val:>9}  {byte_span:>10}  {first_byte:>10}  "
-                  f"{stats['fp_max_abs']:>10.3e}  {stats['fp_max_rel']:>9.2e}  {stats['fp_byte_only']:>9}")
+                  f"{stats['fp_max_abs']:>10.3e}  {stats['fp_max_rel']:>9.2e}  {stats['fp_byte_only']:>9}{suffix}")
 
     first_layer, which = _summary_verdict(per_layer)
     if first_layer is None:
@@ -521,7 +536,7 @@ def check_kv(args) -> int:
             "compared": 0, "differ": 0, "rows": [], "first": None, "max": 0, "no_int8": 0,
             "fp_present": 0, "fp_differ": 0, "fp_byte_rows": [], "fp_value_rows": [],
             "fp_first_byte": None, "fp_first_value": None,
-            "fp_max_abs": 0.0, "fp_max_rel": 0.0, "fp_byte_only": 0,
+            "fp_max_abs": 0.0, "fp_max_rel": 0.0, "fp_byte_only": 0, "fp_nan_only": 0,
         }
     )
     failures = 0
@@ -578,6 +593,7 @@ def check_kv(args) -> int:
                 stats["fp_max_abs"] = max(stats["fp_max_abs"], fp["max_abs"])
                 stats["fp_max_rel"] = max(stats["fp_max_rel"], fp["max_rel"])
             stats["fp_byte_only"] = max(stats["fp_byte_only"], fp["byte_only"])
+            stats["fp_nan_only"] = max(stats["fp_nan_only"], fp["unilateral_nan"])
         if not args.summary_only:
             print(
                 f"\n[kv] layer={layer} rank={rank} cpbal{left_key} vs cpbal{right_key}: "
@@ -590,7 +606,7 @@ def check_kv(args) -> int:
                     f" | fp rows_value={fp['rows_value']} first_value={fp['first_value']} "
                     f"max|d|={fp['max_abs']:.3e} rel={fp['max_rel']:.2e} | "
                     f"rows_bytes={fp['rows_bytes']} first_byte={fp['first_bytes']} "
-                    f"byte_only={fp['byte_only']}"
+                    f"byte_only={fp['byte_only']} nan_only={fp['unilateral_nan']}"
                     if fp is not None
                     else " | (no kv_fp_nat in dump)"
                 )

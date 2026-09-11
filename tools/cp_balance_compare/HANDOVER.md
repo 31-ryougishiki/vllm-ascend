@@ -5,7 +5,7 @@
 
 ## 0. 一句话现状
 
-`cp_balance`（zigzag 切分）与连续切片（`VLLM_ASCEND_CP_BALANCE=0`）在 prefill 上**确实不等**，差异远超噪声地板（p99 ≈ 0.39~0.58 nats，top-1 翻转 17%~30%），且**差异幅度随 rank 数减少而变大**。TP=8 的全层 KV 剖面已经判读（§2.5）：**layer 0 逐字节相同，layer 1 起只差在量化零点的符号位、KV 数值全同** ⇒ 分歧是**亚量化（小于一个 fp8 步）的舍入级差异**，在 **layer 0 的输出**里进入，再由 78 层 MoE 放大；**不是** indexer 选点错、**不是** KV 重排写错、**不是**结构错误。下一步：**重跑一次带 `rows_val`/`rows_byte` 拆分的判读**（确认数值全同），然后跑 **`probe`（op 级、全精度）** 把"attention 内部 vs MoE/MLP"钉死。
+`cp_balance`（zigzag 切分）与连续切片（`VLLM_ASCEND_CP_BALANCE=0`）在 prefill 上**确实不等**，差异远超噪声地板（p99 ≈ 0.39~0.58 nats，top-1 翻转 17%~30%），且**差异幅度随 rank 数减少而变大**。TP=8 的全层 KV 剖面已判读（§2.5）：**layer 0 逐字节相同** ⇒ 写 KV / rope / 布局 / 量化没写错；**layer 1 起 KV 的解码值就不同了**（约一半行、从 token 256 开始）⇒ 分歧在 **layer 0 的输出**里进入并被逐层放大。**不是** indexer 选点错、**不是** KV 重排写错、**不是**元数据契约错。下一步：**分段比较 packed KV 行**（nope/rope/scale，§4.1）定量分歧幅度，然后跑 **`probe`（op 级、全精度）** 定位到 attention vs MoE/MLP。
 
 ## 1. 环境与版本（接手时先对齐）
 
@@ -59,30 +59,34 @@
 ### 2.5 TP=8 全层 KV 剖面（`/root/cp_dump`，1248 个 dump，**已判读**）
 
 命令：`python tools/cp_balance_compare/check_zigzag_dumps.py --dir /root/cp_dump --kind kv --summary-only`
-（原始输出见同目录 `log.log`；`[kv/int8]` 全列 `n/a`：这台机器 NPU `index_select` 不可用，没有 `kv_nat` 回读副本，只看 `[kv/fp]`。）
+（`[kv/int8]` 全列 `n/a`：这台机器 NPU `index_select` 不可用，没有 `kv_nat` 回读副本，只能看 `[kv/fp]`。）
 
-| layer | 结果 |
-| --- | --- |
-| **layer 0** | **8/8 rank 逐字节相同**（`rows_differ 0-0`）→ 写 KV / rope / 布局 / 量化**完全正确** |
-| layer 1 | 8/8 rank 起，`rows_differ ≈ 1017/2048`，**first_token = 256** |
-| layer 2..77 | 同上，`rows_differ` 在 727~1092 之间波动，**first_token 基本恒为 256**（少数 257/258/260） |
-| 全部 77 层 | **`max\|d\| = 0.000e+00`、`rel = 0.00e+00`** |
+| layer | `rows_byte` / `first_byte` | `rows_value` / `first_value` |
+| --- | --- | --- |
+| **layer 0** | **0** / `-` | **0** / `-` → 逐字节相同（连 NaN 的位置都一致） |
+| layer 1 | 1664 / **256** | **1017** / **256** |
+| layer 2 | 1792 / 256 | 996 / 256（`byte_only=20`） |
+| layer 77 | 1792 / 256 | 841 / 256 |
+| 其余层 | ≈1000-1800 / 256 | 727~1092 / 256 |
 
-关键读数：**从 layer 1 起差异只体现在"存储字节"上，KV 的数值一模一样**（`max|d|=0` 覆盖所有层）。
-e4m3 里每个有限值只有一个编码（`±0` 除外），所以"值相同、字节不同"只能是**量化零点的符号位被翻转**
-→ 这是**亚量化（sub-quantization）分歧**：量化前的值确实不同，但**小于一个 fp8 量化步**。
-（本仓库的 checker 现在把两者拆开报：`rows_val` / `rows_byte` / `byte_only`；旧版只报一个 `rows_differ`，
-正是"`rows_differ>0` 而 `max|d|=0`"这个看似矛盾的组合。）
+结论（已用 4 层抽样复核，`first_value` 全部 = 256）：
 
-⚠️ 待复核：旧 checker 的行数是按**字节**数的、幅度是按**数值**算的（两者语义不同），所以要**重跑一次**确认
-`rows_val` 全 0 且 `byte_only>0`。若 `rows_val>0`，性质就完全不同（真内容差异），此时以 `[kv/fp]` 的 `max|d|` 为准。
+- **layer 0 逐字节相同** ⇒ 写 KV / rope / 布局 / 量化本身**没有写错**（§2.4 的 TP=16 结论在这里复现）。
+- **layer 1 起 KV 的"解码值"确实不同**（约一半行、从 token 256 开始）⇒ 不是"只翻零点符号位"，
+  之前的"亚量化、数值全同"结论**作废**（见下面的 NaN 陷阱）。
+- 分歧**在 layer 0 的输出里进入**（layer 0 的 KV 来自 embedding 且逐位相同；layer 1 的 KV 是 layer 0 输出的投影）。
 
-推论：
+⚠️ **两个必须记住的坑**：
 
-- 分歧**在 layer 0 的输出里进入**（layer 0 的 KV 来自 embedding，逐位相同；layer 1 的 KV 是 layer 0 输出的投影）。
-  与 §2.4 的 TP=16 结论一致（layer 0 干净、layer 6 脏）。
-- 分歧幅度**在每一层都小于一个 fp8 量化步** ⇒ 不是"写错 token / 少算位置"这类结构错误（那会给出完全不同的量化值），
-  而是**归约顺序级的舍入差异**；0.5 nat 级 logprob 差异与 17~30% top-1 翻转只能是**下游放大**（78 层 MoE 路由跳变）的结果。
+1. **`max|d|` 的 NaN 陷阱**：旧 checker 打印的 `max|d| = 0.000e+00` 是假的。真实情况是 `delta.max() = NaN`
+   （打包行里有 NaN 字节模式），而 Python 的 `max(0.0, nan)` 返回 `0.0`。**任何"最大幅度"列都必须先排除 NaN。**
+   新版 checker 已修（有限最大值；只有 NaN 对时给 `inf`；单边 NaN 计数进 `NaN-only pair(s)`），并有
+   `test_check_zigzag_kv_reports_nan_difference_instead_of_zero` 兜底。
+2. **整行按 fp8 解码是错的**：packed KV 一行 656 字节 =
+   `k_nope`(512, 真 fp8 e4m3) + `k_pe`(64×bf16 = 128B) + `knope_scale`(4×fp32 = 16B)
+   （`get_sfa_qsfa_packed_head_dim`：512 + 128 + 16 = 656）。后两段是 **bf16/fp32 的字节被"借道" fp8 张量运输**，
+   按 fp8 解码只会得到垃圾值和 NaN（0x7F/0xFF）。因此现在这个 `rows_value` **不能**直接当作
+   "KV 内容不同"的证据 —— 必须**分段比较**（nope 按 fp8、rope 按 bf16、scale 按 fp32），这是 §4.1 的当前这一步。
 
 ### 2.6 其他已确认
 
@@ -97,7 +101,7 @@ e4m3 里每个有限值只有一个编码（`±0` 除外），所以"值相同�
 | indexer 选点错（P1） | **已排除**（rank 局部 `mismatched=0`；全局合并仍未被工具覆盖） |
 | KV 重排 slot 写错 | **已排除**（layer 0 逐位相同） |
 | 元数据契约错（prefix/block_table/kv_len） | **已排除**（`[check]` 告警从未触发） |
-| 量化掩盖导致的假"相同" | **已量化**：全层 fp8 剖面显示"值全同、只有 ±0 符号位不同" ⇒ 差异 < 1 个量化步；比量化更细的幅度只能靠 `act`（probe） |
+| 量化掩盖导致的假"相同" | **反转了**：全层剖面里 KV 的解码值确实不同（`rows_value≈1000/2048`，first=256）。但整行按 fp8 解码会把 rope/scale 段读成垃圾+NaN，所以"KV 内容是否真的变了"要等**分段比较**（§4.1）才能定 |
 | 合并 2B 单次调用（T1，`MERGED_CALL=0`） | **未测**（`run_cp_diag.sh 2call`，2 次加载） |
 | `MIN_TOKENS` 边界（T4） | **未测**（`l1024`） |
 | **主假设 A**：跨 block/rank 的归约顺序类差异，被 78 层 MoE 路由（离散选择）放大 | 未证实；"平滑、普遍、起点在块边界"与之一致 |
@@ -105,31 +109,61 @@ e4m3 里每个有限值只有一个编码（`±0` 除外），所以"值相同�
 
 ## 4. 下一步（按优先级；每步一条命令 + 判据）
 
-### 4.1 复核全层 KV 剖面（数据已在盘上，几秒，不需要 NPU）——**当前这一步**
+### 4.1 分段比较 packed KV 行（数据已在盘上，几秒，不需要 NPU）——**当前这一步**
 
-§2.5 的结论来自一次输出（`log.log`），但那份输出里 `rows_differ>0` 与 `max|d|=0.000e+00` 并存，
-而行数与幅度在旧 checker 里是**两种语义**（字节 vs 数值）。新 checker 把两者拆成
-`rows_val` / `rows_byte` / `byte_only` 三列，重跑一次就能把结论钉死（同一份数据，不需要 NPU）：
+§2.5 已经知道"整行按 fp8 解码后 layer 1 起有 ~1000 行不同、从 token 256 开始"，但**整行按 fp8 解码是错的**：
+一行 656 字节里只有前 512 字节是真 fp8，后 144 字节是 bf16 rope + fp32 scale 借道运输。
+所以要把行拆成三段分别比：
 
 ```bash
 cd /home/z30055003/vllm-ascend
-git rev-parse --short HEAD                     # 需要含本次判读改动（>= 7b838e5ea 之后的 checker）
-ls /root/cp_dump/*.pt 2>/dev/null | wc -l      # 期望 1248 = 78 层 x 8 rank x 2 配置
-python tools/cp_balance_compare/check_zigzag_dumps.py --dir /root/cp_dump --kind kv --summary-only \
-    2>/tmp/kv_profile.err | tee tools/cp_balance_compare/log.log
-tail -3 /tmp/kv_profile.err                    # 期望 "loaded 1248/1248 dumps"
+python - <<'PY'
+import glob, os
+import numpy as np, torch
+NOPE, ROPE_END, SCALE_END = 512, 640, 656   # k_nope(fp8) + k_pe(64*bf16) + knope_scale(4*fp32)
+
+def load(layer, cpbal, rank=0):
+    hits = glob.glob(f"/root/cp_dump/kv_cpbal{cpbal}_layer{layer}_rank{rank}_pid*_*.pt")
+    assert hits, (layer, cpbal)
+    return torch.load(max(hits, key=os.path.getmtime), map_location="cpu", weights_only=False)["kv_fp_nat"]
+
+def stats(x, y):
+    av, bv = x.numpy().astype(np.float64), y.numpy().astype(np.float64)
+    d = np.where(np.isnan(av) & np.isnan(bv), 0.0, np.abs(av - bv))
+    rows = (d > 0).any(axis=1)
+    fin, rel = d[np.isfinite(d)], (d / np.maximum(np.abs(av), 1e-30))
+    rel = rel[np.isfinite(rel)]
+    return (int(rows.sum()), int(rows.argmax()) if rows.any() else -1,
+            float(fin.max()) if fin.size else 0.0, float(rel.max()) if rel.size else 0.0,
+            int(np.isnan(av).sum()), int(np.isnan(bv).sum()))
+
+for layer in (0, 1, 2, 77):
+    a, b = load(layer, 0), load(layer, 1)
+    print(f"--- layer {layer} shape={tuple(a.shape)} {a.dtype} ---")
+    parts = {
+        "nope_fp8":   (a[:, :NOPE].float(), b[:, :NOPE].float()),
+        "rope_bf16":  (a[:, NOPE:ROPE_END].contiguous().view(torch.bfloat16).float(),
+                       b[:, NOPE:ROPE_END].contiguous().view(torch.bfloat16).float()),
+        "scale_fp32": (a[:, ROPE_END:SCALE_END].contiguous().view(torch.float32),
+                       b[:, ROPE_END:SCALE_END].contiguous().view(torch.float32)),
+    }
+    for name, (x, y) in parts.items():
+        rows, first, mx, mr, na, nb = stats(x, y)
+        print(f"  {name:>10}: rows_diff={rows:5d} first={first:5d} "
+              f"max|d|={mx:.3e} max_rel={mr:.3e} nan={na}/{nb}")
+PY
 ```
 
-**判据**（`[kv/fp]` 表 78 行 + 一行 `FIRST DIVERGENCE`）：
+**判据**（layer 0 应当三段全 0；关键看 layer 1/2/77）：
 
 | 看到什么 | 含义 | 下一步 |
 | --- | --- | --- |
-| `rows_val` 全 0、layer 1 起 `rows_byte`>0、`byte_only`>0、`max\|d\|=0` | 亚量化分歧（§2.5 的预期）：KV 数值全同，只翻量化零点的符号位 | 进 4.2 的 `probe` |
-| `rows_val`>0 且 `max\|d\|` 明显非 0 | 真·内容差异（≥1 个量化步），性质完全不同 | 先报出 `first_val`/`max\|d\|`，再查该层写 KV 与选点 |
-| 全 0（连 `rows_byte` 也是 `0-0`） | 两种排布在 KV 上完全一致 | 分歧发生在 KV 写之后 → 仍然进 4.2 |
+| `nope_fp8` 行数≈0（或只有个位数）而 `scale_fp32 rows_diff` 大、`max_rel` 极小（~1e-7） | 量化内容相同，只有 fp32 scale 变了 ⇒ **隐状态差异在 fp32-ulp 量级**（纯归约顺序舍入） | 进 4.2，并预期 logprob 差异全部来自 MoE 放大 |
+| `nope_fp8 rows_diff` 数百~上千，且 `rope_bf16 max_rel` ≥1e-3 | KV 内容确实变了 ⇒ 隐状态差异已达 1e-3 量级 | 进 4.2，重点看 op=out 是否在 layer 0 就先不等 |
+| 三段全 0 | KV 完全一致（与 §2.5 的 layer 0 一样） | 分歧在 KV 写之后 → 仍然进 4.2 |
 
-补充判据：`first_byte` 期望 **256**（§2.5 实测），`first_val` 期望 `-`；`[kv/int8]` 整列 `n/a` 是正常的
-（这台机器 NPU `index_select` 不可用，没有 `kv_nat` 回读副本）。全量加载约 3.4GB 内存、十几秒。
+补充：`first` 期望都是 **256**（§2.5 实测）；`nan` 说明该段里有多少 NaN 字节模式（rope/scale 段本来就可能有，
+因为它们是借道 fp8 运输的 bf16/fp32 数据）。
 
 ### 4.2 op 级激活剖面（`probe` 模式，**已实现**，2 次模型加载 ≈ 20 分钟）——4.1 之后的下一步
 

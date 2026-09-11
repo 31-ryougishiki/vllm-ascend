@@ -74,7 +74,11 @@ prompt 默认是确定性随机 token-id（`--seed 1234`，词表 10 万），�
   | `rows_val=0`、`rows_byte>0`、`byte_only>0`、`max\|d\|=0` | 数值**全同**、只有字节不同。e4m3 里每个有限值只有一种编码（`±0` 除外）⇒ 只能是**量化零点的符号位**翻转 ⇒ **亚量化（sub-quantization）**分歧：量化前的值确实不同，但小于一个 fp8 步 | `FIRST DIVERGENCE (fp/bytes): layer L`，rc=0 |
   | 全 0 | 逐位相同 | `FIRST DIVERGENCE (fp): none`，rc=0 |
 
-  `byte_only` 是**最灵敏的探测器**：数值完全一样时它照样能看出两种排布不等价。本项目的 TP=8 全层扫描就是这个形态（layer 0 逐位相同，layer 1 起 `rows_byte≈1000/2048`、`max|d|=0`）。⚠️ 别把 `rows_byte>0` 当成"内容写错了"——内容写错会体现在 `rows_val` 与 `max|d|` 上。
+  `byte_only` 是**最灵敏的探测器**：数值完全一样时它照样能看出两种排布不等价。⚠️ 别把 `rows_byte>0` 当成"内容写错了"——内容写错会体现在 `rows_val` 与 `max|d|` 上；反过来也别只看 `rows_val`。
+
+  ⚠️ **两个读数陷阱**（都真实踩过）：
+  1. **NaN 不能当 0**：`delta.max()` 遇到 NaN 就是 NaN，而 Python 的 `max(0.0, nan)` 返回 `0.0` —— 一次真实分歧因此被印成 `max|d| = 0.000e+00`。现版本只取有限最大值，只有 NaN 对时给 `inf`，并在行尾标 `[N NaN-only pair(s)]`。
+  2. **packed KV 行不是纯 fp8**：一行 = `k_nope`(kv_lora_rank, 真 fp8) + `k_pe`(qk_rope_head_dim×**bf16**) + `knope_scale`(kv_lora_rank/tile×**fp32**)，后两段是借道 fp8 张量运输的字节（本站点 656 = 512 + 128 + 16）。整行按 fp8 解码会把这两段读成垃圾值和 NaN ⇒ **要按段比较**（nope 用 fp8、rope 用 bf16、scale 用 fp32），否则 `rows_val` 的含义会被污染。GLM-5.2 站点分段脚本见 `HANDOVER.md` §4.1。
   做**多层扫描**（`DUMP_DIR=... DUMP_SPEC=kv:all`）时加 `--summary-only`：每层一行、进度打到 stderr（全层 1248 个文件约几秒），直接给出 `FIRST DIVERGENCE: layer L`——第 L 层 KV 是"第 L 层输入隐状态"的投影，分歧实际是在 **L−1 层的输出**里进入的；若落在 layer 0，则只可能出自写 KV / rope / 布局本身。
 - `compare_cp_rounds.py baseline=... 2call=...` → 各轮指标并排 + 结论：最后一轮的 `C-B` 是否全部回到噪声级。
 - `check_zigzag_dumps.py --kind act` → **O1**：逐 token 比较 attention 的**输入**（`in` = 上一层的输出）与**输出**（`out` = 本层 attention 的贡献）。这是全精度数据（不像 KV 那样被 fp8 量化掩盖），判据只有两条：
