@@ -36,6 +36,8 @@ import re
 import sys
 from collections import defaultdict
 
+import numpy as np
+
 try:
     import torch
 except ImportError:  # pragma: no cover - the target host always has torch
@@ -230,27 +232,36 @@ def check_topk(args) -> int:
     return 0
 
 
-def _kv_rows(payload: dict) -> list[bytes]:
+def _kv_rows(payload: dict) -> np.ndarray | None:
+    """Packed KV rows as a 2-D uint8 array (row = token), or ``None``.
+
+    Vectorised on purpose: a full-layer sweep is 78 layers x ranks pairs, and the
+    old per-row ``bytes(tensor.tolist())`` loop made the analysis take minutes.
+    """
     kv = payload.get("kv_nat")
     if not isinstance(kv, torch.Tensor):
-        return []
-    raw = kv.contiguous().view(torch.uint8)
-    return [bytes(raw[i].tolist()) for i in range(raw.shape[0])]
+        return None
+    return kv.contiguous().view(torch.uint8).numpy()
 
 
-def _max_nope_diff(left_rows: list[bytes], right_rows: list[bytes], diff_rows: list[int]) -> int:
+def _row_diff_mask(left: np.ndarray, right: np.ndarray) -> np.ndarray:
+    """Boolean per-row "these two rows differ" mask over the common row count."""
+    n = min(left.shape[0], right.shape[0])
+    return (left[:n] != right[:n]).any(axis=1)
+
+
+def _max_nope_diff(left: np.ndarray, right: np.ndarray, diff_rows: list[int]) -> int:
     """Max ``|int8|`` difference over the packed nope part of the differing rows.
 
     The first 512 bytes of a packed row are the quantized nope part, so the
     magnitude is readable directly in quantization steps.
     """
-    left = torch.frombuffer(
-        bytearray(b"".join(left_rows[i][:512] for i in diff_rows)), dtype=torch.int8
-    ).to(torch.int16)
-    right = torch.frombuffer(
-        bytearray(b"".join(right_rows[i][:512] for i in diff_rows)), dtype=torch.int8
-    ).to(torch.int16)
-    return int((left - right).abs().max().item())
+    if not diff_rows:
+        return 0
+    rows = np.asarray(diff_rows, dtype=np.int64)
+    left_part = left[rows, :512].astype(np.int16)
+    right_part = right[rows, :512].astype(np.int16)
+    return int(np.abs(left_part - right_part).max())
 
 
 def _fp_diff(left: dict, right: dict) -> tuple[int | None, int | None, float, float]:
@@ -267,16 +278,17 @@ def _fp_diff(left: dict, right: dict) -> tuple[int | None, int | None, float, fl
         return None, None, 0.0, 0.0
     if left_fp.shape != right_fp.shape:
         return None, None, 0.0, 0.0
-    lf = left_fp.float()
-    rf = right_fp.float()
-    delta = (lf - rf).abs()
-    per_row = delta.reshape(delta.shape[0], -1).amax(dim=1)
-    rows = int((per_row > 0).sum().item())
+    lf = left_fp.numpy().astype(np.float32)
+    rf = right_fp.numpy().astype(np.float32)
+    delta = np.abs(lf - rf)
+    per_row = delta.reshape(delta.shape[0], -1).max(axis=1)
+    changed = per_row > 0
+    rows = int(changed.sum())
     if not rows:
         return 0, None, 0.0, 0.0
-    first = int(per_row.nonzero()[0].item())
-    max_abs = float(delta.max().item())
-    scale = float(lf.abs().max().item()) or 1.0
+    first = int(np.argmax(changed))
+    max_abs = float(delta.max())
+    scale = float(np.abs(lf).max()) or 1.0
     return rows, first, max_abs, max_abs / scale
 
 
@@ -366,7 +378,10 @@ def check_kv(args) -> int:
     latest, counts = _latest_per_server(files)
     by_layer: dict[tuple[int, int], dict[str, tuple[str, dict]]] = defaultdict(dict)
     ignored = 0
-    for key in sorted(latest):
+    # Loading every dump is the slow part of a full sweep (GBs); report progress
+    # on stderr so a redirected run does not look like a hang.
+    total = len(latest)
+    for index, key in enumerate(sorted(latest), 1):
         layer, rank, cpbal = key
         path, meta = latest[key]
         if counts[key] > 1:
@@ -377,6 +392,8 @@ def check_kv(args) -> int:
         payload = _load(path, warn=not args.summary_only)
         if payload is not None:
             by_layer[(layer, rank)][cpbal] = (path, payload)
+        if index % 64 == 0 or index == total:
+            print(f"[kv] loaded {index}/{total} dumps", file=sys.stderr)
     per_layer: dict[int, dict] = defaultdict(
         lambda: {
             "compared": 0, "differ": 0, "rows": [], "first": None, "max": 0, "no_int8": 0,
@@ -384,6 +401,7 @@ def check_kv(args) -> int:
         }
     )
     failures = 0
+    last_reported_layer = None
     for (layer, rank), variants in sorted(by_layer.items()):
         if len(variants) < 2:
             if not args.summary_only:
@@ -404,10 +422,11 @@ def check_kv(args) -> int:
         if int8_available:
             left_rows = _kv_rows(left)
             right_rows = _kv_rows(right)
-            n = min(len(left_rows), len(right_rows))
-            diff_rows = [idx for idx in range(n) if left_rows[idx] != right_rows[idx]]
+            mask = _row_diff_mask(left_rows, right_rows)
+            n = int(mask.size)
+            diff_rows = np.nonzero(mask)[0].tolist()
         else:
-            left_rows = right_rows = []
+            left_rows = right_rows = np.zeros((0, 0), dtype=np.uint8)
             n = 0
             diff_rows = []
         stats = per_layer[layer]
@@ -429,7 +448,7 @@ def check_kv(args) -> int:
             print(
                 f"\n[kv] layer={layer} rank={rank} cpbal{left_key} vs cpbal{right_key}: "
                 + (
-                    f"rows {len(left_rows)} vs {len(right_rows)}, differing rows={len(diff_rows)}"
+                    f"rows {left_rows.shape[0]} vs {right_rows.shape[0]}, differing rows={len(diff_rows)}"
                     if int8_available
                     else "no kv_nat in dump (int8 copy skipped on this site)"
                 )
@@ -439,7 +458,7 @@ def check_kv(args) -> int:
                     else " | (no kv_fp_nat in dump)"
                 )
             )
-        if len(left_rows) != len(right_rows) and not args.summary_only:
+        if int8_available and left_rows.shape[0] != right_rows.shape[0] and not args.summary_only:
             print("     WARNING: row counts differ (num_actual_tokens/shape mismatch)")
         if diff_rows:
             failures += 1
@@ -449,11 +468,10 @@ def check_kv(args) -> int:
             max_diff = _max_nope_diff(left_rows, right_rows, diff_rows)
             stats["max"] = max(stats["max"], max_diff)
             if not args.summary_only:
-                lb = left_rows[first]
-                rb = right_rows[first]
-                byte_diff = sum(1 for a, b in zip(lb, rb) if a != b)
+                width = int(left_rows.shape[1])
+                byte_diff = int((left_rows[first] != right_rows[first]).sum())
                 print(
-                    f"     first differing token={first} bytes_differing={byte_diff}/{len(lb)} "
+                    f"     first differing token={first} bytes_differing={byte_diff}/{width} "
                     f"max|int8(nope) diff|={float(_max_nope_diff(left_rows, right_rows, [first])):.1f}"
                     f"  all-differing-rows max|int8|={max_diff}"
                 )
@@ -461,12 +479,18 @@ def check_kv(args) -> int:
                 print(f"     C file: {os.path.basename(right_path)}")
         elif not args.summary_only:
             print("     OK: identical packed KV for every token")
+        if args.summary_only and layer != last_reported_layer:
+            last_reported_layer = layer
+            print(f"[kv] compared layer {layer}", file=sys.stderr)
     _print_kv_summary(per_layer, ignored)
     print()
     fp_layers = sorted(layer for layer, stats in per_layer.items() if any(stats["fp_rows"]))
     if failures or fp_layers:
+        shown = ", ".join(str(layer) for layer in fp_layers[:8])
+        if len(fp_layers) > 8:
+            shown += f", ... (+{len(fp_layers) - 8} more)"
         print(f"[kv] RESULT: {failures} (layer, rank) pair(s) differ in the packed int8 copy; "
-              f"the FP copy differs on layer(s) {fp_layers or '-'} -> P2 violated "
+              f"the FP copy differs on {len(fp_layers)} layer(s): {shown or '-'} -> P2 violated "
               "(a token's KV content is not layout invariant)")
         return 1
     print("[kv] RESULT: P2 holds on the dumped layers (per-token KV identical across layouts)")
