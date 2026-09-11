@@ -65,7 +65,17 @@ prompt 默认是确定性随机 token-id（`--seed 1234`，词表 10 万），�
 
 - `check_zigzag_dumps.py --kind topk` → **P1**：对短于 `sparse_count` 的 prompt，LightningIndexer 每行有效前缀应当恰好是因果窗口 `{0..valid-1}`（identity 或仅顺序不同的同一集合）。有效集合缺项 ⇒ indexer 让 SFA 关注的位置少于因果窗口要求。
 - `check_zigzag_dumps.py --kind kv` → **P2**：dump 按自然 token 顺序存 packed KV，所以 cpbal0 的第 p 行与 cpbal1 的第 p 行是同一个 token，可逐字节比较。首个不同的 layer/token 就是两种排布第一次分歧的地方。
-  dump 里同时带一份**写 cache 之前的同源副本**（`kv_fp_nat`，同样自然序）：它取自 `fused_kv_no_split`，**与 cache 里是同一批打包数字**（sparse-C8 站点是 fp8 e4m3 + e8m0 scale），所以它**不消除量化掩盖**——比 fp8/int8 更细的差异在这份数据里依然看不见，它报出的"第一处不同"只是**深度上的上界**。它的价值在于：不再依赖某些站点上不可用的 NPU cache 回读（`aclnnIndexSelect 161002`），dump 因此仍能产出。判读打印两张表（`[kv/int8]` 与 `[kv/fp]`），`FIRST DIVERGENCE` 以同源副本为准，并给出 `max|d|` 与相对量级 `rel`。做**多层扫描**（`DUMP_DIR=... DUMP_SPEC=kv:all`）时加 `--summary-only`：每层一行、进度打到 stderr（全层 1248 个文件约几秒），直接给出 `FIRST DIVERGENCE: layer L`——第 L 层 KV 是"第 L 层输入隐状态"的投影，分歧实际是在 **L−1 层的输出**里进入的；若落在 layer 0，则只可能出自写 KV / rope / 布局本身。
+  dump 里同时带一份**写 cache 之前的同源副本**（`kv_fp_nat`，同样自然序）：它取自 `fused_kv_no_split`，**与 cache 里是同一批打包数字**（sparse-C8 站点是 fp8 e4m3 + e8m0 scale），所以它**不消除量化掩盖**——比 fp8 更细的差异看不出来。它的价值在于：不再依赖某些站点上不可用的 NPU cache 回读（`aclnnIndexSelect 161002`），dump 因此仍能产出。判读打印两张表（`[kv/int8]` 与 `[kv/fp]`），`FIRST DIVERGENCE` 以同源副本为准。
+  `[kv/fp]` 表把**字节**与**数值**拆开报，因为量化让这两件事含义不同（列：`val_ranks` / `rows_val` / `first_val` / `rows_byte` / `first_byte` / `max|d|` / `rel` / `byte_only`）：
+
+  | 读数 | 含义 | 判据 |
+  | --- | --- | --- |
+  | `rows_val>0`、`max\|d\|` 非 0 | 存储的**数值**不同 ⇒ ≥1 个量化步的真差异 | `FIRST DIVERGENCE (fp/value): layer L`，rc=1 |
+  | `rows_val=0`、`rows_byte>0`、`byte_only>0`、`max\|d\|=0` | 数值**全同**、只有字节不同。e4m3 里每个有限值只有一种编码（`±0` 除外）⇒ 只能是**量化零点的符号位**翻转 ⇒ **亚量化（sub-quantization）**分歧：量化前的值确实不同，但小于一个 fp8 步 | `FIRST DIVERGENCE (fp/bytes): layer L`，rc=0 |
+  | 全 0 | 逐位相同 | `FIRST DIVERGENCE (fp): none`，rc=0 |
+
+  `byte_only` 是**最灵敏的探测器**：数值完全一样时它照样能看出两种排布不等价。本项目的 TP=8 全层扫描就是这个形态（layer 0 逐位相同，layer 1 起 `rows_byte≈1000/2048`、`max|d|=0`）。⚠️ 别把 `rows_byte>0` 当成"内容写错了"——内容写错会体现在 `rows_val` 与 `max|d|` 上。
+  做**多层扫描**（`DUMP_DIR=... DUMP_SPEC=kv:all`）时加 `--summary-only`：每层一行、进度打到 stderr（全层 1248 个文件约几秒），直接给出 `FIRST DIVERGENCE: layer L`——第 L 层 KV 是"第 L 层输入隐状态"的投影，分歧实际是在 **L−1 层的输出**里进入的；若落在 layer 0，则只可能出自写 KV / rope / 布局本身。
 - `compare_cp_rounds.py baseline=... 2call=...` → 各轮指标并排 + 结论：最后一轮的 `C-B` 是否全部回到噪声级。
 - `check_zigzag_dumps.py --kind act` → **O1**：逐 token 比较 attention 的**输入**（`in` = 上一层的输出）与**输出**（`out` = 本层 attention 的贡献）。这是全精度数据（不像 KV 那样被 fp8 量化掩盖），判据只有两条：
   - `in` 相同、`out` 不同 ⇒ 差异是**本层 attention 内部**产生的（indexer 选点顺序 / SFA 归约 / o_proj）；

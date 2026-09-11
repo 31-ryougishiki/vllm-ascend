@@ -416,7 +416,7 @@ def test_check_zigzag_kv_summary_names_first_diverging_layer() -> None:
         assert rc == 1, text
         assert "[kv/fp  ]" in text, text
         # The FP copy must win: it sees layer 0, which the int8 copy reports as clean.
-        assert "FIRST DIVERGENCE (fp): layer 0" in text, text
+        assert "FIRST DIVERGENCE (fp/value): layer 0" in text, text
         assert "first token 64" in text, text
         assert "[kv/int8]     0     0/2" in text, text  # the blind spot the FP copy closes
         # The layer-0 FP row must report the magnitude in real units (~1e-2),
@@ -468,7 +468,7 @@ def test_check_zigzag_kv_summary_fp_only_dumps() -> None:
         text = buffer.getvalue()
         assert rc == 1, text
         assert "n/a (no kv_nat in dump" in text, text
-        assert "FIRST DIVERGENCE (fp): layer 0" in text, text
+        assert "FIRST DIVERGENCE (fp/value): layer 0" in text, text
         assert "first token 32" in text, text
         assert "layer 0 的 KV 直接来自 embedding" in text, text
     finally:
@@ -508,7 +508,7 @@ def test_check_zigzag_kv_skips_truncated_dumps() -> None:
         # The good rank is still compared (1/1), the truncated one is dropped.
         assert rc == 1, text
         assert "1/1" in text, text
-        assert "FIRST DIVERGENCE (fp): layer 0" in text, text
+        assert "FIRST DIVERGENCE (fp/value): layer 0" in text, text
     finally:
         shutil.rmtree(out, ignore_errors=True)
 
@@ -598,7 +598,7 @@ def test_check_zigzag_kv_handles_fp8_dumps() -> None:
             rc = checker.check_kv(argparse.Namespace(dir=str(out), summary_only=True))
         text = buffer.getvalue()
         assert rc == 1, text + errors.getvalue()
-        assert "FIRST DIVERGENCE (fp): layer 0" in text, text
+        assert "FIRST DIVERGENCE (fp/value): layer 0" in text, text
         assert "first token 32" in text, text
     finally:
         shutil.rmtree(out, ignore_errors=True)
@@ -723,6 +723,64 @@ def test_check_zigzag_act_pins_moe_divergence() -> None:
         assert "[act]     1   in         8        5" in text, text
         assert "FIRST DIVERGENCE (act): layer 1 op=in at token 3" in text, text
         assert "MoE/MLP" in text, text
+    finally:
+        shutil.rmtree(out, ignore_errors=True)
+
+
+def test_check_zigzag_kv_separates_bytes_from_values() -> None:
+    """A flipped *sign of zero* is a byte difference, not a value difference.
+
+    e4m3 stores every finite number exactly once except ``+0``/``-0``, so two
+    dumps can differ in bytes on thousands of rows while every stored *value* is
+    identical.  That is not a content error -- it is the fingerprint of a
+    difference *below* one quantization step (the pre-quantization values differ
+    and one of them flipped the sign of a value that rounded to zero).  The
+    checker must report it as sub-quantization (rc=0, ``rows_value == 0``) and
+    never as a value divergence (rc=1); the TP=8 KV sweep produced exactly this
+    signature (``rows_differ`` in the thousands with ``max|d| = 0.000e+00``).
+    """
+    if checker is None:
+        print("[skip] torch not available (check_zigzag_dumps needs it)")
+        return
+    import argparse
+
+    import torch
+
+    if not hasattr(torch, "float8_e4m3fn"):
+        print("[skip] this torch has no float8_e4m3fn")
+        return
+
+    out = _temp_dir("cp_ab_bytesonly_")
+    try:
+        torch.manual_seed(11)
+        rows = 256
+        base = (torch.randn(rows, 8) * 2).to(torch.float8_e4m3fn)
+        base_raw = base.view(torch.uint8).clone()
+        # Column 0 is a hard +0 from token 128 on in B ...
+        base_raw[128:, 0] = 0x00
+        left = base_raw.view(torch.float8_e4m3fn)
+        # ... and the same *value* (-0.0 == 0.0) stored as -0 in C.
+        right_raw = base_raw.clone()
+        right_raw[128:, 0] = 0x80
+        right = right_raw.view(torch.float8_e4m3fn)
+        assert torch.equal(left.float(), right.float()), "fixture must differ only in bytes"
+        for rank in range(2):
+            torch.save({"kv_fp_nat": left.clone()}, out / f"kv_cpbal0_layer0_rank{rank}_pid{rank}_1000.pt")
+            torch.save({"kv_fp_nat": right.clone()}, out / f"kv_cpbal1_layer0_rank{rank}_pid{rank}_1001.pt")
+        buffer, errors = io.StringIO(), io.StringIO()
+        with redirect_stdout(buffer), redirect_stderr(errors):
+            rc = checker.check_kv(argparse.Namespace(dir=str(out), summary_only=True))
+        text = buffer.getvalue()
+        assert rc == 0, text + errors.getvalue()
+        fp_row = next(line for line in text.splitlines() if line.startswith("[kv/fp  ]     0"))
+        # layer, val_ranks, rows_val, first_val, rows_byte, first_byte, max|d|, rel, byte_only
+        assert fp_row.split() == [
+            "[kv/fp", "]", "0", "0/2", "0-0", "-", "128-128", "128", "0.000e+00", "0.00e+00", "128",
+        ], fp_row
+        assert "FIRST DIVERGENCE (fp/bytes): layer 0" in text, text
+        assert "sub-quantization" in text, text
+        assert "no value-level difference" in text, text
+        assert "P2 violated" not in text, text
     finally:
         shutil.rmtree(out, ignore_errors=True)
 

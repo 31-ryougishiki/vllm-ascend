@@ -5,7 +5,7 @@
 
 ## 0. 一句话现状
 
-`cp_balance`（zigzag 切分）与连续切片（`VLLM_ASCEND_CP_BALANCE=0`）在 prefill 上**确实不等**，差异远超噪声地板（p99 ≈ 0.39~0.58 nats，top-1 翻转 17%~30%），且**差异幅度随 rank 数减少而变大**；已确认 **不是 indexer 选点错**、**不是 KV 重排写错**，分歧**从"第一个跨 block 的 token"开始**。KV 剖面的数据已在盘上（`/root/cp_dump`，1248 个 dump）**但还没判读** —— 这是当前的第一步；若 fp8 掩盖让 KV 剖面看不出起点，就直接上已经写好的 **`probe` 模式**（op 级、全精度、按 token 位置对齐的 attention in/out 剖面，见 4.2）。
+`cp_balance`（zigzag 切分）与连续切片（`VLLM_ASCEND_CP_BALANCE=0`）在 prefill 上**确实不等**，差异远超噪声地板（p99 ≈ 0.39~0.58 nats，top-1 翻转 17%~30%），且**差异幅度随 rank 数减少而变大**。TP=8 的全层 KV 剖面已经判读（§2.5）：**layer 0 逐字节相同，layer 1 起只差在量化零点的符号位、KV 数值全同** ⇒ 分歧是**亚量化（小于一个 fp8 步）的舍入级差异**，在 **layer 0 的输出**里进入，再由 78 层 MoE 放大；**不是** indexer 选点错、**不是** KV 重排写错、**不是**结构错误。下一步：**重跑一次带 `rows_val`/`rows_byte` 拆分的判读**（确认数值全同），然后跑 **`probe`（op 级、全精度）** 把"attention 内部 vs MoE/MLP"钉死。
 
 ## 1. 环境与版本（接手时先对齐）
 
@@ -56,7 +56,35 @@
 - layer 6 的 KV 是"layer 6 输入隐状态"的投影 ⇒ **分歧是在 layer 0..5 里产生的**。
 - 差异是**平滑且普遍**的（1984/2048 行都不同，幅度小），不像"少数 token 大幅偏"的选点/路由跳变。
 
-### 2.5 其他已确认
+### 2.5 TP=8 全层 KV 剖面（`/root/cp_dump`，1248 个 dump，**已判读**）
+
+命令：`python tools/cp_balance_compare/check_zigzag_dumps.py --dir /root/cp_dump --kind kv --summary-only`
+（原始输出见同目录 `log.log`；`[kv/int8]` 全列 `n/a`：这台机器 NPU `index_select` 不可用，没有 `kv_nat` 回读副本，只看 `[kv/fp]`。）
+
+| layer | 结果 |
+| --- | --- |
+| **layer 0** | **8/8 rank 逐字节相同**（`rows_differ 0-0`）→ 写 KV / rope / 布局 / 量化**完全正确** |
+| layer 1 | 8/8 rank 起，`rows_differ ≈ 1017/2048`，**first_token = 256** |
+| layer 2..77 | 同上，`rows_differ` 在 727~1092 之间波动，**first_token 基本恒为 256**（少数 257/258/260） |
+| 全部 77 层 | **`max\|d\| = 0.000e+00`、`rel = 0.00e+00`** |
+
+关键读数：**从 layer 1 起差异只体现在"存储字节"上，KV 的数值一模一样**（`max|d|=0` 覆盖所有层）。
+e4m3 里每个有限值只有一个编码（`±0` 除外），所以"值相同、字节不同"只能是**量化零点的符号位被翻转**
+→ 这是**亚量化（sub-quantization）分歧**：量化前的值确实不同，但**小于一个 fp8 量化步**。
+（本仓库的 checker 现在把两者拆开报：`rows_val` / `rows_byte` / `byte_only`；旧版只报一个 `rows_differ`，
+正是"`rows_differ>0` 而 `max|d|=0`"这个看似矛盾的组合。）
+
+⚠️ 待复核：旧 checker 的行数是按**字节**数的、幅度是按**数值**算的（两者语义不同），所以要**重跑一次**确认
+`rows_val` 全 0 且 `byte_only>0`。若 `rows_val>0`，性质就完全不同（真内容差异），此时以 `[kv/fp]` 的 `max|d|` 为准。
+
+推论：
+
+- 分歧**在 layer 0 的输出里进入**（layer 0 的 KV 来自 embedding，逐位相同；layer 1 的 KV 是 layer 0 输出的投影）。
+  与 §2.4 的 TP=16 结论一致（layer 0 干净、layer 6 脏）。
+- 分歧幅度**在每一层都小于一个 fp8 量化步** ⇒ 不是"写错 token / 少算位置"这类结构错误（那会给出完全不同的量化值），
+  而是**归约顺序级的舍入差异**；0.5 nat 级 logprob 差异与 17~30% top-1 翻转只能是**下游放大**（78 层 MoE 路由跳变）的结果。
+
+### 2.6 其他已确认
 
 - 日志侧元数据不变量 `[CP_BALANCE][check][*]`（prefix sum / block_table 行数 / `kv_len>=q_len` / 请求对齐）**从未触发**。
 - `[CP_BALANCE] metadata zigzag=1 … cp_size=8 … local_tokens=256`、`forward zigzag_active=1` 每轮都出现 → C 确实走 zigzag，分片算术自洽（2048/8=256，2049→pad 2064→258）。
@@ -69,7 +97,7 @@
 | indexer 选点错（P1） | **已排除**（rank 局部 `mismatched=0`；全局合并仍未被工具覆盖） |
 | KV 重排 slot 写错 | **已排除**（layer 0 逐位相同） |
 | 元数据契约错（prefix/block_table/kv_len） | **已排除**（`[check]` 告警从未触发） |
-| 量化掩盖导致的假"相同" | **未排除**：`kv_fp_nat` 是 fp8 同源副本，**不是更高精度**；比 fp8 细的差异看不见 → 报出的"第一处不同"只是深度上界 |
+| 量化掩盖导致的假"相同" | **已量化**：全层 fp8 剖面显示"值全同、只有 ±0 符号位不同" ⇒ 差异 < 1 个量化步；比量化更细的幅度只能靠 `act`（probe） |
 | 合并 2B 单次调用（T1，`MERGED_CALL=0`） | **未测**（`run_cp_diag.sh 2call`，2 次加载） |
 | `MIN_TOKENS` 边界（T4） | **未测**（`l1024`） |
 | **主假设 A**：跨 block/rank 的归约顺序类差异，被 78 层 MoE 路由（离散选择）放大 | 未证实；"平滑、普遍、起点在块边界"与之一致 |
@@ -77,28 +105,33 @@
 
 ## 4. 下一步（按优先级；每步一条命令 + 判据）
 
-### 4.1 拿全层 KV 剖面（数据已在盘上，几秒，不需要 NPU）——**当前这一步**
+### 4.1 复核全层 KV 剖面（数据已在盘上，几秒，不需要 NPU）——**当前这一步**
+
+§2.5 的结论来自一次输出（`log.log`），但那份输出里 `rows_differ>0` 与 `max|d|=0.000e+00` 并存，
+而行数与幅度在旧 checker 里是**两种语义**（字节 vs 数值）。新 checker 把两者拆成
+`rows_val` / `rows_byte` / `byte_only` 三列，重跑一次就能把结论钉死（同一份数据，不需要 NPU）：
 
 ```bash
 cd /home/z30055003/vllm-ascend
-echo "HEAD=$(git rev-parse --short HEAD) dirty=$(git status --porcelain | wc -l)"
-ls /root/cp_dump/*.pt 2>/dev/null | wc -l          # 期望 1248 = 78 层 x 8 rank x 2 配置
+git rev-parse --short HEAD                     # 需要含本次判读改动（>= 7b838e5ea 之后的 checker）
+ls /root/cp_dump/*.pt 2>/dev/null | wc -l      # 期望 1248 = 78 层 x 8 rank x 2 配置
 python tools/cp_balance_compare/check_zigzag_dumps.py --dir /root/cp_dump --kind kv --summary-only \
     2>/tmp/kv_profile.err | tee tools/cp_balance_compare/log.log
-tail -3 /tmp/kv_profile.err                        # 期望 "loaded 1248/1248 dumps"
+tail -3 /tmp/kv_profile.err                    # 期望 "loaded 1248/1248 dumps"
 ```
 
-**判据**：`[kv/fp]` 表 78 行 + `FIRST DIVERGENCE (fp): layer L`；各层 `first_token` 期望 = **128**（TP=8 的块大小）。
-- `L = 0` → 只可能出自**写 KV / rope / 布局本身** → 查 `vllm_ascend/layers/cp_zigzag.py` 的分片映射与 `sfa_v1.py` 里重排后的 slot 写入；
-- `L = 1` → **layer 0 的 attention 输出**先不等 → 直接进 4.2（`probe` 会把它钉死在 op=out）；
-- `L > 1` → 是 **L−1 层的输出**先不等 → 4.2 用 `in`/`out` 两条线区分 attention 与 MoE/MLP；
-- 注意上界性质：因 fp8 掩盖，真实起点**可能更早**（这也是 4.2 必须做的原因）。
+**判据**（`[kv/fp]` 表 78 行 + 一行 `FIRST DIVERGENCE`）：
 
-⚠️ 两个已知前提：① 这份判读要 `check_zigzag_dumps.py` 是**带 fp8 支持**的版本（`2091b4a8d` 及以后，HEAD 即可）；若远端更旧会直接崩在
-`Got unsupported ScalarType Float8_e4m3fn` / `failed finding central directory`（`log.log` 里那份 traceback 的行号正对应
-`e38bb25b7`，即修复前的版本——先 `git rev-parse HEAD` 确认，别拿旧代码判读）；② 全量加载约 3.4GB 内存、十几秒。
+| 看到什么 | 含义 | 下一步 |
+| --- | --- | --- |
+| `rows_val` 全 0、layer 1 起 `rows_byte`>0、`byte_only`>0、`max\|d\|=0` | 亚量化分歧（§2.5 的预期）：KV 数值全同，只翻量化零点的符号位 | 进 4.2 的 `probe` |
+| `rows_val`>0 且 `max\|d\|` 明显非 0 | 真·内容差异（≥1 个量化步），性质完全不同 | 先报出 `first_val`/`max\|d\|`，再查该层写 KV 与选点 |
+| 全 0（连 `rows_byte` 也是 `0-0`） | 两种排布在 KV 上完全一致 | 分歧发生在 KV 写之后 → 仍然进 4.2 |
 
-### 4.2 op 级激活剖面（`probe` 模式，**已实现**，2 次模型加载 ≈ 20 分钟）
+补充判据：`first_byte` 期望 **256**（§2.5 实测），`first_val` 期望 `-`；`[kv/int8]` 整列 `n/a` 是正常的
+（这台机器 NPU `index_select` 不可用，没有 `kv_nat` 回读副本）。全量加载约 3.4GB 内存、十几秒。
+
+### 4.2 op 级激活剖面（`probe` 模式，**已实现**，2 次模型加载 ≈ 20 分钟）——4.1 之后的下一步
 
 目的：把"哪一步先不等"从"第几层的 KV"细化到 **attention 内部 vs MoE/MLP**，而且是**全精度**（不像 KV 那样被 fp8 量化掩盖）。
 

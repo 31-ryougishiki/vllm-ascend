@@ -318,50 +318,94 @@ def _as_float32(tensor: torch.Tensor) -> np.ndarray | None:
         return None
 
 
-def _fp_diff(left: dict, right: dict) -> tuple[int | None, int | None, float, float]:
-    """Row-wise comparison of the source-side packed KV copy (``kv_fp_nat``).
+def _fp_diff(left: dict, right: dict) -> dict | None:
+    """Compare the source-side packed KV copy (``kv_fp_nat``) two ways.
 
-    Returns ``(differing_rows, first_row, max_abs_delta, max_rel_delta)``;
-    ``(None, None, 0.0, 0.0)`` when the dump has no such copy.  It is the copy
-    taken before the cache scatter, i.e. the *same packed numbers* the cache
-    holds (fp8 on a sparse-C8 site) -- it removes the dependence on the NPU
-    cache readback, **not** the quantization: sub-fp8 differences stay invisible
-    here, so the first difference it reports is an upper bound in depth.
+    The stored copy is *quantized* (fp8 e4m3 on a sparse-C8 site), so two
+    different pre-quantization values can land on the same stored number -- and,
+    conversely, a difference far below one quantization step usually leaves the
+    stored *values* identical while still flipping the **sign of a quantized
+    zero**.  Both signals matter and they mean different things, so they are
+    reported separately:
+
+    * ``rows_value`` / ``first_value`` / ``max_abs``: the stored numbers differ.
+      This is a divergence at (or above) the quantization step -- a real content
+      difference.
+    * ``rows_bytes`` / ``first_bytes`` / ``byte_only``: the stored *bytes* differ.
+      When ``rows_value`` is 0 this can only be a sign flip of a quantized zero
+      (e4m3 encodes every finite value once, except ``+0``/``-0``): a
+      **sub-quantization** divergence, i.e. proof that the pre-quantization
+      values differ while agreeing to within one step.  That is the sensitive
+      detector the value comparison alone cannot provide.
+
+    Returns ``None`` when a dump has no comparable FP copy.
     """
     left_fp = left.get("kv_fp_nat")
     right_fp = right.get("kv_fp_nat")
     if not (isinstance(left_fp, torch.Tensor) and isinstance(right_fp, torch.Tensor)):
-        return None, None, 0.0, 0.0
-    if left_fp.shape != right_fp.shape:
-        return None, None, 0.0, 0.0
+        return None
+    if left_fp.shape != right_fp.shape or left_fp.ndim != 2:
+        return None
     lf = _as_float32(left_fp)
     rf = _as_float32(right_fp)
     if lf is None or rf is None:
-        return None, None, 0.0, 0.0
+        return None
+    rows = int(lf.shape[0])
+    elements = int(lf.shape[1]) if lf.ndim == 2 else 0
+    if rows == 0 or elements == 0:
+        return None
+    raw_l = left_fp.detach().to("cpu").contiguous().view(torch.uint8).numpy()
+    raw_r = right_fp.detach().to("cpu").contiguous().view(torch.uint8).numpy()
+    itemsize = max(1, raw_l.shape[1] // elements)
+    # One byte is one element for fp8, but fp16/bf16/fp32 rows are wider: fold
+    # the byte mask back to one entry per element so it can be combined with the
+    # value mask.
+    byte_diff = (raw_l != raw_r).reshape(rows, elements, itemsize).any(axis=2)
+    # NaN == NaN must not count as a value difference (a NaN on one side only
+    # still does: the two layouts then really hold different numbers).
+    both_nan = np.isnan(lf) & np.isnan(rf)
+    value_diff = (lf != rf) & ~both_nan
+    per_row_bytes = byte_diff.any(axis=1)
+    per_row_value = value_diff.any(axis=1)
     delta = np.abs(lf - rf)
-    per_row = delta.reshape(delta.shape[0], -1).max(axis=1)
-    changed = per_row > 0
-    rows = int(changed.sum())
-    if not rows:
-        return 0, None, 0.0, 0.0
-    first = int(np.argmax(changed))
-    max_abs = float(delta.max())
-    scale = float(np.abs(lf).max()) or 1.0
-    return rows, first, max_abs, max_abs / scale
+    delta[both_nan] = 0.0
+    stats = {
+        "rows_bytes": int(per_row_bytes.sum()),
+        "rows_value": int(per_row_value.sum()),
+        "first_bytes": int(np.argmax(per_row_bytes)) if per_row_bytes.any() else None,
+        "first_value": int(np.argmax(per_row_value)) if per_row_value.any() else None,
+        "max_abs": float(delta.max()) if per_row_value.any() else 0.0,
+        "max_rel": 0.0,
+        # elements that differ as bytes but not as values: sign of zero (or a
+        # NaN payload) -- the fingerprint of a sub-quantization difference.
+        "byte_only": int((byte_diff & ~value_diff).sum()),    }
+    if stats["max_abs"]:
+        scale = float(np.abs(lf).max()) or 1.0
+        stats["max_rel"] = stats["max_abs"] / scale
+    return stats
 
 
 def _summary_verdict(per_layer: dict[int, dict]) -> tuple[int | None, str]:
-    """First layer that differs, judged on the FP copy when it exists."""
-    use_fp = any(stats["fp_rows"] for stats in per_layer.values())
+    """First layer whose KV differs, judged on the FP copy when it exists.
+
+    A value-level difference wins over a byte-only (sub-quantization) one: the
+    verdict reports the earliest layer with a *content* difference when there is
+    one, and otherwise the earliest layer whose stored bytes differ at all.
+    """
+    use_fp = any(stats["fp_present"] for stats in per_layer.values())
     for layer in sorted(per_layer):
         stats = per_layer[layer]
         if not stats["compared"]:
             continue
         if use_fp:
-            if any(rows for rows in stats["fp_rows"]):
-                return layer, "fp"
+            if any(rows for rows in stats["fp_value_rows"]):
+                return layer, "fp/value"
         elif stats["differ"]:
             return layer, "int8"
+    if use_fp:
+        for layer in sorted(per_layer):
+            if any(rows for rows in per_layer[layer]["fp_byte_rows"]):
+                return layer, "fp/bytes"
     return None, "fp" if use_fp else "int8"
 
 
@@ -386,36 +430,56 @@ def _print_kv_summary(per_layer: dict[int, dict], ignored: int) -> None:
         print(f"[kv/int8] {layer:>5}  {stats['differ']:>4}/{stats['compared']:<5}  {span:>13}  "
               f"{first:>11}  {stats['max']:>7}{suffix}")
 
-    have_fp = any(stats["fp_rows"] for stats in per_layer.values())
+    have_fp = any(stats["fp_present"] for stats in per_layer.values())
     if have_fp:
-        print(f"[kv/fp  ] {'layer':>5}  {'ranks_diff':>10}  {'rows_differ':>13}  {'first_token':>11}  "
-              f"{'max|d|':>10}  {'rel':>9}")
+        print(f"[kv/fp  ] {'layer':>5}  {'val_ranks':>9}  {'rows_val':>10}  {'first_val':>9}  "
+              f"{'rows_byte':>10}  {'first_byte':>10}  {'max|d|':>10}  {'rel':>9}  {'byte_only':>9}")
         for layer in sorted(per_layer):
             stats = per_layer[layer]
             if not stats["compared"]:
                 continue
-            rows = stats["fp_rows"]
-            span = f"{min(rows)}-{max(rows)}" if rows else "-"
-            first = "-" if stats["fp_first"] is None else str(stats["fp_first"])
-            print(f"[kv/fp  ] {layer:>5}  {stats['fp_differ']:>4}/{stats['compared']:<5}  {span:>13}  "
-                  f"{first:>11}  {stats['fp_max_abs']:>10.3e}  {stats['fp_max_rel']:>9.2e}")
+            val_rows = stats["fp_value_rows"]
+            byte_rows = stats["fp_byte_rows"]
+            val_span = f"{min(val_rows)}-{max(val_rows)}" if val_rows else "-"
+            byte_span = f"{min(byte_rows)}-{max(byte_rows)}" if byte_rows else "-"
+            first_val = "-" if stats["fp_first_value"] is None else str(stats["fp_first_value"])
+            first_byte = "-" if stats["fp_first_byte"] is None else str(stats["fp_first_byte"])
+            print(f"[kv/fp  ] {layer:>5}  {stats['fp_differ']:>4}/{stats['compared']:<4}  {val_span:>10}  "
+                  f"{first_val:>9}  {byte_span:>10}  {first_byte:>10}  "
+                  f"{stats['fp_max_abs']:>10.3e}  {stats['fp_max_rel']:>9.2e}  {stats['fp_byte_only']:>9}")
 
     first_layer, which = _summary_verdict(per_layer)
     if first_layer is None:
         print(f"[kv] FIRST DIVERGENCE ({which}): none -- every compared (layer, rank) is bit-identical")
         return
     stats = per_layer[first_layer]
-    if which == "fp":
+    if which == "fp/value":
         detail = (
-            f"{stats['fp_differ']}/{stats['compared']} ranks, first token {stats['fp_first']}, "
+            f"{stats['fp_differ']}/{stats['compared']} ranks, first token {stats['fp_first_value']}, "
             f"max|d|={stats['fp_max_abs']:.3e} (rel {stats['fp_max_rel']:.2e})"
+        )
+        print(f"[kv] FIRST DIVERGENCE (fp/value): layer {first_layer} is the first layer whose KV "
+              f"*values* already differ ({detail}) -> a real content difference (>= 1 quantization step)")
+    elif which == "fp/bytes":
+        detail = (
+            f"{stats['fp_differ']}/{stats['compared']} ranks, first token {stats['fp_first_byte']}, "
+            f"rows_byte={min(stats['fp_byte_rows'])}-{max(stats['fp_byte_rows'])}, "
+            f"byte_only elements={stats['fp_byte_only']}"
+        )
+        print(f"[kv] FIRST DIVERGENCE (fp/bytes): layer {first_layer} is the first layer whose stored KV "
+              f"*bytes* differ ({detail})")
+        print(
+            "[kv] -> 但 rows_val 全 0、max|d|=0：所有层的 KV **数值完全相同**，差异只出现在量化零点"
+            "的符号位（e4m3 里每个有限值只有一个编码，±0 除外）→ 这是**亚量化（sub-quantization）**"
+            "分歧：量化前的值确实不同，但小于一个 fp8 量化步。"
         )
     else:
         detail = (
             f"{stats['differ']}/{stats['compared']} ranks, first token {stats['first']}, "
             f"max|int8| {stats['max']}"
         )
-    print(f"[kv] FIRST DIVERGENCE ({which}): layer {first_layer} is the first layer whose KV already differs ({detail})")
+        print(f"[kv] FIRST DIVERGENCE (int8): layer {first_layer} is the first layer whose KV already "
+              f"differs ({detail})")
     if first_layer == 0:
         print(
             "[kv] -> layer 0 的 KV 直接来自 embedding（与排布无关），所以分歧不是从上一层传进来的，"
@@ -424,7 +488,7 @@ def _print_kv_summary(per_layer: dict[int, dict], ignored: int) -> None:
     else:
         print(
             f"[kv] -> 该层 KV 是「该层输入隐状态」的投影，所以分歧是在上一层（layer {first_layer - 1}）"
-            "的输出里进入的；下一步按这一层去定位是哪一步先不等"
+            "的输出里进入的；下一步用 probe（op 级、全精度）定位是哪一步先不等"
         )
 
 
@@ -455,7 +519,9 @@ def check_kv(args) -> int:
     per_layer: dict[int, dict] = defaultdict(
         lambda: {
             "compared": 0, "differ": 0, "rows": [], "first": None, "max": 0, "no_int8": 0,
-            "fp_differ": 0, "fp_rows": [], "fp_first": None, "fp_max_abs": 0.0, "fp_max_rel": 0.0,
+            "fp_present": 0, "fp_differ": 0, "fp_byte_rows": [], "fp_value_rows": [],
+            "fp_first_byte": None, "fp_first_value": None,
+            "fp_max_abs": 0.0, "fp_max_rel": 0.0, "fp_byte_only": 0,
         }
     )
     failures = 0
@@ -493,15 +559,25 @@ def check_kv(args) -> int:
             stats["rows"].append(len(diff_rows))
         else:
             stats["no_int8"] += 1
-        fp_rows, fp_first, fp_max_abs, fp_max_rel = _fp_diff(left, right)
-        if fp_rows:
-            stats["fp_differ"] += 1
-            stats["fp_rows"].append(fp_rows)
-            stats["fp_first"] = fp_first if stats["fp_first"] is None else min(stats["fp_first"], fp_first)
-            stats["fp_max_abs"] = max(stats["fp_max_abs"], fp_max_abs)
-            stats["fp_max_rel"] = max(stats["fp_max_rel"], fp_max_rel)
-        elif fp_rows == 0:
-            stats["fp_rows"].append(0)
+        fp = _fp_diff(left, right)
+        if fp is not None:
+            stats["fp_present"] += 1
+            stats["fp_byte_rows"].append(fp["rows_bytes"])
+            stats["fp_value_rows"].append(fp["rows_value"])
+            if fp["first_bytes"] is not None:
+                stats["fp_first_byte"] = (
+                    fp["first_bytes"] if stats["fp_first_byte"] is None
+                    else min(stats["fp_first_byte"], fp["first_bytes"])
+                )
+            if fp["rows_value"]:
+                stats["fp_differ"] += 1
+                stats["fp_first_value"] = (
+                    fp["first_value"] if stats["fp_first_value"] is None
+                    else min(stats["fp_first_value"], fp["first_value"])
+                )
+                stats["fp_max_abs"] = max(stats["fp_max_abs"], fp["max_abs"])
+                stats["fp_max_rel"] = max(stats["fp_max_rel"], fp["max_rel"])
+            stats["fp_byte_only"] = max(stats["fp_byte_only"], fp["byte_only"])
         if not args.summary_only:
             print(
                 f"\n[kv] layer={layer} rank={rank} cpbal{left_key} vs cpbal{right_key}: "
@@ -511,8 +587,11 @@ def check_kv(args) -> int:
                     else "no kv_nat in dump (int8 copy skipped on this site)"
                 )
                 + (
-                    f" | fp rows={fp_rows} first={fp_first} max|d|={fp_max_abs:.3e} rel={fp_max_rel:.2e}"
-                    if fp_rows is not None
+                    f" | fp rows_value={fp['rows_value']} first_value={fp['first_value']} "
+                    f"max|d|={fp['max_abs']:.3e} rel={fp['max_rel']:.2e} | "
+                    f"rows_bytes={fp['rows_bytes']} first_byte={fp['first_bytes']} "
+                    f"byte_only={fp['byte_only']}"
+                    if fp is not None
                     else " | (no kv_fp_nat in dump)"
                 )
             )
@@ -542,16 +621,24 @@ def check_kv(args) -> int:
             print(f"[kv] compared layer {layer}", file=sys.stderr)
     _print_kv_summary(per_layer, ignored)
     print()
-    fp_layers = sorted(layer for layer, stats in per_layer.items() if any(stats["fp_rows"]))
-    if failures or fp_layers:
-        shown = ", ".join(str(layer) for layer in fp_layers[:8])
-        if len(fp_layers) > 8:
-            shown += f", ... (+{len(fp_layers) - 8} more)"
+    value_layers = sorted(layer for layer, stats in per_layer.items() if any(stats["fp_value_rows"]))
+    byte_layers = sorted(layer for layer, stats in per_layer.items() if any(stats["fp_byte_rows"]))
+    if failures or value_layers:
+        shown = ", ".join(str(layer) for layer in (value_layers or byte_layers)[:8])
+        if len(value_layers or byte_layers) > 8:
+            shown += f", ... (+{len(value_layers or byte_layers) - 8} more)"
         print(f"[kv] RESULT: {failures} (layer, rank) pair(s) differ in the packed int8 copy; "
-              f"the FP copy differs on {len(fp_layers)} layer(s): {shown or '-'} -> P2 violated "
+              f"the FP copy differs *in value* on {len(value_layers)} layer(s): {shown or '-'} -> P2 violated "
               "(a token's KV content is not layout invariant)")
         return 1
-    print("[kv] RESULT: P2 holds on the dumped layers (per-token KV identical across layouts)")
+    if byte_layers:
+        print(f"[kv] RESULT: no value-level difference anywhere; the stored bytes differ on "
+              f"{len(byte_layers)} layer(s) ({byte_layers[0]}..{byte_layers[-1]}) and only as flipped "
+              "signs of quantized zeros -> the KV *content* agrees within one quantization step "
+              "(sub-quantization divergence), i.e. no layout/content error, but the two layouts are "
+              "not bit-identical")
+        return 0
+    print("[kv] RESULT: P2 holds on the dumped layers (per-token KV bit-identical across layouts)")
     return 0
 
 
