@@ -1123,23 +1123,26 @@ def check_act(args) -> int:
               "pre-MLP 的 norm / 残差 / 跨 rank 归约（不是 MLP 本身，也不是 attention）")
     elif op == "gu_q":
         print(f"[act] -> layer {layer} 的 **gate_up 量化输入**（喂给 npu_quant_matmul 的 fp8 + e8m0 scale）先不等，"
-              f"而同层 MLP 的 bf16 输入（op=mlp_in）逐字节相同 ⇒ 根因在**激活量化这一步**："
+              f"而同层 MLP 的 bf16 输入（op=mlp_in）逐字节相同 ⇒ 根因候选集中在**激活量化这一步**："
               f"同一批 bf16 行在不同排布下量化出不同的 fp8/scale（MX 量化并非逐 token 独立，"
               f"或融合的 norm+quant 内核按 tile 共享状态）。"
-              f"下一步：查该层量化/融合内核的入参形状与 tile，不必再往 GEMM 里找")
+              f"注意：本判词只到「步骤 + 生产者」，不到代码行/算子参数——下一步用这一轮的 dump 做离线复现"
+              f"（同输入不同行序喂 npu_dynamic_mx_quant，无需再加载模型）")
     elif op == "gu_out":
         if quant_clean is False:
             print(f"[act] -> layer {layer} 的 **gate_up_proj 输出**先不等，且同层 **gu_q 也不等** ⇒ "
-                  f"根因在**量化**：同一个 bf16 输入量化出不同的 fp8/scale（见 op=gu_q 那一行）")
+                  f"根因候选集中在**量化**（见 op=gu_q 那一行）；下一步同上（离线复现量化那一步）")
         elif quant_clean is True:
             print(f"[act] -> layer {layer} 的 **gate_up_proj 输出**先不等，而它的两个输入都逐字节相同"
-                  f"（bf16 见 op=mlp_in，量化后的 fp8/scale 见 op=gu_q）⇒ 根因在 **npu_quant_matmul 这个 GEMM 内核本身**："
-                  f"逐行数学与权重都相同、输入逐位相同却给出不同结果 ⇒ 查内核 tiling/workspace 与确定性"
-                  f"（同一配置重跑一次即可判定），而不是 token 排布的数学")
+                  f"（bf16 见 op=mlp_in，量化后的 fp8/scale 见 op=gu_q）⇒ 根因候选集中在 "
+                  f"**npu_quant_matmul 这个 GEMM 内核本身**：逐行数学与权重都相同、输入逐位相同却给出不同结果"
+                  f"⇒ 查内核 tiling/workspace 与确定性（同一配置重跑一次即可判定）。"
+                  f"注意：算子实现在 CANN 里，没有源码行可指——能拿到的是「什么入参形状/行序下不可复现」"
+                  f"与绕开方式，用 dump 的 (q, scale) 做离线行置换实验即可给出")
         else:
             print(f"[act] -> layer {layer} 的 **gate_up_proj 输出**先不等，而 MLP 输入逐字节相同 ⇒ "
                   f"分歧产生在这一个 GEMM 内部：**激活量化（A-quant）** 或 GEMM 内核的 tiling/累加顺序"
-                  f"（本层未打点 qin，无法区分；加 `qin:{layer}` 后一轮即可定死）")
+                  f"（本层未打点 qin，无法区分；加 `qin:{layer}` 后一轮即可收窄到两者之一）")
     elif op == "dn_in":
         print(f"[act] -> layer {layer} 的 **down_proj 输入（bf16，silu 之后）**先不等，"
               f"而 gate_up_proj 输出相同 ⇒ 分歧产生在中间的**激活函数（silu）**这一步")
@@ -1149,19 +1152,20 @@ def check_act(args) -> int:
                   f"先看更早的 op=gu_q / op=gu_out 两行，分歧不在这一步")
         else:
             print(f"[act] -> layer {layer} 的 **down_proj 量化输入**（silu 之后的 fp8 + scale）先不等，"
-                  f"而 gate_up_proj 输出相同 ⇒ 根因在 **silu 之后的量化**这一步")
+                  f"而 gate_up_proj 输出相同 ⇒ 根因候选集中在 **silu 之后的量化**这一步"
+                  f"（同样只到「步骤」，下一步用 dump 做离线复现）")
     elif op == "mlp_out":
         if dn_q_clean is False:
             print(f"[act] -> layer {layer} 的 **MLP/MoE 输出**先不等，但同层 down_proj 的量化输入也不等 ⇒ "
-                  f"根因在 down_proj 之前（见 op=dn_q / op=dn_in 两行）")
+                  f"根因候选在 down_proj 之前（见 op=dn_q / op=dn_in 两行）")
         elif dn_q_clean is True:
             print(f"[act] -> layer {layer} 的 **MLP/MoE 输出**先不等，而它的输入与 down_proj 的量化输入都相同"
-                  f"（见同层 op=mlp_in / op=dn_q）⇒ 根因在 **down_proj 这个 GEMM（含跨 rank 归约）**："
-                  f"输入逐位相同却给出不同输出 ⇒ 查内核 tiling/workspace 与确定性")
+                  f"（见同层 op=mlp_in / op=dn_q）⇒ 根因候选集中在 **down_proj 这个 GEMM（含跨 rank 归约）**："
+                  f"输入逐位相同却给出不同输出 ⇒ 查内核 tiling/workspace 与确定性（同样需要离线行置换实验定位）")
         else:
             print(f"[act] -> layer {layer} 的 **MLP/MoE 输出**先不等，而它的输入相同（见同层 mlp_in 那一行）"
                   "⇒ 分歧产生在这一层的 MLP/MoE **内部**：激活量化 / GEMM 分组与内核 tiling / 专家计算"
-                  f"（本层未打点 qin，无法区分；加 `qin:{layer}` 后一轮即可定死）")
+                  f"（本层未打点 qin，无法区分；加 `qin:{layer}` 后一轮即可收窄）")
     else:
         print(f"[act] -> layer {layer} 的 attention 输出先不等（输入见 op=in 那一行）："
               "差异在这一层的 attention 内部产生（indexer 选点顺序 / SFA 归约顺序 / o_proj），"
