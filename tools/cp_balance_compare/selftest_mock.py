@@ -825,6 +825,86 @@ def test_check_zigzag_kv_reports_nan_difference_instead_of_zero() -> None:
         shutil.rmtree(out, ignore_errors=True)
 
 
+def test_check_zigzag_topk_cross_layout_uses_positions() -> None:
+    """The B/C top-k comparison must match rows by token, and flag order-only changes.
+
+    Same trap as the activation trace: under zigzag rank 0 owns ``[0,1]+[6,7]``
+    while the continuous layout gives it ``[0..3]``, so a row-wise comparison
+    would report nonsense.  With ``positions`` present the checker must compare
+    per token and distinguish "different set" (a real indexer bug) from "same
+    set, different order" (the SFA kernel consumes the list as given, so this is
+    a prime suspect for a numeric difference).
+    """
+    if checker is None:
+        print("[skip] torch not available (check_zigzag_dumps needs it)")
+        return
+    import argparse
+
+    import torch
+
+    out = _temp_dir("cp_ab_topkcross_")
+    try:
+        width = 8
+
+        def save(cpbal: int, rank: int, positions: list[int], rows: list[list[int]],
+                 q_prefix: list[int], kv_raw: list[int], ts: int = 0) -> None:
+            topk = torch.tensor(
+                [row + [-1] * (width - len(row)) for row in rows], dtype=torch.int32
+            )
+            torch.save(
+                {
+                    "kind": "topk",
+                    "topk_indices": topk,
+                    "positions": torch.tensor(positions, dtype=torch.int32),
+                    "actual_seq_lengths_query": torch.tensor(q_prefix, dtype=torch.int32),
+                    "actual_seq_lengths_key": torch.tensor(kv_raw, dtype=torch.int32),
+                },
+                out / f"topk_cpbal{cpbal}_layer0_rank{rank}_pid{100 + rank}_{(1000 + cpbal) if not ts else ts}.pt",
+            )
+
+        # B (continuous): rank 0 -> tokens 0..3 (one batch, kv=4), rank 1 -> 4..7
+        # (one batch, kv=8).  Every list is the full ascending causal window, so
+        # the per-dump window check passes as well.
+        save(0, 0, [0, 1, 2, 3],
+             [[0], [0, 1], [0, 1, 2], [0, 1, 2, 3]], [4], [4])
+        save(0, 1, [4, 5, 6, 7],
+             [[0, 1, 2, 3, 4], [0, 1, 2, 3, 4, 5], [0, 1, 2, 3, 4, 5, 6],
+              [0, 1, 2, 3, 4, 5, 6, 7]], [4], [8])
+        # C (zigzag): rank 0 -> tokens [0,1] + [6,7] (two batches), rank 1 ->
+        # [2,3] + [4,5].  Same sets everywhere; token 7 is presented reversed.
+        save(1, 0, [0, 1, 6, 7],
+             [[0], [0, 1], [0, 1, 2, 3, 4, 5, 6], [7, 6, 5, 4, 3, 2, 1, 0]], [2, 4], [2, 8])
+        save(1, 1, [2, 3, 4, 5],
+             [[0, 1, 2], [0, 1, 2, 3], [0, 1, 2, 3, 4], [0, 1, 2, 3, 4, 5]], [2, 4], [4, 6])
+
+        buffer, errors = io.StringIO(), io.StringIO()
+        with redirect_stdout(buffer), redirect_stderr(errors):
+            rc = checker.check_topk(argparse.Namespace(dir=str(out), summary_only=True))
+        text = buffer.getvalue()
+        assert rc == 0, text + errors.getvalue()
+        assert "[topk/cross]" in text, text
+        cross_row = next(line for line in text.splitlines() if line.startswith("[topk/cross]     0"))
+        # layer, compared, covered_B, covered_C, set_diff, order_diff, first_set, first_order
+        expected = ["[topk/cross]", "0", "8", "8", "8", "0", "1", "-", "7"]
+        assert cross_row.split() == expected, cross_row
+        assert "same set in a different ORDER" in text, text
+
+        # A different set must be reported as a real mismatch (rc=1): token 7
+        # now selects a set that is not B's causal window either.
+        save(1, 0, [0, 1, 6, 7],
+             [[0], [0, 1], [0, 1, 2, 3, 4, 5, 6], [0, 1, 2, 3, 4, 5, 6, 0]], [2, 4], [2, 8], ts=1002)
+        save(1, 1, [2, 3, 4, 5],
+             [[0, 1, 2], [0, 1, 2, 3], [0, 1, 2, 3, 4], [0, 1, 2, 3, 4, 5]], [2, 4], [4, 6], ts=1002)
+        buffer = io.StringIO()
+        with redirect_stdout(buffer):
+            rc = checker.check_topk(argparse.Namespace(dir=str(out), summary_only=True))
+        text = buffer.getvalue()
+        assert rc == 1, text
+        assert "selected a DIFFERENT SET" in text, text
+    finally:
+        shutil.rmtree(out, ignore_errors=True)
+
+
 def test_load_prompts_file() -> None:
     out = Path(_temp_dir("cp_ab_pf_"))
     try:

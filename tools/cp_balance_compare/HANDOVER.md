@@ -5,7 +5,7 @@
 
 ## 0. 一句话现状
 
-`cp_balance`（zigzag 切分）与连续切片（`VLLM_ASCEND_CP_BALANCE=0`）在 prefill 上**确实不等**，差异远超噪声地板（p99 ≈ 0.39~0.58 nats，top-1 翻转 17%~30%），且**差异幅度随 rank 数减少而变大**。TP=8 的全层 KV 剖面已判读（§2.5）：**layer 0 逐字节相同** ⇒ 写 KV / rope / 布局 / 量化没写错；**layer 1 起 KV 的解码值就不同了**（约一半行、从 token 256 开始）⇒ 分歧在 **layer 0 的输出**里进入并被逐层放大。**不是** indexer 选点错、**不是** KV 重排写错、**不是**元数据契约错。下一步：**分段比较 packed KV 行**（nope/rope/scale，§4.1）定量分歧幅度，然后跑 **`probe`（op 级、全精度）** 定位到 attention vs MoE/MLP。
+`cp_balance`（zigzag 切分）与连续切片（`VLLM_ASCEND_CP_BALANCE=0`）在 prefill 上**确实不等**，差异远超噪声地板（p99 ≈ 0.39~0.58 nats，top-1 翻转 17%~30%），且**差异幅度随 rank 数减少而变大**。TP=8 全层 KV 剖面 + 分段比较（§2.5、§4.1）已确认：**layer 0 逐字节相同**（写 KV / rope / 布局 / 量化没写错），**layer 1 起三段（nope/rope/scale）都真的不同且从 token 256 开始**，幅度逐层放大（block-max 代理 6.8e-7 → 1.7e-3，未量化的 rope 9.4e-2 → 0.70）⇒ 分歧在 **layer 0 的输出**里进入并被逐层放大，是**真实的数值分歧**（不是只翻量化零点）。**不是** indexer 选点错、**不是** KV 重排写错、**不是**元数据契约错。下一步：`probe` 轮（§4.2）——`act` 定位 attention vs MoE/MLP，`topk/cross` 判定索引表是否只是顺序不同。
 
 ## 1. 环境与版本（接手时先对齐）
 
@@ -101,7 +101,7 @@
 | indexer 选点错（P1） | **已排除**（rank 局部 `mismatched=0`；全局合并仍未被工具覆盖） |
 | KV 重排 slot 写错 | **已排除**（layer 0 逐位相同） |
 | 元数据契约错（prefix/block_table/kv_len） | **已排除**（`[check]` 告警从未触发） |
-| 量化掩盖导致的假"相同" | **反转了**：全层剖面里 KV 的解码值确实不同（`rows_value≈1000/2048`，first=256）。但整行按 fp8 解码会把 rope/scale 段读成垃圾+NaN，所以"KV 内容是否真的变了"要等**分段比较**（§4.1）才能定 |
+| 量化掩盖导致的假"相同" | **已澄清**：分段比较显示三段都真的不同，但幅度谱极不均匀——`scale_fp32`（block-max 代理）1e-6→1.7e-3、`rope_bf16`（未量化）9e-2→0.70、`nope_fp8` 只差 1 步（极值段）。分歧真实存在且逐层放大，不是亚量化噪声 |
 | 合并 2B 单次调用（T1，`MERGED_CALL=0`） | **未测**（`run_cp_diag.sh 2call`，2 次加载） |
 | `MIN_TOKENS` 边界（T4） | **未测**（`l1024`） |
 | **主假设 A**：跨 block/rank 的归约顺序类差异，被 78 层 MoE 路由（离散选择）放大 | 未证实；"平滑、普遍、起点在块边界"与之一致 |
@@ -165,21 +165,50 @@ PY
 补充：`first` 期望都是 **256**（§2.5 实测）；`nan` 说明该段里有多少 NaN 字节模式（rope/scale 段本来就可能有，
 因为它们是借道 fp8 运输的 bf16/fp32 数据）。
 
+**已实测结果（TP=8 现场，2026-09-12）**：
+
+| layer | nope_fp8 | rope_bf16 | scale_fp32 |
+| --- | --- | --- | --- |
+| 0 | 0 行 / max 0 | 0 行 / max 0 | 0 行 / max 0 |
+| 1 | **1664 行**，first 256，max\|d\| **32** | **1664 行**，first 256，max\|d\| 9.4e-2 | 1300 行，first 256，max\|d\| **6.8e-7** |
+| 2 | 1792 行，first 256，max\|d\| 32 | 1792 行，max\|d\| 6.3e-2 | 1725 行，max\|d\| 8.2e-7 |
+| 77 | 1792 行，first 256，max\|d\| **320** | 1792 行，max\|d\| **7.0e-1** | 1792 行，max\|d\| **1.7e-3** |
+
+读法：**三段都真的不同**（不是"只翻零点符号位"），但幅度谱很不均匀——
+- `scale_fp32` 是 **fp32 的 block-max 代理**，它的 `max|d|` 从 6.8e-7（layer 1）涨到 1.7e-3（layer 77），
+  这个量级才是"隐状态差异"的可信下界/上界（= block 内极值元素的相对变化，~1e-6→1e-3）；
+- `nope_fp8` 的 `max|d|=32`（layer 1）= **e4m3 在 256~448 段的一个量化步**，即"极值元素差 1 步"，
+  不是"KV 内容大幅不同"；layer 77 的 320 = 同段 10 步（差异确实在长起来）；
+- `rope_bf16` 是**未经量化的 bf16 k_pe**，它的 max|d| 从 9.4e-2 涨到 0.70 —— 由于 rope 值本身是 O(1~10)，
+  说明到 layer 77 时隐状态的差异已经到 **~1e-2…1e-1 相对**量级；
+- `max_rel` 列（1e27~1e31）是伪值：分母里出现 0/denormal，别读它。
+
+结论：分歧从一开始（layer 1 = layer 0 输出的投影）就**真实存在**，并且**逐层放大**（scale 代理 1e-6 → 1e-3，
+rope 9e-2 → 7e-1）。所以不是"只差在量化零点符号位上"的亚量化噪声，而是**持续放大的数值分歧**；
+`probe`（4.2）就是去测它在 layer 0 的那一跳有多大、是 attention 还是 MoE。
+
 ### 4.2 op 级激活剖面（`probe` 模式，**已实现**，2 次模型加载 ≈ 20 分钟）——4.1 之后的下一步
 
 目的：把"哪一步先不等"从"第几层的 KV"细化到 **attention 内部 vs MoE/MLP**，而且是**全精度**（不像 KV 那样被 fp8 量化掩盖）。
+默认一轮带三样东西：`act:0,1,2,3`（attention in/out）、`topk:0`（layer 0 的索引进表，按 token 位置比集合与顺序）、`kv:0,1`（参考）。
 
 ```bash
-bash tools/cp_balance_compare/run_cp_diag.sh probe          # B/C 无 B2 + act:0,1,2,3,kv:0,1,2,3 → /root/cp_probe
+bash tools/cp_balance_compare/run_cp_diag.sh probe          # B/C 无 B2 → /root/cp_probe
 python tools/cp_balance_compare/check_zigzag_dumps.py --dir /root/cp_probe --kind act --summary-only
+python tools/cp_balance_compare/check_zigzag_dumps.py --dir /root/cp_probe --kind topk --summary-only
 ```
 
 **判据**（每层两行的紧凑表 + 一行结论）：
 - `FIRST DIVERGENCE (act): layer L op=out at token P` → 差异**在本层 attention 内部**产生（indexer 选点顺序 / SFA 归约顺序 / o_proj）；
 - `... op=in at token P` → 差异是**上一层（L−1）的 MoE/MLP**产生的；
 - `none` → 探测的这几层全精度逐字节相同，分歧在更深处 → `export DUMP_SPEC=act:4,5,6,7,8,9` 再来一轮（层数几乎免费，贵的是模型加载）。
+- `[topk/cross] RESULT: ... same set in a different ORDER` → 同一个 token 在 B/C 下选出**同一集合但顺序不同**：
+  内核按给定顺序累加 ⇒ 这本身就是数值分歧的候选机制（可以直接作为下一步的修复/验证方向）；
+  `... DIFFERENT SET` → indexer 本身就与排布有关（更严重，先修这个）。
 
-要点：位置键取自写 KV 用的同一个 `slot_mapping_cp`，跨布局可比；`slot=-1` 的 padding 行被丢弃；one-shot，所以只有第一个请求（2048）的数据。
+要点：位置键取自写 KV 用的同一个 `slot_mapping_cp`，跨布局可比；`slot=-1` 的 padding 行被丢弃；
+one-shot，所以只有第一个请求（2048）的数据。`topk` 的跨排布对比需要 dump 里的 `positions`
+（老 dump 没有 → 会打印 "cross-layout order comparison skipped"）。
 
 ### 4.3 两个未做的判别实验（各 2 次模型加载，约 20 分钟）
 

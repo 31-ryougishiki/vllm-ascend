@@ -188,6 +188,143 @@ def _row_windows(payload: dict) -> tuple[list[int], list[int], str]:
     return positions, kv_lens, name
 
 
+def _topk_positions(payload: dict, rows: int) -> np.ndarray | None:
+    """Global token position of every row of a top-k dump, or ``None``.
+
+    Old dumps have no ``positions`` field (written before the activation trace
+    existed); without it the rows of B and C cannot be matched up (the same row
+    index is a different token in the two layouts), so the cross-layout
+    comparison is skipped instead of compared by row.
+    """
+    positions = payload.get("positions")
+    if not isinstance(positions, torch.Tensor):
+        return None
+    pos = positions.detach().to("cpu").to(torch.int64).numpy()[:rows]
+    return pos if pos.size else None
+
+
+def _topk_global_table(paths: list[str]) -> tuple[dict[int, np.ndarray], int] | None:
+    """Pool every rank of one layout into ``{token position: index list}``.
+
+    Ranks must be pooled, not paired rank-by-rank: under zigzag rank ``r`` owns
+    ``[block r, block 15-r]`` while the continuous layout gives it
+    ``[256r, 256r+256)``, so rank 1's token sets do not even intersect.  Only the
+    whole layout covers the sequence.
+    """
+    table: dict[int, np.ndarray] = {}
+    width = 0
+    for path in paths:
+        payload = _load(path)
+        if payload is None:
+            continue
+        topk = payload.get("topk_indices")
+        if not isinstance(topk, torch.Tensor) or topk.ndim < 2:
+            continue
+        rows = int(topk.shape[0])
+        positions = _topk_positions(payload, rows)
+        if positions is None:
+            continue
+        flat = topk.reshape(rows, -1)
+        width = max(width, int(flat.shape[1]))
+        array = flat.numpy()
+        limit = int(payload.get("num_actual_tokens") or 0)
+        for index, position in enumerate(positions):
+            if position < 0 or (limit > 0 and position >= limit):
+                continue
+            table[int(position)] = array[index]
+    if not table:
+        return None
+    return table, width
+
+
+def _compare_topk_layouts(layer: int, left: tuple, right: tuple) -> dict:
+    """Compare the two layouts' index lists token by token."""
+    table_l, width_l = left
+    table_r, width_r = right
+    width = min(width_l, width_r)
+    common = sorted(set(table_l) & set(table_r))
+    set_diff = order_diff = 0
+    first_set = first_order = None
+    sample = None
+    for position in common:
+        row_l = table_l[position][:width]
+        row_r = table_r[position][:width]
+        if np.array_equal(row_l, row_r):
+            continue
+        # Only non-negative entries are real KV positions.
+        list_l = [int(x) for x in row_l[row_l >= 0]]
+        list_r = [int(x) for x in row_r[row_r >= 0]]
+        if sorted(list_l) != sorted(list_r):
+            set_diff += 1
+            if first_set is None:
+                first_set = position
+                if sample is None:
+                    sample = (position, sorted(set(list_l) - set(list_r))[:8], sorted(set(list_r) - set(list_l))[:8])
+        else:
+            order_diff += 1
+            if first_order is None:
+                first_order = position
+                if sample is None:
+                    sample = (position, list_l[:6], list_r[:6])
+    return {
+        "layer": layer, "compared": len(common), "set_diff": set_diff, "order_diff": order_diff,
+        "first_set": first_set, "first_order": first_order, "sample": sample,
+        "covered_l": len(table_l), "covered_r": len(table_r),
+    }
+
+
+def _topk_cross_config(args, latest: dict) -> int:
+    """Second pass of ``--kind topk``: B vs C index lists, keyed by token.
+
+    Separate from the per-dump causal-window check on purpose: that one is about
+    the indexer's *contract*, this one is about layout invariance, and they fail
+    for different reasons.
+    """
+    by_layer: dict[int, dict[str, list[str]]] = defaultdict(lambda: defaultdict(list))
+    for key in sorted(latest):
+        layer, _rank, cpbal = key
+        by_layer[layer][cpbal].append(latest[key][0])
+    rows: list[dict] = []
+    for layer, variants in sorted(by_layer.items()):
+        if len(variants) < 2:
+            continue
+        left = _topk_global_table(variants[sorted(variants)[0]])
+        right = _topk_global_table(variants[sorted(variants)[-1]])
+        if left is None or right is None:
+            continue
+        rows.append(_compare_topk_layouts(layer, left, right))
+    if not rows:
+        print("[topk/cross] no dump carries per-row positions -> cross-layout order comparison skipped")
+        print("[topk/cross] (set VLLM_ASCEND_CP_BALANCE_DUMP=topk:<layer> and re-run the round to get them)")
+        return 0
+    print()
+    print(f"[topk/cross] {'layer':>5}  {'compared':>8}  {'covered_B':>9}  {'covered_C':>9}  "
+          f"{'set_diff':>8}  {'order_diff':>10}  {'first_set':>9}  {'first_order':>11}")
+    set_diffs = order_diffs = 0
+    for stats in rows:
+        set_diffs += stats["set_diff"]
+        order_diffs += stats["order_diff"]
+        print(f"[topk/cross] {stats['layer']:>5}  {stats['compared']:>8}  {stats['covered_l']:>9}  "
+              f"{stats['covered_r']:>9}  {stats['set_diff']:>8}  {stats['order_diff']:>10}  "
+              f"{'-' if stats['first_set'] is None else stats['first_set']:>9}  "
+              f"{'-' if stats['first_order'] is None else stats['first_order']:>11}")
+    if rows and rows[0]["sample"] is not None:
+        position, left_part, right_part = rows[0]["sample"]
+        print(f"[topk/cross] first differing token={position}: B={left_part} C={right_part}")
+    if set_diffs:
+        print(f"[topk/cross] RESULT: {set_diffs} token(s) selected a DIFFERENT SET of positions in B and C "
+              "-> the indexer itself is layout dependent (a real bug, not just ordering)")
+        return 1
+    if order_diffs:
+        print(f"[topk/cross] RESULT: every set is identical, but {order_diffs} token(s) present the same set "
+              "in a different ORDER. The SFA kernel consumes the list in the given order, so this alone can "
+              "produce different roundings -> prime suspect for the numeric divergence")
+        return 0
+    print("[topk/cross] RESULT: identical sets AND identical order for every compared token "
+          "-> the indexer output is layout invariant")
+    return 0
+
+
 def check_topk(args) -> int:
     files = list(_iter_dumps(args.dir, "topk"))
     if not files:
@@ -263,8 +400,9 @@ def check_topk(args) -> int:
             print("       OK: every row's valid prefix is exactly the causal window")
     if ignored and args.summary_only:
         print(f"[topk] {ignored} older dump(s) ignored (newest per (layer, rank, cp_bal) wins)")
+    cross = _topk_cross_config(args, latest)
     print()
-    if failures:
+    if failures or cross:
         print(f"[topk] RESULT: {failures} dump(s) with mismatched rows -> P1 violated (indexer/plumbing)")
         return 1
     print("[topk] RESULT: P1 holds on all dumps (top-k == causal window; indexer selection is not the cause)")

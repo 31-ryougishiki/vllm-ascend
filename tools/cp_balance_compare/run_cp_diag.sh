@@ -119,11 +119,14 @@ case "${mode}" in
     # 的贡献）各存一份，按**全局 token 位置**打点，所以 B/C 可以直接逐 token 比。
     # 判据见 README「激活剖面」：in 相同 + out 不同 => attention 内部先不等；
     # out 相同 + 下一层 in 不同 => 中间那层的 MoE/MLP 先不等。
-    # 规模：每层每个 sample ≈ 全 rank 合计 hidden*2B*2048（hidden=7168 时约 29MB），
-    # 4 层 × 2 sample × 2 配置 ≈ 470MB → 必须落真实磁盘，默认 /root/cp_probe。
+    # 另外带 layer 0 的 topk（索引表按 token 位置跨排布对比：集合是否相同、顺序是否相同
+    # —— SFA 内核按给定顺序累加，顺序不同本身就是数值分歧的候选机制）。
+    # 规模：act 每层每个 sample ≈ 全 rank 合计 hidden*2B*2048（hidden=7168 时约 29MB），
+    # topk 一层约 16MB*rank；默认 4 层 act + 1 层 topk + 2 层 kv ≈ 800MB
+    # → 必须落真实磁盘，默认 /root/cp_probe。
     round_name="r_probe"
     repeat_a=0
-    dump_spec="${DUMP_SPEC:-act:0,1,2,3,kv:0,1,2,3}"
+    dump_spec="${DUMP_SPEC:-act:0,1,2,3,topk:0,kv:0,1}"
     out_root="${OUT_ROOT:-/dev/shm/cp_ab_probe}"
     if [[ -z "${DUMP_DIR:-}" ]]; then
       dump_dir="/root/cp_probe"

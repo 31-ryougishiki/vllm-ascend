@@ -338,14 +338,14 @@ def _natural_order_fp(
         return None
 
 
-def _act_positions(attn_metadata: Any, rows: int) -> torch.Tensor | None:
+def _token_positions(attn_metadata: Any, rows: int) -> torch.Tensor | None:
     """Global cache slot (== natural token position) of every rank-local row.
 
-    The activation trace is joined **by token**, never by row: under B
-    (continuous slice) rank ``r`` holds ``[local_start, local_end_with_pad)``
+    The indexer and activation dumps are joined **by token**, never by row: under
+    B (continuous slice) rank ``r`` holds ``[local_start, local_end_with_pad)``
     while under C (zigzag) it holds ``[prev_block, next_block]`` -- the same row
     index is a different token, so a row-wise comparison is meaningless (the trap
-    the top-k dump fell into).
+    the top-k dump fell into before it carried this field).
 
     ``slot_mapping_cp`` already encodes that mapping for both layouts: it is the
     very array the KV writers scatter with, and its values are the token's global
@@ -1546,11 +1546,19 @@ class AscendSFAImpl(MLAAttentionImpl):
         zigzag_active: bool,
     ) -> None:
         """Dump the LightningIndexer output plus the metadata needed to map
-        its rows back to absolute token positions (task T2)."""
+        its rows back to absolute token positions (task T2).
+
+        ``positions`` (the token each row belongs to) is what makes the dump
+        comparable *across layouts*: the SFA kernel consumes the index list in
+        the order the indexer produced it, so the same token getting the same
+        set of positions in a different order is already a candidate mechanism
+        for a numeric divergence between B (continuous) and C (zigzag).
+        """
         if not self._zigzag_dump_enabled(self._zigzag_dump_topk_layers, self._zigzag_dump_topk_done):
             return
         self._zigzag_dump_topk_done = True
         ctx = getattr(attn_metadata, "dsa_cp_context", None)
+        positions = _token_positions(attn_metadata, int(topk_indices.shape[0]))
         payload: dict[str, Any] = {
             "kind": "topk",
             "layer_name": self.layer_name,
@@ -1560,6 +1568,8 @@ class AscendSFAImpl(MLAAttentionImpl):
             "num_actual_tokens": int(attn_metadata.num_actual_tokens),
             "num_input_tokens": int(attn_metadata.num_input_tokens),
         }
+        if positions is not None:
+            payload["positions"] = positions[: int(topk_indices.shape[0])]
         if ctx is not None:
             for key in (
                 "actual_seq_lengths_query_zigzag",
@@ -1669,7 +1679,7 @@ class AscendSFAImpl(MLAAttentionImpl):
         else:
             self._zigzag_dump_act_in_done = True
         try:
-            positions = _act_positions(attn_metadata, int(x.shape[0]) if rows is None else int(rows))
+            positions = _token_positions(attn_metadata, int(x.shape[0]) if rows is None else int(rows))
             if positions is None:
                 _zigzag_warn_once(
                     "act_no_positions",
