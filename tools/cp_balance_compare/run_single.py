@@ -71,7 +71,7 @@ def load_driver():
     return module
 
 
-def parse_args(argv: list[str] | None = None, cp_default: int = 16) -> argparse.Namespace:
+def parse_args(argv: list[str] | None = None, cp_default: int = 8) -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter
     )
@@ -90,7 +90,7 @@ def parse_args(argv: list[str] | None = None, cp_default: int = 16) -> argparse.
         "--cp-size",
         type=int,
         default=cp_default,
-        help="zigzag 的 cp_size == launcher 的 TP_SIZE（默认取 $CP_SIZE/$TP_SIZE，否则 16）",
+        help="zigzag 的 cp_size == launcher 的 TP_SIZE（默认取 $CP_SIZE/$TP_SIZE，否则 8）",
     )
     parser.add_argument("--out", default=DEFAULT_OUT)
     parser.add_argument("--url", default="", help="只发请求，不拉起 server")

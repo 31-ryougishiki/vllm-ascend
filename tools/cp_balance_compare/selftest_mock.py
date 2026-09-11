@@ -382,6 +382,7 @@ def test_check_zigzag_kv_summary_names_first_diverging_layer() -> None:
 
     out = _temp_dir("cp_ab_kvsummary_")
     try:
+        torch.manual_seed(1234)  # the fixture (and its printed magnitudes) must be reproducible
         base = torch.randint(-120, 120, (256, 64), dtype=torch.int8)
         base_fp = torch.randn(256, 64, dtype=torch.float16)
 
@@ -417,8 +418,11 @@ def test_check_zigzag_kv_summary_names_first_diverging_layer() -> None:
         # The FP copy must win: it sees layer 0, which the int8 copy reports as clean.
         assert "FIRST DIVERGENCE (fp): layer 0" in text, text
         assert "first token 64" in text, text
-        assert "1.001e-02" in text, text  # magnitude in real units, not int8 steps
         assert "[kv/int8]     0     0/2" in text, text  # the blind spot the FP copy closes
+        # The layer-0 FP row must report the magnitude in real units (~1e-2),
+        # not the int8 step count the packed copy would show.
+        fp_row = next(line for line in text.splitlines() if line.startswith("[kv/fp  ]     0"))
+        assert "e-02" in fp_row, fp_row
 
         # Identical layouts (both copies) must report no divergence at all.
         for rank in range(2):

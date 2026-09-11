@@ -15,7 +15,7 @@
 #   PROMPT_LENS  默认 2048,2049,4096        MIN_TOKENS 默认 2048
 #   REPEAT_A     默认 1（=0 跳过 B2 重复跑：少一次模型加载。噪声地板已确认是 0 时可用，
 #                此时 driver 的阈值仍是 max(0.05, 5×0)=0.05，各 case 指标不受影响）
-#   TP_SIZE      默认 16（launcher 的 tensor-parallel-size，同时决定 zigzag 的 cp_size）
+#   TP_SIZE      默认 8（launcher 的 tensor-parallel-size，同时决定 zigzag 的 cp_size）
 #   CP_SIZE      默认取 TP_SIZE（driver 的 --cp-size，必须等于 TP_SIZE）
 #   OUT_ROOT     默认 /dev/shm/cp_ab        BASE_PORT  默认 8034
 #   DUMP_SPEC    默认 topk:6,kv:0,6（置空=不 dump；支持 kv:all / topk:all）
@@ -57,7 +57,7 @@ comparer="tools/cp_balance_compare/compare_cp_rounds.py"
 launcher="${LAUNCHER:-bash tools/cp_balance_compare/launcher_glm52_w4a4c8_mxfp4.sh {port}}"
 prompt_lens="${PROMPT_LENS:-2048,2049,4096}"
 min_tokens="${MIN_TOKENS:-2048}"
-cp_size="${CP_SIZE:-${TP_SIZE:-16}}"
+cp_size="${CP_SIZE:-${TP_SIZE:-8}}"
 repeat_a="${REPEAT_A:-1}"
 if [[ "${no_repeat}" == true ]]; then
   repeat_a=0

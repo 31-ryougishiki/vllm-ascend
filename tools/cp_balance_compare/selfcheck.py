@@ -263,7 +263,7 @@ def check_host(report: Report, base_port: int, dump_dir: str, out_root: str) -> 
             lines = info.stdout.splitlines()
             # Each *physical* chip has exactly one "<id> Ascend910..." Name row.
             chips = sum(1 for line in lines if "Ascend910" in line)
-            want = int(os.environ.get("TP_SIZE", "16"))
+            want = int(os.environ.get("TP_SIZE", "8"))
             report.say("[INFO] npu-smi info (前 16 行):")
             for line in lines[:16]:
                 report.say(f"         {line}")

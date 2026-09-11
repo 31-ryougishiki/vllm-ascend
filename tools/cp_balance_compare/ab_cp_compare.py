@@ -1454,14 +1454,14 @@ def cp_size_default() -> int:
     """zigzag's ``cp_size`` IS the tensor parallel size, so follow CP_SIZE/TP_SIZE.
 
     vllm_ascend passes ``global_tp_size`` as the zigzag ``cp_size`` and pads
-    tokens to ``2 * tp_size``; the launchers default to ``TP=16``, so the driver
+    tokens to ``2 * tp_size``; the launchers default to ``TP=8``, so the driver
     must agree or the zigzag block annotation (``block@first_div``) is wrong.
     """
     for key in ("CP_SIZE", "TP_SIZE"):
         value = os.environ.get(key)
         if value and value.isdigit():
             return int(value)
-    return 16
+    return 8
 
 
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
@@ -1508,7 +1508,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         help="zigzag context-parallel size for the plan annotation; the zigzag "
         "layout's cp_size IS the tensor parallel size (vllm_ascend passes "
         "global_tp_size as cp_size and pads tokens to 2 * tp_size), so this must "
-        "equal the launcher's TP_SIZE ($CP_SIZE/$TP_SIZE, site default 16)",
+        "equal the launcher's TP_SIZE ($CP_SIZE/$TP_SIZE, site default 8)",
     )
     parser.add_argument(
         "--cp-balance-min-tokens",

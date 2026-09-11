@@ -107,14 +107,14 @@ if [ -n "${DRY_RUN:-}" ]; then
     echo "[cp-ab][dry-run] ERROR: vllm not found in PATH" >&2
     exit 2
   fi
-  echo "[cp-ab][dry-run] OK vllm=$(command -v vllm) model=${MODEL_PATH} port=${port} tp=${TP_SIZE:-16}"
+  echo "[cp-ab][dry-run] OK vllm=$(command -v vllm) model=${MODEL_PATH} port=${port} tp=${TP_SIZE:-8}"
   exit 0
 fi
 
 vllm serve "${MODEL_PATH}" \
   --host 0.0.0.0 \
   --port "${port}" \
-  --tensor-parallel-size "${TP_SIZE:-16}" \
+  --tensor-parallel-size "${TP_SIZE:-8}" \
   --enable-expert-parallel \
   --distributed-executor-backend mp \
   --max_model_len "${MAX_MODEL_LEN:-135000}" \

@@ -143,11 +143,11 @@ python tools/cp_balance_compare/compare_cp_rounds.py \
 python tools/cp_balance_compare/selfcheck.py --collect
 ```
 
-常用覆盖（`run_cp_diag.sh` 的环境变量）：`PROMPT_LENS`、`MIN_TOKENS`、`TP_SIZE`（launcher 的 TP，默认 16）、`CP_SIZE`（driver 的 `--cp-size`，默认取 `TP_SIZE`）、`REPEAT_A`（默认 1；`REPEAT_A=0` 或命令加 `--no-repeat` 跳过 B2 重复跑，**省一次模型加载**，噪声地板已知为 0 时用）、`OUT_ROOT`、`BASE_PORT`、`DUMP_SPEC`（置空=不 dump；支持 `kv:all` / `topk:all`）、`DUMP_DIR`、`LAUNCHER`。
+常用覆盖（`run_cp_diag.sh` 的环境变量）：`PROMPT_LENS`、`MIN_TOKENS`、`TP_SIZE`（launcher 的 TP，默认 8）、`CP_SIZE`（driver 的 `--cp-size`，默认取 `TP_SIZE`）、`REPEAT_A`（默认 1；`REPEAT_A=0` 或命令加 `--no-repeat` 跳过 B2 重复跑，**省一次模型加载**，噪声地板已知为 0 时用）、`OUT_ROOT`、`BASE_PORT`、`DUMP_SPEC`（置空=不 dump；支持 `kv:all` / `topk:all`）、`DUMP_DIR`、`LAUNCHER`。
 
 > 诊断轮优先用 **`sweep` 模式**而不是一堆 env 前缀：脚本模式写在同一行命令里，粘贴时不会像 `VAR=... cmd` 那样被折断后**静默退回默认值**（那样会白跑一轮 B2）。
 
-> **一轮的成本结构**：几乎全在模型加载（本机 TP=16 约 10 分钟/次），推理只要 ~2 秒/条。所以"加长度/加 dump 层数"几乎免费，而"多跑一个配置"（B2、2call）就是 +10 分钟。诊断轮按这个取舍：`REPEAT_A=0 DUMP_SPEC=kv:all` 是 2 次加载 + 全层数据。
+> **一轮的成本结构**：几乎全在模型加载（约 10 分钟/次；TP=8/16 量级相当），推理只要 ~2 秒/条。所以"加长度/加 dump 层数"几乎免费，而"多跑一个配置"（B2、2call）就是 +10 分钟。诊断轮按这个取舍：`sweep` 模式（= `--no-repeat` + `DUMP_SPEC=kv:all`）是 2 次加载 + 全层数据。
 
 已经有 server 在跑时，可以跳过拉起，直接驱动两个/三个地址（注意此模式无法读 server 日志，指纹与 zigzag 检查会被跳过）：
 
@@ -187,7 +187,7 @@ $OUT_ROOT/<round>/
 ## 七、注意事项
 
 - **顺序执行是设计前提**：TP=N 的 server 独占整机，所以 driver 一个一个拉起/停掉；多机场景请自己起 server 后用 `--urls`。
-- **TP 与 zigzag 的 `cp_size` 是同一个数**：`vllm_ascend` 把 `global_tp_size` 当作 zigzag 的 `cp_size`（SP padding 到 `2 * tp_size`，每条序列切成 `2 * cp_size` 块），所以 launcher 的 `TP_SIZE` 必须等于 driver 的 `--cp-size`。站点默认 16（`ASCEND_RT_VISIBLE_DEVICES` 默认 `0..15`，需要 16 张可见 NPU）；`run_cp_diag.sh`/`run_single.py` 用 `CP_SIZE`、`TP_SIZE` 统一取默认值，`selfcheck.py` 会核对 launcher 打印的 `tp=` 与 `--cp-size`，server 日志里的 `[CP_BALANCE] metadata zigzag=1 … cp_size=16` 是最终确认。
+- **TP 与 zigzag 的 `cp_size` 是同一个数**：`vllm_ascend` 把 `global_tp_size` 当作 zigzag 的 `cp_size`（SP padding 到 `2 * tp_size`，每条序列切成 `2 * cp_size` 块），所以 launcher 的 `TP_SIZE` 必须等于 driver 的 `--cp-size`。站点默认 8（`ASCEND_RT_VISIBLE_DEVICES` 默认 `0..7`，需要 8 张可见 NPU）；`run_cp_diag.sh`/`run_single.py` 用 `CP_SIZE`、`TP_SIZE` 统一取默认值，`selfcheck.py` 会核对 launcher 打印的 `tp=` 与 `--cp-size`，server 日志里的 `[CP_BALANCE] metadata zigzag=1 … cp_size=8` 是最终确认。
 - **C 没进 zigzag 就没有结论**：`VLLM_ASCEND_CP_BALANCE_MIN_TOKENS` 被 driver 显式钉住并写入指纹（源码默认是 8192），否则盒子默认值会让 C 悄悄留在连续切片路径上，看起来像“cp_balance 对精度无影响”。`run_cp_diag.sh` 用 `--zigzag-check strict --on-zigzag-miss skip` 兜底。
 - **阈值不是绝对精度判据**：`0.05` 只是起步线，真正的判据是它和 5×噪声地板取大者；没有 B2 就没有噪声地板，`--repeat-a` 应默认带上。
 - **dump 目录会跨轮累积**：判读只取每个 `(layer, rank, cpbal)` 的最新一份，旧文件被忽略（会打印提示），不要求手动清理。
