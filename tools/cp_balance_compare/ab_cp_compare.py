@@ -77,6 +77,7 @@ import os
 import signal
 import subprocess
 import sys
+import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
@@ -406,6 +407,36 @@ def build_cases(args: argparse.Namespace) -> list[PromptCase]:
 # --------------------------------------------------------------------------- #
 
 
+def _stream_log(stream, log, prefix: str | None) -> None:
+    """Drain the launcher's output into ``log`` and mirror it to stdout.
+
+    The log file always gets the *raw* lines (fingerprint parsing, ``tail()``
+    and everything the user reads from disk stay unchanged); the screen gets the
+    same lines prefixed with the config name so a live model load is followable
+    and never gets confused with the driver's own output.  ``prefix=None`` keeps
+    the file write and skips the echo (``--no-stream-log``).
+
+    Runs in a daemon thread; without a reader the pipe would fill up and block
+    the server.
+    """
+    try:
+        for line in stream:
+            log.write(line)
+            log.flush()
+            if prefix:
+                text = line.rstrip("\n")
+                if text:
+                    print(f"{prefix} {text}", flush=True)
+    except (OSError, ValueError):
+        # The log handle can be closed underneath us when a server is killed.
+        pass
+    finally:
+        try:
+            stream.close()
+        except OSError:
+            pass
+
+
 def launch_server(args: argparse.Namespace, name: str, log_dir: Path):
     port = args.base_port
     env = os.environ.copy()
@@ -415,21 +446,32 @@ def launch_server(args: argparse.Namespace, name: str, log_dir: Path):
     print(f"[launch] {name}: {cmd}")
     print(f"[launch] {name}: CP_BALANCE={env.get('VLLM_ASCEND_CP_BALANCE')}")
     if args.dry_run:
-        return None, port, None, log_path
+        return None, port, None, log_path, None
+    if args.stream_log:
+        print(f"[launch] {name}: 模型拉起日志实时打屏（前缀 [{name}]），原始日志 -> {log_path}")
     log = open(log_path, "w")
     try:
         proc = subprocess.Popen(
             ["bash", "-lc", cmd],
             cwd=args.repo_root,
             env=env,
-            stdout=log,
+            stdout=subprocess.PIPE,
             stderr=subprocess.STDOUT,
+            text=True,
+            bufsize=1,
             start_new_session=True,
         )
     except Exception:
         log.close()
         raise
-    return proc, port, log, log_path
+    reader = threading.Thread(
+        target=_stream_log,
+        args=(proc.stdout, log, f"[{name}]" if args.stream_log else None),
+        name=f"cpab-log-{name}",
+        daemon=True,
+    )
+    reader.start()
+    return proc, port, log, log_path, reader
 
 
 def wait_ready(
@@ -471,7 +513,7 @@ def wait_ready(
     return False
 
 
-def stop_server(proc, log, restart_wait: float = 30.0) -> None:
+def stop_server(proc, log, reader=None, restart_wait: float = 30.0) -> None:
     try:
         if proc is not None and proc.poll() is None:
             try:
@@ -487,6 +529,9 @@ def stop_server(proc, log, restart_wait: float = 30.0) -> None:
                     pass
                 proc.wait(timeout=30)
     finally:
+        if reader is not None:
+            # Let the log thread see the closed pipe before the file goes away.
+            reader.join(timeout=15.0)
         if log is not None:
             log.close()
         if proc is not None:
@@ -1260,7 +1305,7 @@ def collect_sequential(args, names, cases, out_dir, log_dir):
     failures: list[str] = []
     skipped: list[str] = []
     for index, name in enumerate(names):
-        proc, port, log, log_path = launch_server(args, name, log_dir)
+        proc, port, log, log_path, reader = launch_server(args, name, log_dir)
         if args.dry_run:
             if log is not None:
                 log.close()
@@ -1313,7 +1358,7 @@ def collect_sequential(args, names, cases, out_dir, log_dir):
                     )
                     break
         finally:
-            stop_server(proc, log, args.restart_wait)
+            stop_server(proc, log, reader, args.restart_wait)
     return results, runtimes, failures, skipped
 
 
@@ -1503,6 +1548,14 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--no-plot", dest="plot", action="store_false")
     parser.add_argument("--no-csv", dest="csv", action="store_false")
     parser.add_argument("--dry-run", action="store_true")
+    parser.add_argument(
+        "--no-stream-log",
+        dest="stream_log",
+        action="store_false",
+        default=True,
+        help="stop mirroring the server log to stdout (the raw logs/server_<config>.log "
+        "is always written; useful when the model-load log is too noisy)",
+    )
     args = parser.parse_args(argv)
     args.env_override = [item.split("=", 1) for item in args.env]
     return args

@@ -12,7 +12,7 @@
 
 因为两条路径的 kernel、模型、权重完全相同，只有 token 排布不同，所以 **`C-B` 的差值就是 cp_balance 的账**；`B2-B` 给出它必须打败的噪声地板。原设计里的 “A（关 DSA-CP）锚点” 已下线：它走的是不同代码路径，只能给粗参照，要 A 会被 driver 直接报错拒绝。
 
-> 本目录所有工具（含后续新增的诊断脚本）必须遵守[第八节](#八工具与脚本的三条硬要求)的三条要求。
+> 本目录所有工具（含后续新增的诊断脚本）必须遵守[第八节](#八工具与脚本的四条硬要求)的四条要求。
 
 ## 一、目录里各文件的角色
 
@@ -52,6 +52,8 @@
 3. 从 server 日志确认 **C 真的走进了 zigzag**（`--zigzag-check strict`）——没进 zigzag 就说明 C 退化成了 B，后面的对比没有意义，此时 `--on-zigzag-miss skip` 会停掉剩余配置并以非 0 退出；
 4. 逐 prompt 请求 `/v1/completions`：`echo=true`、`logprobs=K`、`prompt_logprobs=K`、`max_tokens=1`、`temperature=0`、`add_special_tokens=false`、`return_token_ids=true`；
 5. 记录每个位置的 `token_logprobs`（真实 token 的 logprob，所有配置同一个 token，差值是干净的逐位置精度信号）与 `top_logprobs`（top-1 / top-5），写完 `results_<配置>.json` 后停 server。
+
+server 的 stdout/stderr 既写入 `<轮次>/logs/server_<配置>.log`（**原始行**，指纹解析与 `tail()` 读的都是这份），也**实时打屏**，屏幕上的每一行带 `[<配置>]` 前缀，所以模型拉起/加载过程可以直接看到、不会和 driver 自己的输出混淆；不想要屏幕噪声时加 `--no-stream-log`（日志文件照写）。
 
 prompt 默认是确定性随机 token-id（`--seed 1234`，词表 10 万），长度 2048 / 2049 / 4096：2048 正好是 `2*cp_size`(=16) 的整数块，2049 不整块（覆盖 padding/切分边界），4096 是长序列。
 
@@ -166,13 +168,15 @@ $OUT_ROOT/<round>/
 - driver 需要 `requests` + `numpy`；`check_zigzag_dumps.py` 需要 `torch`（跑在 vLLM 宿主机上）；画图需要 `matplotlib`（缺了只警告跳过）。
 - 非 Linux 主机上，`selftest_mock.py` 里依赖 bash 的 launcher 用例会被跳过（`[skip] bash not usable`）或失败（Windows 上给假 `vllm` 置可执行位无效，`test_shipped_launchers_print_complete_fingerprint` 报 `vllm not found in PATH`），都属宿主差异，不是 driver 的问题。
 
-## 八、工具与脚本的三条硬要求
+## 八、工具与脚本的四条硬要求
 
-> 这三条是对本目录所有工具（含后续新增的诊断脚本）的固定要求，新增或修改代码时都必须满足。
+> 这四条是对本目录所有工具（含后续新增的诊断脚本）的固定要求，新增或修改代码时都必须满足。
 
 1. **修改代码直接 commit。** 不留未提交的改动：无论改的是 `vllm_ascend/` 里的实现还是本目录的诊断工具，改完就在当前仓库 commit，提交信息写清动机、改动点和验证方式。诊断轮次靠 `git rev-parse HEAD` 对齐版本（`selfcheck.py` 会打印 HEAD 与工作区改动），未提交的改动会让“这一轮结果对应哪份代码”无法追溯。
 
 2. **执行脚本尽量做到一行执行。** 每一个测试/诊断动作都要有一条可直接复制粘贴、不需要手工拼参数的命令；默认值覆盖常见场景，环境差异用参数或环境变量覆盖。步骤多于一步的，用一个脚本把它们串成一条命令（例如 `python tools/cp_balance_compare/selfcheck.py` 一次完成现场体检 + driver 自测 + 配置门 + 轮次预演），不要写成需要人工分多步交互的形式。
 
 3. **必须说明需要得到的结果。** 每个脚本、每一轮测试都要明确给出“期望看到什么”：判据是哪个数字/哪个阈值/哪一行标记，`PASS`/`WARN`/`FAIL`/`[skip]` 各代表什么，以及不满足时下一步去查什么。只打印数据、不给判据的脚本视为未完成——没有判据就无法下结论。范例见 `selfcheck.py`：每个检查项都会打印一行 `期望结果:`。
+
+4. **一次只给一步。** 每次只说明当前要执行的一步：一条命令 + 这一步需要得到的结果；上一步的结果确认后再给下一步，不预先罗列后续步骤。每一步的产出决定下一步走向，一次给多步会诱导跳过判据、在错误的假设上继续跑。
 

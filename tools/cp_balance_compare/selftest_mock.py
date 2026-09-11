@@ -238,6 +238,72 @@ def test_fingerprint_line_ignores_other_cp_ab_lines() -> None:
         shutil.rmtree(out, ignore_errors=True)
 
 
+def test_stream_log_mirrors_to_screen_and_file() -> None:
+    """A live model load must be followable while the raw log stays on disk.
+
+    ``--no-stream-log`` only drops the echo; the file write is what
+    ``verify_config``/``tail()`` read, so it must always happen.
+    """
+    out = _temp_dir("cp_ab_stream_")
+    try:
+        log_path = out / "server_B.log"
+        payload = "line one\n\nline two\n"
+        with open(log_path, "w", encoding="utf-8") as handle:
+            buffer = io.StringIO()
+            with redirect_stdout(buffer):
+                driver._stream_log(io.StringIO(payload), handle, "[B]")
+        # Raw lines, byte for byte, including the blank one.
+        assert log_path.read_text(encoding="utf-8") == payload
+        printed = buffer.getvalue()
+        assert "[B] line one" in printed
+        assert "[B] line two" in printed
+        assert "[B] \n" not in printed  # blank lines are not echoed
+
+        # prefix=None: file only (what --no-stream-log does).
+        with open(log_path, "w", encoding="utf-8") as handle:
+            buffer = io.StringIO()
+            with redirect_stdout(buffer):
+                driver._stream_log(io.StringIO(payload), handle, None)
+        assert log_path.read_text(encoding="utf-8") == payload
+        assert buffer.getvalue() == ""
+    finally:
+        shutil.rmtree(out, ignore_errors=True)
+
+
+def test_launch_server_streams_log_to_screen() -> None:
+    """A real launcher's output must reach both the log file and the screen."""
+    if not _bash_usable():
+        print("[skip] bash not usable on this host")
+        return
+    out = _temp_dir("cp_ab_launch_")
+    try:
+        script = out / "noisy_launcher.sh"
+        script.write_text(
+            "#!/usr/bin/env bash\n"
+            "echo '[cp-ab] CP_BALANCE=0 DSA_CP=1 MIN_TOKENS=2048 EMBED_LOCAL=0 SPEC=0 KV=0'\n"
+            "echo 'loading weights 1/2'\n"
+            "echo 'loading weights 2/2'\n",
+            encoding="utf-8",
+        )
+        args = driver.parse_args(
+            ["--launcher", f"bash {script.as_posix()} {{port}}", "--repo-root", str(out)]
+        )
+        buffer = io.StringIO()
+        with redirect_stdout(buffer):
+            proc, _port, log, log_path, reader = driver.launch_server(args, "C", out)
+            proc.wait(timeout=120)
+            driver.stop_server(proc, log, reader, 0.0)
+        raw = log_path.read_text(encoding="utf-8")
+        assert "loading weights 2/2" in raw
+        assert driver.find_fingerprint(raw) is not None, raw
+        printed = buffer.getvalue()
+        assert "[launch] C" in printed
+        assert "[C] loading weights 1/2" in printed
+        assert "[C] loading weights 2/2" in printed
+    finally:
+        shutil.rmtree(out, ignore_errors=True)
+
+
 def test_load_prompts_file() -> None:
     out = Path(_temp_dir("cp_ab_pf_"))
     try:
