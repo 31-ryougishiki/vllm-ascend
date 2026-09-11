@@ -19,11 +19,26 @@ in ──attention──▶ out ──pre-MLP norm──▶ mlp_in ══gate_up
 
 ⇒ 分歧**诞生在 layer 0 的 dense MLP 内部**（layer 0/1/2 是 dense MLP，`first_k_dense_replace=3`，
 **没有专家、没有路由**），再逐层放大（到 layer 77 时未量化的 rope 段已差到 7e-1）。
-**下一步**：把 MLP 内部那三步分开 —— `gu_out`（gate_up_proj 输出）与 `dn_in`（down_proj 输入）已在
-`probe` 轮里打点，见 §5。
+
+**下一步（已把打点补齐）**：这一层的 dense MLP 是 **`W8A8_MXFP8`**（`quant_model_description.json`，见 §2.2），
+所以"同一个 bf16 输入、逐行数学、却算出不同结果"只剩两种根因，而它们用**一轮**就能分开——
+新增 `qin:<层>` 打点，直接记录两个 MLP GEMM **实际吃到的量化输入**（fp8 + e8m0 scale）：
+
+```
+in ─attn─▶ out ─norm─▶ mlp_in ─[量化]─▶ gu_q ─gate_up─▶ gu_out ─silu─▶ dn_in ─[量化]─▶ dn_q ─down_proj─▶ mlp_out
+   ✅相同        ✅相同          ✅相同      ❓        ❓              ❓        ❓             ❌ token≥256 不同
+```
+
+| 观察 | 根因 |
+| --- | --- |
+| `mlp_in` 相同、**`gu_q` 不同** | **激活量化这一步**：同一批 bf16 行量化出不同 fp8/scale（MX 量化不是逐 token 独立，或融合内核按 tile 共享状态） |
+| `gu_q` 相同、**`gu_out` 不同** | **`npu_quant_matmul` 这个 GEMM 内核**：输入逐位相同 ⇒ 只能查 tiling/workspace 与确定性（同配置重跑一次即可判定） |
+| `gu_out` 相同、**`dn_q` 不同** | silu 之后的**量化** |
+| `dn_q` 相同、**`mlp_out` 不同** | **down_proj 这个 GEMM**（含跨 rank 归约） |
 
 已排除：indexer 选点错、KV 重排/写错、元数据契约错、**attention 数值错**、pre-MLP norm/残差/归约错、
-合并 2B 调用（`2call`）。
+合并 2B 调用（`2call`）、**"A-quant 的 scale 按批/按 rank 局部行集算"**（`w8a8_mxfp8.py:86-102` 的
+`npu_dynamic_mx_quant` + `group_sizes=[1,1,32]` 是按行、每 32 个 K 元素一个 scale ⇒ 与同 rank 上还有哪些行无关）。
 
 ## 1. 目标与判据口径
 
@@ -55,6 +70,7 @@ in ──attention──▶ out ──pre-MLP norm──▶ mlp_in ══gate_up
 | `n_routed_experts` / `num_experts_per_tok` | 256 / 8 | 后续若查 MoE 层，用 `--enable-return-routed-experts` 抓路由 |
 | `hidden_size` / `kv_lora_rank` / `qk_rope_head_dim` | 6144 / 512 / 64 | **packed KV 一行 = 512(fp8) + 128(64×bf16) + 16(4×fp32) = 656 字节** —— 整行按 fp8 解码是错的 |
 | `index_topk` | 2048 | 2048-token prompt 下 indexer 走"全选"路径（identity），故 topk 断言在长 prompt 下信息量低 |
+| 量化（实测，见 §2.2 提醒的核对） | `quant_model_description.json`：全局 `model_quant_type=W4A4_MXFP4`、`group_size=32`、`version=1.0.0`；但 **layer 0 的 MLP 三个投影是 `W8A8_MXFP8`**，attention 的 `q_a_proj`/`kv_a_proj_with_mqa`/`o_proj`/`indexer.wq_b` 也是 `W8A8_MXFP8`，`kv_b_proj` 与 indexer 的 `wk`/`weights_proj`/`k_norm` 是 `FLOAT` | 决定 dense MLP 走 `w8a8_mxfp8.py`（按行 MX-FP8，`group_sizes=[1,1,32]`）；`config.json` 里 `quantization_config` 为 **null** 是正常的——站点靠 launcher 的 `--quantization ascend` 走 ModelSlim |
 
 ⚠️ 这张表取自**同架构的本地 `GLM-5.2-w8a8c8-mxfp8/config.json`**：架构类字段（`first_k_dense_replace`、
 `mlp_layer_types`、`scoring_func`、专家数、`hidden_size`/`kv_lora_rank`/`qk_rope_head_dim`）与远端
@@ -86,6 +102,7 @@ KV 写 slot 映射、attention/indexer 调用形状、模型边界 gather/rerang
 | 当前 forward 的 zigzag 状态与 DSA ctx | `vllm_ascend/ascend_forward_context.py`（**注意**：`zigzag_cp_context` 只在 zigzag 生效时才有值） |
 | MoE aux 重排（`input_ids`/`mc2_mask`） | `ascend_forward_context.set_ascend_forward_context` + `cp_zigzag.zigzag_reorder_moe_aux` |
 | MLP 边界打点（**在本仓库内**可行的挂钩方式；模型代码在 site-packages 里） | `vllm_ascend/worker/model_runner_v1.py::_install_cp_balance_mlp_dumps`（按模块名 `layers.<L>.mlp[.gate_up_proj\|.down_proj]` 挂 forward hook） |
+| 量化输入打点（`qin:<层>`：两个 MLP GEMM 实际吃到的 fp8 + e8m0 scale） | `vllm_ascend/worker/model_runner_v1.py::_install_cp_balance_quant_dumps`（按层包住 `AscendLinearMethod.apply`：元组走融合分支直接 dump，否则在该次 `apply` 内拦截 `npu_dynamic_mx_quant`/`npu_dynamic_quant`） |
 | ⚠️ 误导项 | `vllm_ascend/patch/worker/patch_deepseek_v2.py` 里的 `_zigzag_layer_forward` / `_patched_forward` **对本模型不生效**：它 patch 的是 `DeepseekV2DecoderLayer/Model`，而本模型用 `DeepseekV32DecoderLayer/Model`（无继承关系） |
 
 ## 3. 已确认的事实（带数字，可直接引用）
@@ -149,53 +166,76 @@ KV 写 slot 映射、attention/indexer 调用形状、模型边界 gather/rerang
 | attention 数值（SFA/indexer/o_proj） | **已排除**（layer 0 attention 输出逐字节相同） |
 | pre-MLP norm / 残差 / 跨 rank 归约 | **已排除**（layer 0 `mlp_in` 逐字节相同） |
 | 合并 2B 调用（`2call`） | **已排除**（只改 attention 形状，而 attention 已逐位相同；别跑） |
-| **dense MLP 内部：`gate_up_proj`（含 A 量化）** | **下一刀**（`gu_out` 已打点，等待新一轮判读） |
-| **dense MLP 内部：`silu` 或其量化 / `down_proj`** | **候选**（`dn_in` 已打点） |
+| **dense MLP：`gate_up_proj` 的量化 vs 它的 GEMM** | **下一刀**（`gu_q`/`gu_out` 已打点，见 §5.1） |
+| **dense MLP：silu 的量化 / `down_proj` 的 GEMM** | **下一刀**（`dn_in`/`dn_q`/`mlp_out` 已打点） |
 | MoE 层（≥3）的路由与专家计算 | 未测；等 layer 0 定死后再看是否需要 |
 | `MIN_TOKENS` 边界（`l1024`） | 未测；与本问题无关，最低优先级 |
 
-**主导猜想**：MLP 是逐 token 数学、输入又逐位相同，却算出不同结果 ⇒ 最可能是**激活量化（A-quant）的 scale
-不是按 token 独立算的**（按批/按 rank 局部行集算），于是"同一 token 在不同排布下拿到不同的量化 scale"，
-输出系统性偏移 ~1e-3。这一条用 `gu_out` 一点即可证真/证伪。
+**主导猜想（已按代码收窄）**：layer 0 的 dense MLP 是 **W8A8_MXFP8**（§2.2 实测），
+`w8a8_mxfp8.py:86-102` 的激活量化是 `npu_dynamic_mx_quant(x, dst_type=float8_e4m3fn)` +
+`npu_quant_matmul(..., group_sizes=[1,1,32])` ⇒ **按行、每 32 个 K 元素一个 MX scale**，
+与"同一 rank 上还有哪些行"无关。观测形态也支持这一点：若 scale 与 rank 局部行集相关，
+C 里 rank 0 的 block 0（token 0..127，与尾块同处一个 rank）会被污染而变脏，实测 0..255 恰好干净。
+所以现在只剩两种根因（见 §0 的四行表），而 `qin:` 打点让**一轮**就能二选一：
 
-⚠️ 但要注意一个**反向证据**：本仓库 `vllm_ascend/quantization/methods/w4a4_mxfp4.py::apply` 里，w4a4 线性层用的是
-`npu_dynamic_mx_quant(...)`（MX 量化，按**行**、每 32 元素一个块）——若该路径真的生效，A-quant 就与批无关，
-上面的猜想要换方向（例如 GEMM 内核按 M/workspace 选 tiling、或 flashcomm 的 gather 与 quant 的先后）。
-**本站实际实例化的是哪个量化类尚未核实**（见 §2.2 的提醒）。所以 `gu_out` 这一步同时也是对"到底走了哪条量化路径"的检验。
+* 量化输入（`gu_q`/`dn_q`）也变 ⇒ 根因在**量化/融合**这一步；
+* 量化输入逐位相同而 GEMM 输出变 ⇒ 根因在 **GEMM 内核**（tiling/workspace/确定性）。
+
+⚠️ 融合路径：`fuse_norm_quant` 默认开启（`ascend_config.py:519` + `graph_fusion_pass_manager.py:54`，
+且只在 `W4A4_DYNAMIC`/`W4A4_FLATQUANT_DYNAMIC` 时被禁用，本站的 `W4A4_MXFP4` 不在禁用名单里），
+所以量化可能由融合的 `npu_add_rms_norm_dynamic_mx_quant` 一类内核产出，并以
+`(fp8, scale)` 元组传给线性层（`w8a8_mxfp8.py:77-80`）。`qin:` 打点对两条路径都成立
+（元组就按收到的 dump，否则在 `apply` 内部拦截量化算子），payload 里的 `fused` 字段会说明走的是哪条。
 
 ## 5. 下一步（一步一条命令 + 判据）
 
-### 5.1 当前这一步：把 layer 0 的 MLP 再切三段
+### 5.1 当前这一步：一轮定位 layer 0 dense MLP 的根因
 
 ```bash
 cd /home/z30055003/vllm-ascend
 unset DUMP_DIR                                  # ⚠️ 否则继承的 DUMP_DIR 会把数据吸到别的目录（§6.3）
+bash tools/cp_balance_compare/run_cp_diag.sh probe --dry-run   # 先看 dir= 与 spec
 bash tools/cp_balance_compare/run_cp_diag.sh probe      # B/C 各一次加载 ≈ 20 分钟 → /root/cp_probe
 python tools/cp_balance_compare/check_zigzag_dumps.py --dir /root/cp_probe \
     --kind act --summary-only --block-size 128 2>&1 | tee tools/cp_balance_compare/log.log
 ```
 
-跑起来先确认一行（模型加载完打印，9 个模块/rank）：
+`probe` 默认 spec = `act:0,1,mlp:0,1,qin:0,topk:0,kv:0,1`（layer 0 是根因所在，layer 1 作对照；
+层数越多 dump 越大而信息不变）。
+
+跑起来先确认两行（模型加载完打印）：
 
 ```
-[CP_BALANCE][dump] mlp trace armed for [(0,'model.layers.0.mlp'), (0,'…mlp.gate_up_proj'), (0,'…mlp.down_proj'), (1,…), (2,…)]
+[CP_BALANCE][dump] mlp trace armed for [(0,'model.layers.0.mlp'), (0,'…mlp.gate_up_proj'), (0,'…mlp.down_proj'), (1,…)]
+[CP_BALANCE][dump] quant trace armed for [(0,'model.layers.0.mlp.gate_up_proj'), (0,'model.layers.0.mlp.down_proj')]
 ```
 
-结束时应有 `dump: +N file(s)`（N≈336 = 每层 6 个采样点 × 3 层 × 8 rank × 2 配置 + `topk:0` 16 + `kv:0,1` 32）。
-若打印的是 `mlp trace requested … but no 'layers.<L>.mlp*' module matched`，说明模块名不匹配 → 把该行贴回来。
+结束时应有 `dump: +N file(s)`：N≈272 = (layer 0 八个采样点 + layer 1 六个) × 8 rank × 2 配置 = 224，
+加 `topk:0` 16 + `kv:0,1` 32。
+若出现 `… dnin layer=0 skipped: value is a quantized tuple …`，说明融合路径生效、`dn_in` 少 16 个（N≈256），
+**该缺口由同轮的 `dn_q` 补上**（同一数据的量化版本）。
+若打印 `mlp trace requested … no 'layers.<L>.mlp*' module matched`（或 quant trace 的同类告警），
+说明模块名不匹配 → 把该行贴回来。
 
-判读表每层 6 行，**取最早不等的那一行**：
+判读表 layer 0 最多 8 行，**取最早不等的那一行**：
 
 | 最早不等 | 结论 | 下一步查什么 |
 | --- | --- | --- |
-| `gu_out` | **gate_up_proj 这一个 GEMM 内部** | 它的 A 量化（per-token MX？per-tensor？flashcomm gather 与 quant 的先后）+ 入参形状 |
-| `dn_in` | **silu（或其量化）** | 激活实现与中间量化 |
-| `mlp_out` | **down_proj**（含跨 rank 归约） | row-parallel 的 partial/reduce 路径 |
+| `gu_q`（量化输入） | **激活量化这一步**：同一批 bf16 行量化出不同 fp8/scale | 该量化/融合内核的入参形状与 tile（`fuse_norm_quant` 是否生效、gather 与 quant 的先后） |
+| `gu_out`（且 `gu_q` 相同） | **`npu_quant_matmul` 这个 GEMM 内核** | 内核 tiling/workspace/**确定性**：同配置重跑一次（`--configs C,B --repeat-a`）即可判定 |
+| `dn_q` | **silu 之后的量化** | 激活量化实现与融合 |
+| `mlp_out`（且 `dn_q` 相同） | **`down_proj` 的 GEMM**（含跨 rank 归约） | row-parallel 的 partial/reduce 路径与内核确定性 |
+
+判读器会自己把相邻行合起来给结论：`gu_out` 先不等时，若同层 `gu_q` 也不等就指向量化，
+若 `gu_q` 逐位相同就明确指向 GEMM 内核；spec 没写 `qin:` 时会写明"本层未打点 qin，无法区分"。
 
 ### 5.2 后续候选（按需，别预先跑）
 
-- 若 `gu_out` 就先不等 ⇒ 给该线性层加"量化 scale"打点（打 `npu_dynamic_mx_quant`/`npu_dynamic_quant` 的返回 scale，按 token 位置比），一步定死是不是 scale 粒度问题。
-- 若 layer 0 全部相同、差异从 layer ≥1 才出现 ⇒ `export DUMP_SPEC=act:3,4,mlp:3,4` 再跑一轮（层数几乎免费，贵的是模型加载）。
+- 落在"量化"分支 ⇒ 打该层量化/融合内核的**入参形状**（`npu_add_rms_norm_dynamic_mx_quant` 的 in/out 形状、
+  tile 大小），必要时把 `fuse_norm_quant` 关掉再跑一轮做对照（`ascend_config` 的 `fuse_norm_quant`）。
+- 落在"GEMM 内核"分支 ⇒ 先跑 `--configs C,B --repeat-a`（3 次加载）：`C2−C≠0` 即内核不确定性，
+  `=0` 则把 `npu_quant_matmul` 的入参形状/workspace 与 tiling 打出来。
+- 若 layer 0 全部相同、差异从 layer ≥1 才出现 ⇒ `export DUMP_SPEC=act:1,2,mlp:1,2,qin:1` 再跑一轮。
 - 若最终落在 MoE 层（≥3）⇒ 用内置 `--enable-return-routed-experts` 抓全层逐 token 路由（**已验证可用**，见 `README.md` §四）。
 
 ## 6. 易错点清单（按"会让你得出错误结论"排序）
@@ -240,8 +280,8 @@ python tools/cp_balance_compare/check_zigzag_dumps.py --dir /root/cp_probe \
 | 首跑/换机器自检 | `python tools/cp_balance_compare/selfcheck.py` | `[verdict] READY`，无 FAIL |
 | 不加载模型校验 env/指纹 | `ab_cp_compare.py --preflight` | `[preflight] all configs OK` |
 | 省掉每轮 source | `source tools/cp_balance_compare/prepare_env.sh` | 打印两段 source 耗时 + `CP_AB_SKIP_SOURCE=1` |
-| **当前这一步**：MLP 内部剖面 | `unset DUMP_DIR; bash tools/cp_balance_compare/run_cp_diag.sh probe` | `mlp trace armed for [...]`、`dump: +N file(s)` |
-| 判读剖面 | `check_zigzag_dumps.py --dir /root/cp_probe --kind act --summary-only --block-size 128` | `FIRST DIVERGENCE (act): layer L op=… at token P` + 每层 6 行 |
+| **当前这一步**：一轮定位根因（量化 vs GEMM） | `unset DUMP_DIR; bash tools/cp_balance_compare/run_cp_diag.sh probe` | `mlp trace armed for [...]` + `quant trace armed for [...]`、`dump: +N file(s)`（N≈272） |
+| 判读剖面 | `check_zigzag_dumps.py --dir /root/cp_probe --kind act --summary-only --block-size 128` | `FIRST DIVERGENCE (act): layer L op=… at token P` + layer 0 的 8 行（含 `gu_q`/`dn_q`）与判词 |
 | 判读索引表（跨排布） | `… --kind topk --summary-only` | `[topk/cross] RESULT: … ORDER / DIFFERENT SET / invariant` |
 | 全层 KV 剖面 | `export DUMP_DIR=/root/cp_dump; run_cp_diag.sh sweep` → `… --kind kv --summary-only` | `FIRST DIVERGENCE (fp/value\|fp/bytes): layer L` |
 | 单配置手工调试 | `python tools/cp_balance_compare/run_single.py [--config C]` | `[http] <- 200` + `[result]` 行 |

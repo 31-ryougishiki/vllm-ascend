@@ -65,28 +65,53 @@ except ImportError:  # pragma: no cover - the target host always has torch
     raise
 
 NAME_RE = re.compile(
-    r"(?P<kind>topk|kv|actin|actout|mlpin|mlpout|guout|dnin)_cpbal(?P<cpbal>\d+)_layer(?P<layer>-?\d+)"
+    r"(?P<kind>topk|kv|actin|actout|mlpin|mlpout|guq|guout|dnin|dnq)_cpbal(?P<cpbal>\d+)_layer(?P<layer>-?\d+)"
     r"_rank(?P<rank>\d+)_pid(?P<pid>\d+)_(?P<ts>\d+)\.pt$"
 )
 
-# ``act`` is one logical kind with several ops in the file name (attention in/out
-# plus the MLP boundary of the same layers); the other kinds map to themselves so
-# ``--kind kv``/``--kind act`` glob exactly their own files.
+# ``act`` is one logical kind with several ops in the file name (attention in/out,
+# the MLP boundary of the same layers, and the quantized activation each MLP GEMM
+# consumes); the other kinds map to themselves so ``--kind kv``/``--kind act``
+# glob exactly their own files.
 _KIND_GLOBS = {
     "topk": ("topk_*.pt",),
     "kv": ("kv_*.pt",),
-    "act": ("actin_*.pt", "actout_*.pt", "mlpin_*.pt", "guout_*.pt", "dnin_*.pt", "mlpout_*.pt"),
+    "act": (
+        "actin_*.pt",
+        "actout_*.pt",
+        "mlpin_*.pt",
+        "guq_*.pt",
+        "guout_*.pt",
+        "dnin_*.pt",
+        "dnq_*.pt",
+        "mlpout_*.pt",
+    ),
 }
-# Row order inside one layer: attention input/output, then the MLP pipeline
-# (input -> gate_up output -> down_proj input -> output).  Anything that differs
-# earlier in this order is where the divergence is born.
-_ACT_OP_ORDER = {"in": 0, "out": 1, "mlp_in": 2, "gu_out": 3, "dn_in": 4, "mlp_out": 5}
+# Row order inside one layer, i.e. the order the numbers flow: the layer input
+# and its attention output, then the MLP pipeline -- its input, the activation
+# quantization the gate_up GEMM consumes, that GEMM's output, the down_proj
+# input, the quantization the down_proj GEMM consumes, and finally the MLP
+# output.  The earliest differing row is where the divergence is born; the pair
+# ``(qin, GEMM out)`` is what separates "the quantization changed" from "the
+# GEMM kernel changed".
+_ACT_OP_ORDER = {
+    "in": 0,
+    "out": 1,
+    "mlp_in": 2,
+    "gu_q": 3,
+    "gu_out": 4,
+    "dn_in": 5,
+    "dn_q": 6,
+    "mlp_out": 7,
+}
 _FILE_KIND_OP = {
     "actin": "in",
     "actout": "out",
     "mlpin": "mlp_in",
+    "guq": "gu_q",
     "guout": "gu_out",
     "dnin": "dn_in",
+    "dnq": "dn_q",
     "mlpout": "mlp_out",
 }
 
@@ -816,22 +841,45 @@ def check_kv(args) -> int:
 def _act_rows(payload: dict) -> tuple[np.ndarray, np.ndarray, np.ndarray, int] | None:
     """``(positions, raw_bytes, float32, itemsize)`` of one activation dump.
 
-    ``raw_bytes`` is the exact stored representation (bf16/fp16/fp32 viewed as
-    bytes), so the comparison is bit-exact; ``float32`` exists only to quantify
-    the magnitude of a difference.
+    Two payload shapes are understood:
+
+    * ``act`` -- a bf16/fp16/fp32 activation (the ``act``/``mlp`` trace);
+    * ``q``   -- the **quantized** activation a GEMM consumes (fp8 e4m3 / int8),
+      optionally with its ``s`` scale (e8m0).  Its bytes and the scale's bytes are
+      concatenated row-wise into one comparison, so a change in either the codes
+      or the scale counts as a difference; ``float32`` comes from the codes only
+      and is used for the magnitude column.
+
+    ``raw_bytes`` is the exact stored representation (viewed as bytes), so the
+    comparison is bit-exact.
     """
-    act = payload.get("act")
     positions = payload.get("positions")
-    if not isinstance(act, torch.Tensor) or not isinstance(positions, torch.Tensor):
+    if not isinstance(positions, torch.Tensor):
         return None
-    rows = min(int(act.shape[0]), int(positions.numel()))
-    if rows == 0 or act.ndim != 2:
+    act = payload.get("act")
+    quant = payload.get("q")
+    source = act if isinstance(act, torch.Tensor) else quant
+    if not isinstance(source, torch.Tensor) or source.ndim != 2:
+        return None
+    rows = min(int(source.shape[0]), int(positions.numel()))
+    if rows == 0:
         return None
     pos = positions[:rows].detach().to("cpu").to(torch.int64).numpy()
-    kept = act.detach()[:rows].to("cpu").contiguous()
+    kept = source.detach()[:rows].to("cpu").contiguous()
     raw = kept.view(torch.uint8).numpy()
     width = int(kept.shape[1])
     itemsize = max(1, raw.shape[1] // width) if width else 1
+    if not isinstance(act, torch.Tensor):
+        scale = payload.get("s")
+        if (
+            isinstance(scale, torch.Tensor)
+            and scale.ndim == 2
+            and int(scale.shape[0]) >= rows
+        ):
+            scale_bytes = (
+                scale.detach()[:rows].to("cpu").contiguous().view(torch.uint8).numpy()
+            )
+            raw = np.concatenate([raw, scale_bytes], axis=1)
     return pos, raw, kept.float().numpy(), itemsize
 
 
@@ -925,6 +973,11 @@ def check_act(args) -> int:
 
     * ``in`` equal, ``out`` different -> attention (indexer / SFA / o_proj);
     * ``out`` of layer L equal, ``in`` of layer L+1 different -> MoE/MLP.
+
+    Inside one MLP the ``qin`` rows (``gu_q``/``dn_q``) carry the **quantized**
+    activation each GEMM consumes, so the verdict can separate "the activation
+    quantization changed" from "the GEMM kernel changed" -- without them a
+    ``gu_out``/``mlp_out`` difference has two indistinguishable explanations.
     """
     files = list(_iter_dumps(args.dir, "act"))
     if not files:
@@ -1017,6 +1070,20 @@ def check_act(args) -> int:
     if layer is None:
         print("[act] RESULT: traced activations are bit-identical across layouts")
         return 0
+    # Sibling rows of the same layer: the verdict can then say whether the step
+    # *before* the earliest divergence was already clean, which is exactly what
+    # separates the two root causes inside one GEMM.  ``None`` means the op was
+    # not traced at all -- that is not the same as "clean", and the verdict says
+    # so instead of guessing.
+    same_layer = {item["op"]: item for item in rows if item["layer"] == layer}
+
+    def _clean(op_name: str) -> bool | None:
+        item = same_layer.get(op_name)
+        return None if item is None else not bool(item["differ"])
+
+    quant_clean = _clean("gu_q")
+    gu_out_clean = _clean("gu_out")
+    dn_q_clean = _clean("dn_q")
     if op == "in":
         if layer == 0:
             print("[act] -> layer 0 的输入是 embedding（与排布无关）却在两种排布下不同："
@@ -1029,16 +1096,47 @@ def check_act(args) -> int:
         print(f"[act] -> layer {layer} 的 **MLP 输入**先不等，而同一层的 attention 输出相同"
               "（见同层 op=out 那一行）⇒ 分歧产生在「attention 输出 → MLP 输入」之间："
               "pre-MLP 的 norm / 残差 / 跨 rank 归约（不是 MLP 本身，也不是 attention）")
+    elif op == "gu_q":
+        print(f"[act] -> layer {layer} 的 **gate_up 量化输入**（喂给 npu_quant_matmul 的 fp8 + e8m0 scale）先不等，"
+              f"而同层 MLP 的 bf16 输入（op=mlp_in）逐字节相同 ⇒ 根因在**激活量化这一步**："
+              f"同一批 bf16 行在不同排布下量化出不同的 fp8/scale（MX 量化并非逐 token 独立，"
+              f"或融合的 norm+quant 内核按 tile 共享状态）。"
+              f"下一步：查该层量化/融合内核的入参形状与 tile，不必再往 GEMM 里找")
     elif op == "gu_out":
-        print(f"[act] -> layer {layer} 的 **gate_up_proj 输出**先不等，而 MLP 输入逐字节相同"
-              "⇒ 分歧产生在这一个 GEMM 内部：**激活量化（A-quant）** 或 GEMM 内核的 tiling/累加顺序。"
-              "下一步：把该线性层的动态量化 scale（per-token 还是 per-tensor）与 GEMM 入参形状打出来对比")
+        if quant_clean is False:
+            print(f"[act] -> layer {layer} 的 **gate_up_proj 输出**先不等，且同层 **gu_q 也不等** ⇒ "
+                  f"根因在**量化**：同一个 bf16 输入量化出不同的 fp8/scale（见 op=gu_q 那一行）")
+        elif quant_clean is True:
+            print(f"[act] -> layer {layer} 的 **gate_up_proj 输出**先不等，而它的两个输入都逐字节相同"
+                  f"（bf16 见 op=mlp_in，量化后的 fp8/scale 见 op=gu_q）⇒ 根因在 **npu_quant_matmul 这个 GEMM 内核本身**："
+                  f"逐行数学与权重都相同、输入逐位相同却给出不同结果 ⇒ 查内核 tiling/workspace 与确定性"
+                  f"（同一配置重跑一次即可判定），而不是 token 排布的数学")
+        else:
+            print(f"[act] -> layer {layer} 的 **gate_up_proj 输出**先不等，而 MLP 输入逐字节相同 ⇒ "
+                  f"分歧产生在这一个 GEMM 内部：**激活量化（A-quant）** 或 GEMM 内核的 tiling/累加顺序"
+                  f"（本层未打点 qin，无法区分；加 `qin:{layer}` 后一轮即可定死）")
     elif op == "dn_in":
-        print(f"[act] -> layer {layer} 的 **down_proj 输入**先不等，而 gate_up_proj 输出相同"
-              "⇒ 分歧产生在中间的**激活函数（silu）或其量化**这一步")
+        print(f"[act] -> layer {layer} 的 **down_proj 输入（bf16，silu 之后）**先不等，"
+              f"而 gate_up_proj 输出相同 ⇒ 分歧产生在中间的**激活函数（silu）**这一步")
+    elif op == "dn_q":
+        if gu_out_clean is False:
+            print(f"[act] -> layer {layer} 的 **down_proj 量化输入**先不等，但同层 gate_up 输出也不等 ⇒ "
+                  f"先看更早的 op=gu_q / op=gu_out 两行，分歧不在这一步")
+        else:
+            print(f"[act] -> layer {layer} 的 **down_proj 量化输入**（silu 之后的 fp8 + scale）先不等，"
+                  f"而 gate_up_proj 输出相同 ⇒ 根因在 **silu 之后的量化**这一步")
     elif op == "mlp_out":
-        print(f"[act] -> layer {layer} 的 **MLP/MoE 输出**先不等，而它的输入相同（见同层 mlp_in 那一行）"
-              "⇒ 分歧产生在这一层的 MLP/MoE **内部**：激活量化 / GEMM 分组与内核 tiling / 专家计算")
+        if dn_q_clean is False:
+            print(f"[act] -> layer {layer} 的 **MLP/MoE 输出**先不等，但同层 down_proj 的量化输入也不等 ⇒ "
+                  f"根因在 down_proj 之前（见 op=dn_q / op=dn_in 两行）")
+        elif dn_q_clean is True:
+            print(f"[act] -> layer {layer} 的 **MLP/MoE 输出**先不等，而它的输入与 down_proj 的量化输入都相同"
+                  f"（见同层 op=mlp_in / op=dn_q）⇒ 根因在 **down_proj 这个 GEMM（含跨 rank 归约）**："
+                  f"输入逐位相同却给出不同输出 ⇒ 查内核 tiling/workspace 与确定性")
+        else:
+            print(f"[act] -> layer {layer} 的 **MLP/MoE 输出**先不等，而它的输入相同（见同层 mlp_in 那一行）"
+                  "⇒ 分歧产生在这一层的 MLP/MoE **内部**：激活量化 / GEMM 分组与内核 tiling / 专家计算"
+                  f"（本层未打点 qin，无法区分；加 `qin:{layer}` 后一轮即可定死）")
     else:
         print(f"[act] -> layer {layer} 的 attention 输出先不等（输入见 op=in 那一行）："
               "差异在这一层的 attention 内部产生（indexer 选点顺序 / SFA 归约顺序 / o_proj），"

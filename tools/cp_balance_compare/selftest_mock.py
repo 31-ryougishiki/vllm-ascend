@@ -1022,6 +1022,79 @@ def test_check_zigzag_act_covers_mlp_boundary() -> None:
         shutil.rmtree(out, ignore_errors=True)
 
 
+def test_check_zigzag_act_qin_separates_quant_from_gemm() -> None:
+    """`gu_q`/`dn_q` must separate "the quantization changed" from "the GEMM changed".
+
+    With W8A8_MXFP8 weights the activation quantization is per row (32-element MX
+    groups), so a bit-identical bf16 input *must* quantize identically.  If it does
+    not, the root cause is the quantization step; if it does while the GEMM output
+    still differs, the root cause is the GEMM kernel itself.  The verdict must say
+    which one, from the same table -- without that split, ``gu_out`` alone cannot
+    tell the two apart.
+    """
+    if checker is None:
+        print("[skip] torch not available (check_zigzag_dumps needs it)")
+        return
+    import argparse
+
+    import torch
+
+    out = _temp_dir("cp_ab_qin_")
+    try:
+        torch.manual_seed(59)
+        base = torch.rand(8, 4).add(0.5).to(torch.bfloat16)
+        q_same = torch.rand(8, 4).add(0.5).to(torch.float8_e4m3fn)
+        s_same = torch.full((8, 1), 127, dtype=torch.uint8)
+        q_other = q_same.clone()
+        q_other[4:] = (q_other[4:].float() + 0.5).to(torch.float8_e4m3fn)
+        s_other = s_same.clone()
+        s_other[4:] = 128
+        shifted = base.clone()
+        shifted[4:] = (shifted[4:].float() + 0.25).to(torch.bfloat16)
+        positions = torch.tensor(list(range(8)), dtype=torch.int32)
+
+        def save(kind: str, cpbal: int, payload: dict) -> None:
+            payload = dict(payload)
+            payload["positions"] = positions
+            torch.save(
+                payload,
+                out / f"{kind}_cpbal{cpbal}_layer0_rank0_pid100_{1000 + cpbal}.pt",
+            )
+
+        def qin(q, s) -> dict:
+            return {"kind": "qin", "op": "gu_q", "q": q.clone(), "s": s.clone()}
+
+        def run() -> str:
+            buffer, errors = io.StringIO(), io.StringIO()
+            with redirect_stdout(buffer), redirect_stderr(errors):
+                rc = checker.check_act(
+                    argparse.Namespace(dir=str(out), summary_only=True, block_size=4)
+                )
+            text = buffer.getvalue()
+            assert rc == 1, text + errors.getvalue()
+            return text
+
+        # 1) bf16 input AND the fp8/scale pair are identical; only the GEMM output
+        #    differs -> the GEMM kernel is the root cause.
+        for cpbal in (0, 1):
+            save("mlpin", cpbal, {"kind": "mlp", "act": base.clone()})
+            save("guq", cpbal, qin(q_same, s_same))
+        for cpbal, data in ((0, base), (1, shifted)):
+            save("guout", cpbal, {"kind": "mlp", "act": data.clone()})
+        text = run()
+        assert "[act] FIRST DIVERGENCE (act): layer 0 op=gu_out at token 4" in text, text
+        assert "GEMM 内核本身" in text, text
+
+        # 2) the quantization itself differs from token 4 on -> that row wins.
+        for cpbal, (q, s) in ((0, (q_same, s_same)), (1, (q_other, s_other))):
+            save("guq", cpbal, qin(q, s))
+        text = run()
+        assert "[act] FIRST DIVERGENCE (act): layer 0 op=gu_q at token 4" in text, text
+        assert "量化这一步" in text, text
+    finally:
+        shutil.rmtree(out, ignore_errors=True)
+
+
 def test_load_prompts_file() -> None:
     out = Path(_temp_dir("cp_ab_pf_"))
     try:

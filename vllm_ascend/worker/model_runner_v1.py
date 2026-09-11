@@ -3557,6 +3557,7 @@ class NPUModelRunner(GPUModelRunner):
         dump_dir = _dump_dir()
         done: set[tuple[int, str]] = set()
         skipped: set[tuple[int, str]] = set()
+        skipped_tuple: set[str] = set()
 
         def _dsa_cp_context():
             """The DSA-CP context of the current forward, zigzag or continuous.
@@ -3599,6 +3600,27 @@ class NPUModelRunner(GPUModelRunner):
             if (layer_idx, op) in done:
                 return
             if getattr(_EXTRA_CTX, "in_profile_run", False):
+                return
+            if isinstance(value, (tuple, list)):
+                # A fused norm+quant producer (fuse_norm_quant) hands the linear a
+                # ``(fp8, e8m0 scale)`` pair, so there is no bf16 tensor to dump.
+                # Say so once instead of returning silently: a missing row in the
+                # act table would otherwise look exactly like "this step is
+                # identical".  The pair itself is what ``qin:<layer>`` captures.
+                if op not in skipped_tuple:
+                    skipped_tuple.add(op)
+                    logger.warning(
+                        "[CP_BALANCE][dump] %s layer=%s skipped: value is a "
+                        "quantized tuple (%s) fed by a fused producer; use "
+                        "qin:%s to trace that pair",
+                        kind,
+                        layer_idx,
+                        ", ".join(
+                            str(getattr(item, "dtype", type(item).__name__))
+                            for item in value[:2]
+                        ),
+                        layer_idx,
+                    )
                 return
             if not isinstance(value, torch.Tensor) or value.ndim != 2:
                 return
@@ -3684,6 +3706,306 @@ class NPUModelRunner(GPUModelRunner):
                 sorted(layers),
             )
 
+    def _install_cp_balance_quant_dumps(self) -> None:
+        """Trace the *quantized* activation the traced layers' MLP GEMMs consume.
+
+        ``VLLM_ASCEND_CP_BALANCE_DUMP=qin:0`` dumps, once per layer and process,
+        the **fp8 activation and its e8m0 scale** handed to ``npu_quant_matmul``
+        for ``layers.<L>.mlp.gate_up_proj`` (op ``gu_q``) and
+        ``layers.<L>.mlp.down_proj`` (op ``dn_q``).
+
+        Why this tap exists: the ``act``/``mlp`` hooks observe bf16 tensors, so a
+        difference born in the activation quantization is only visible *after*
+        the GEMM, as a ``gu_out``/``mlp_out`` difference that per-row math cannot
+        explain (the W8A8_MXFP8 scheme quantizes per row with 32-element MX
+        groups, which is layout independent).  Comparing this pair across the two
+        layouts separates the two candidate root causes in one round:
+
+        * ``gu_q`` differs while ``mlp_in`` is bit-identical
+          -> the divergence is born in the **quantization** (or in the fused
+          producer that emits the pair);
+        * ``gu_q`` identical while ``gu_out`` differs
+          -> the divergence is born in the **GEMM kernel** itself
+          (tiling / workspace / determinism), not in the token layout's math.
+
+        The tap is an instance-level ``apply`` wrapper on the layer's
+        ``AscendLinearMethod`` adapter: that adapter is one object per layer
+        (``linear_op.py`` stores it and calls it for every parallel flavour,
+        including ``matmul_and_reduce``), so only the requested layers are
+        touched.  When the scheme quantizes inside ``apply`` the probe patches
+        ``torch_npu.npu_dynamic_mx_quant`` / ``npu_dynamic_quant`` for exactly the
+        duration of that one call, so no other layer pays for it.
+
+        Positions follow the layout: rank-local rows are keyed by
+        ``slot_mapping_cp``, an all-gathered (FlashComm) tensor by the natural
+        slot mapping in gather order (``[r0_prev, r0_next, ...]`` under zigzag,
+        natural order under the continuous slice).  If neither matches, the
+        sample is skipped with an explicit warning -- never silently, because a
+        missing row would be indistinguishable from "identical".
+        """
+        try:
+            from vllm_ascend import envs as ascend_envs
+            from vllm_ascend.attention.sfa_v1 import (
+                _dump_dir,
+                _parse_dump_spec,
+                _zigzag_dump,
+            )
+        except Exception as exc:  # pragma: no cover - diagnostics only
+            logger.warning("[CP_BALANCE][dump] quant trace unavailable: %s", exc)
+            return
+        layers = _parse_dump_spec(ascend_envs.VLLM_ASCEND_CP_BALANCE_DUMP).get("qin")
+        if not layers:
+            return
+
+        import torch
+        from vllm_ascend.ascend_forward_context import _EXTRA_CTX
+
+        dump_dir = _dump_dir()
+        done: set[tuple[int, str]] = set()
+        skipped: set[tuple[int, str]] = set()
+
+        def _forward_attn_metadata():
+            try:
+                from vllm.forward_context import get_forward_context
+
+                return getattr(get_forward_context(), "attn_metadata", None)
+            except Exception:
+                return None
+
+        def _dsa_cp_context():
+            ctx = getattr(_EXTRA_CTX, "zigzag_cp_context", None)
+            if ctx is not None and getattr(ctx, "slot_mapping_cp", None) is not None:
+                return ctx
+            meta = _forward_attn_metadata()
+            if meta is None:
+                return None
+            for candidate in meta.values() if isinstance(meta, dict) else [meta]:
+                ctx = getattr(candidate, "dsa_cp_context", None)
+                if ctx is not None and getattr(ctx, "slot_mapping_cp", None) is not None:
+                    return ctx
+            return None
+
+        def _natural_slots(rows: int):
+            meta = _forward_attn_metadata()
+            if meta is None:
+                return None
+            for candidate in meta.values() if isinstance(meta, dict) else [meta]:
+                slots = getattr(candidate, "slot_mapping", None)
+                if isinstance(slots, torch.Tensor) and slots.numel() >= rows:
+                    return slots
+            return None
+
+        def _positions(rows: int):
+            """Token position (cache slot) of every row, or None when unknown."""
+            ctx = _dsa_cp_context()
+            if ctx is None or rows <= 0:
+                return None
+            local = getattr(ctx, "slot_mapping_cp", None)
+            if isinstance(local, torch.Tensor) and local.numel() == rows:
+                return local.detach().to("cpu").to(torch.int64)
+            natural = _natural_slots(rows)
+            if isinstance(natural, torch.Tensor):
+                gather = getattr(ctx, "zigzag_gather_index", None)
+                if isinstance(gather, torch.Tensor) and gather.numel() >= rows:
+                    try:
+                        return natural[gather[:rows]].detach().to("cpu").to(torch.int64)
+                    except Exception as exc:  # pragma: no cover - diagnostics only
+                        logger.warning(
+                            "[CP_BALANCE][dump] zigzag gather order unusable (%s); "
+                            "falling back to natural order",
+                            exc,
+                        )
+                return natural[:rows].detach().to("cpu").to(torch.int64)
+            return None
+
+        def _emit(layer_idx, op, name, quant, scale, in_act, fused) -> None:
+            key = (layer_idx, op)
+            if key in done:
+                return
+            if getattr(_EXTRA_CTX, "in_profile_run", False):
+                return
+            if not isinstance(quant, torch.Tensor):
+                # Nothing was intercepted: the scheme may quantize in a fused op
+                # that this tap cannot see.  Say so -- a missing row must never be
+                # indistinguishable from "this step is identical".
+                if key not in skipped:
+                    skipped.add(key)
+                    logger.warning(
+                        "[CP_BALANCE][dump] %s layer=%s: no activation quantization "
+                        "call was observed inside apply(); nothing dumped",
+                        op,
+                        layer_idx,
+                    )
+                return
+            rows = int(quant.shape[0])
+            positions = _positions(rows)
+            if positions is None:
+                if key not in skipped:
+                    skipped.add(key)
+                    logger.warning(
+                        "[CP_BALANCE][dump] %s layer=%s skipped: no token positions "
+                        "for rows=%s (quant=%s%s); the sample would not be "
+                        "comparable across layouts",
+                        op,
+                        layer_idx,
+                        rows,
+                        tuple(quant.shape),
+                        ""
+                        if not isinstance(scale, torch.Tensor)
+                        else f", scale={tuple(scale.shape)}",
+                    )
+                return
+            done.add(key)
+            _zigzag_dump(
+                {
+                    "kind": "qin",
+                    "op": op,
+                    "layer_name": name,
+                    "layer_idx": layer_idx,
+                    "fused": bool(fused),
+                    "positions": positions,
+                    "q": quant.detach().to("cpu"),
+                    "s": scale.detach().to("cpu")
+                    if isinstance(scale, torch.Tensor)
+                    else None,
+                    "in_act": in_act[:rows].detach().to("cpu")
+                    if isinstance(in_act, torch.Tensor)
+                    else None,
+                    "in_dtype": str(in_act.dtype)
+                    if isinstance(in_act, torch.Tensor)
+                    else None,
+                },
+                layer_idx,
+                "guq" if op == "gu_q" else "dnq",
+                dump_dir,
+            )
+
+        try:
+            import torch_npu
+        except Exception as exc:  # pragma: no cover - diagnostics only
+            logger.warning("[CP_BALANCE][dump] quant trace needs torch_npu: %s", exc)
+            return
+
+        capture: dict[str, dict | None] = {"slot": None}
+
+        def _quant_probe(orig):
+            def wrapper(x, *args, **kwargs):
+                out = orig(x, *args, **kwargs)
+                slot = capture["slot"]
+                if slot is not None and not slot["captured"]:
+                    slot["captured"] = True
+                    if (
+                        isinstance(out, (tuple, list))
+                        and len(out) >= 2
+                        and torch.is_tensor(out[0])
+                    ):
+                        slot["quant"] = out[0]
+                        slot["scale"] = out[1] if torch.is_tensor(out[1]) else None
+                return out
+
+            return wrapper
+
+        def _patch_quant_ops():
+            """Intercept the activation-quant op for one ``apply``; return restore."""
+            originals = []
+            for op_name in ("npu_dynamic_mx_quant", "npu_dynamic_quant"):
+                orig = getattr(torch_npu, op_name, None)
+                if orig is None or getattr(orig, "_cp_balance_probe", False):
+                    continue
+                probe = _quant_probe(orig)
+                probe._cp_balance_probe = True  # type: ignore[attr-defined]
+                setattr(torch_npu, op_name, probe)
+                originals.append((op_name, orig))
+
+            def restore() -> None:
+                for op_name, orig in originals:
+                    setattr(torch_npu, op_name, orig)
+
+            return restore
+
+        def _make_apply(orig_apply, layer_idx, op, name):
+            def apply(layer, x, bias=None, *args, **kwargs):
+                key = (layer_idx, op)
+                if (
+                    key in done
+                    or capture["slot"] is not None
+                    or getattr(_EXTRA_CTX, "in_profile_run", False)
+                ):
+                    return orig_apply(layer, x, bias, *args, **kwargs)
+                if isinstance(x, (tuple, list)) and len(x) >= 2 and torch.is_tensor(x[0]):
+                    # A fused producer (fuse_norm_quant) already quantized it.
+                    _emit(
+                        layer_idx,
+                        op,
+                        name,
+                        x[0],
+                        x[1] if torch.is_tensor(x[1]) else None,
+                        None,
+                        True,
+                    )
+                    return orig_apply(layer, x, bias, *args, **kwargs)
+                slot: dict = {"captured": False, "quant": None, "scale": None}
+                capture["slot"] = slot
+                restore = _patch_quant_ops()
+                try:
+                    result = orig_apply(layer, x, bias, *args, **kwargs)
+                finally:
+                    capture["slot"] = None
+                    restore()
+                _emit(
+                    layer_idx,
+                    op,
+                    name,
+                    slot["quant"],
+                    slot["scale"],
+                    x if torch.is_tensor(x) and x.ndim == 2 else None,
+                    False,
+                )
+                return result
+
+            return apply
+
+        installed = []
+        for name, module in self.model.named_modules():
+            op = None
+            for layer_idx in layers:
+                if name.endswith(f"layers.{layer_idx}.mlp.gate_up_proj"):
+                    op = "gu_q"
+                elif name.endswith(f"layers.{layer_idx}.mlp.down_proj"):
+                    op = "dn_q"
+                if op is not None:
+                    break
+            if op is None:
+                continue
+            adapter = getattr(module, "quant_method", None)
+            if adapter is None or not hasattr(adapter, "apply"):
+                logger.warning(
+                    "[CP_BALANCE][dump] %s has no quant_method.apply; %s not traced",
+                    name,
+                    op,
+                )
+                continue
+            try:
+                adapter.apply = _make_apply(adapter.apply, layer_idx, op, name)
+            except Exception as exc:  # pragma: no cover - diagnostics only
+                logger.warning(
+                    "[CP_BALANCE][dump] cannot patch %s (%s): %s", name, op, exc
+                )
+                continue
+            installed.append((layer_idx, name))
+        if installed:
+            logger.info(
+                "[CP_BALANCE][dump] quant trace armed for %s -> %s",
+                sorted(installed),
+                dump_dir,
+            )
+        else:
+            logger.warning(
+                "[CP_BALANCE][dump] quant trace requested for layers %s but no "
+                "'.mlp.gate_up_proj'/'.mlp.down_proj' module matched",
+                sorted(layers),
+            )
+
     def load_model(self) -> None:
         load_model_start_time = time.perf_counter()
         logger.info("Starting to load model %s...", self.model_config.model)
@@ -3765,6 +4087,7 @@ class NPUModelRunner(GPUModelRunner):
         logger.info("Loading model weights took %.4f GB", m.consumed_memory / float(2**30))
 
         self._install_cp_balance_mlp_dumps()
+        self._install_cp_balance_quant_dumps()
 
         get_offloader().post_init()
 

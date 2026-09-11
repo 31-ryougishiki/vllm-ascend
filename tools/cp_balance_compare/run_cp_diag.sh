@@ -20,7 +20,8 @@
 #   CP_SIZE      默认取 TP_SIZE（driver 的 --cp-size，必须等于 TP_SIZE）
 #   OUT_ROOT     默认 /dev/shm/cp_ab        BASE_PORT  默认 8034
 #   KIND         check 模式的判读类型（默认 both；probe 轮用 KIND=act）
-#   DUMP_SPEC    默认 topk:6,kv:0,6（置空=不 dump；支持 kv:all / topk:all / act:0,1,2,3）
+#   DUMP_SPEC    默认 topk:6,kv:0,6（置空=不 dump；支持 kv:all / topk:all / act:0,1,2,3 /
+#                mlp:0,1 / qin:0；probe 模式自带一套默认值）
 #   DUMP_DIR     默认 /dev/shm/cp_balance_dump（**writer 与 checker 共用这一个**；
 #                kv:all 是 GB 级、act 是百 MB 级，/dev/shm 小就指到真实磁盘——写满
 #                /dev/shm 还会把 server 自己搞死，它的 IPC/prometheus 目录都在那里）
@@ -119,15 +120,17 @@ case "${mode}" in
     # 的贡献）各存一份，按**全局 token 位置**打点，所以 B/C 可以直接逐 token 比。
     # 判据见 README「激活剖面」：in 相同 + out 不同 => attention 内部先不等；
     # out 相同 + 下一层 in 不同 => 中间那层的 MoE/MLP 先不等。
-    # 现在再加 MLP 边界（mlp:<层>）：dense MLP / MoE 的输入与输出各一份，
-    # 把一层切成 attention out → mlp in → mlp out → 下一层 attention in。
-    # 另外带 layer 0 的 topk（索引表按 token 位置跨排布对比：集合是否相同、顺序是否相同）。
-    # 规模：每个 sample ≈ 全 rank 合计 hidden*2B*2048（hidden=6144 时约 25MB），
-    # 默认 3 层 × (act 2 + mlp 2) + 1 层 topk + 2 层 kv ≈ 850MB
+    # MLP 边界（mlp:<层>）：MLP 的输入与输出各一份，把一层切成
+    # attention out → mlp in → mlp out → 下一层 attention in。
+    # qin:<层>：该层两个 MLP GEMM **实际吃到的量化输入**（fp8 + e8m0 scale）。
+    # 它和 mlp_in/gu_out/dn_q 一起把「同一个 bf16 输入却算出不同结果」拆成两种根因：
+    #   量化输入也变 => 根因在量化/融合内核；量化输入相同而 GEMM 输出不同 => 根因在 GEMM 内核。
+    # 只打 layer 0/1（0 是根因所在，1 作对照）：层数越多 dump 越大，而 2 层已足够定位。
+    # 规模：每层每 rank ≈16MB × 8 rank × 2 配置 ⇒ 2 层 ≈ 510MB，加 qin ≈ 575MB
     # → 必须落真实磁盘，默认 /root/cp_probe。
     round_name="r_probe"
     repeat_a=0
-    dump_spec="${DUMP_SPEC:-act:0,1,2,mlp:0,1,2,topk:0,kv:0,1}"
+    dump_spec="${DUMP_SPEC:-act:0,1,mlp:0,1,qin:0,topk:0,kv:0,1}"
     out_root="${OUT_ROOT:-/dev/shm/cp_ab_probe}"
     if [[ -z "${DUMP_DIR:-}" ]]; then
       dump_dir="/root/cp_probe"

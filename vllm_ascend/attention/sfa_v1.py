@@ -206,7 +206,7 @@ def _dump_dir() -> str:
     return os.getenv("VLLM_ASCEND_CP_BALANCE_DUMP_DIR", "").strip() or SFA_ZIGZAG_DUMP_DIR
 
 
-_ZIGZAG_DUMP_KINDS = ("topk", "kv", "act", "mlp")
+_ZIGZAG_DUMP_KINDS = ("topk", "kv", "act", "mlp", "qin")
 _ZIGZAG_ALL_LAYERS = set(range(1 << 20))
 _ZIGZAG_WARNED_KEYS: set[str] = set()
 
@@ -250,6 +250,7 @@ def _parse_dump_spec(raw: Any) -> dict[str, set[int]]:
         kv:0,6              # layers 0 and 6, KV dump
         topk:6,kv:0,6       # both
         act:0,1             # layers 0 and 1, attention input + output trace
+        qin:0               # layer 0: fp8 activation + e8m0 scale fed to its MLP GEMMs
         topk:all            # every layer
 
     A token containing ``:`` opens a new kind; bare numbers are appended to the

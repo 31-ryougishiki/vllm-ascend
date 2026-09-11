@@ -52,7 +52,7 @@
 
 | 模式 | 轮次目录 | 做什么 | 回答什么 |
 | --- | --- | --- | --- |
-| **`probe`** | `r_probe`（dump→`/root/cp_probe`） | B/C（无 B2）+ `act:0,1,2,mlp:0,1,2,topk:0,kv:0,1` | **当前主用**：哪一步先不等（attention / pre-MLP / MLP 内部） |
+| **`probe`** | `r_probe`（dump→`/root/cp_probe`） | B/C（无 B2）+ `act:0,1,mlp:0,1,qin:0,topk:0,kv:0,1` | **当前主用**：哪一步先不等（attention / pre-MLP / MLP 内部的量化 vs GEMM） |
 | `sweep` | `r_sweep` | B/C + `kv:all` 全层 KV dump | 第几层的 KV 先不等（→ 上一层输出进入） |
 | `baseline` | `r1_baseline` | B/C/B2 + `topk:6,kv:0,6` | 现状差异多大、落在哪个分片 |
 | `check` | — | 直接 `exec check_zigzag_dumps.py --dir <dump> --kind ${KIND:-both}`（`KIND=act` 自动加 `--summary-only`） | 判读（不需要 NPU） |
@@ -68,9 +68,15 @@ python tools/cp_balance_compare/check_zigzag_dumps.py --dir /root/cp_probe \
     --kind act --summary-only --block-size 128 2>&1 | tee tools/cp_balance_compare/log.log
 ```
 
-**跑起来先看两行**：模型加载完应打印 `[CP_BALANCE][dump] mlp trace armed for [...9 个模块...]`；
-结束时应有 `dump: +N file(s)`（`probe` 轮 N≈336：每层 6 个采样点 × 3 层 × 8 rank × 2 配置 = 288，加 `topk:0` 16 + `kv:0,1` 32）。
-⚠️ 若打印的是 `mlp trace requested … but no 'layers.<L>.mlp*' module matched`，说明模块名不匹配 → 把该行贴回来改匹配规则。
+**跑起来先看两行**：模型加载完应打印 `[CP_BALANCE][dump] mlp trace armed for [...]` 与
+`[CP_BALANCE][dump] quant trace armed for [...]`（后者只在 spec 带 `qin:` 时出现）；
+结束时应有 `dump: +N file(s)`（`probe` 轮 N≈272：layer 0 八个采样点 + layer 1 六个，
+× 8 rank × 2 配置 = 224，加 `topk:0` 16 + `kv:0,1` 32）。
+⚠️ 若打印的是 `mlp trace requested … but no 'layers.<L>.mlp*' module matched`（或 `quant trace … no '….mlp.gate_up_proj'`）
+说明模块名不匹配 → 把该行贴回来改匹配规则。
+⚠️ 若出现 `[CP_BALANCE][dump] dnin layer=0 skipped: value is a quantized tuple …`，
+说明该层的 norm+quant 已被融合（`fuse_norm_quant`），此时 `dn_in` 少 16 个文件（N≈256），
+**该缺口由同一轮的 `dn_q` 补上**——它是同一个数据的量化版本。
 
 常用覆盖：`PROMPT_LENS`、`MIN_TOKENS`、`TP_SIZE`、`CP_SIZE`、`REPEAT_A=0`/`--no-repeat`（省一次加载）、`OUT_ROOT`、
 `DUMP_SPEC`（如 `act:0,1,2,3,mlp:0,1,2,3`、`kv:all`；置空=不 dump）、`DUMP_DIR`（**writer 与 checker 共用一个旋钮**）、`KIND`、`LAUNCHER`。
@@ -88,15 +94,28 @@ launcher 还支持 `EXTRA_SERVE_ARGS="--enable-return-routed-experts"`（空格�
 | `topk` | indexer 索引表 | ① 每行有效前缀 == 因果窗口（P1 断言）；② `[topk/cross]`：B vs C 逐 token 比**集合**与**顺序** |
 | `act` | attention 与 MLP 的逐层采样 | 每层 6 行（数据流顺序），`FIRST DIVERGENCE (act): layer L op=… at token P` |
 
-`--kind act` 的一行 = 一个采样点，顺序即数据流顺序：
+`--kind act` 的一行 = 一个采样点，顺序即数据流顺序（每层最多 8 行）：
 
 ```
-in ─attention─▶ out ─pre-MLP norm─▶ mlp_in ─gate_up_proj─▶ gu_out ─silu─▶ dn_in ─down_proj─▶ mlp_out
+in ─attention─▶ out ─pre-MLP norm─▶ mlp_in ─[量化]─▶ gu_q ─gate_up_proj─▶ gu_out
+   ─silu─▶ dn_in ─[量化]─▶ dn_q ─down_proj─▶ mlp_out
 ```
 
 **最早不等的那一行决定下一步查哪里**：`in`=层间（残差/norm）；`out`=本层 attention；`mlp_in`=attention→MLP 之间；
-`gu_out`=gate_up 这个 GEMM（含 A 量化）；`dn_in`=silu/其量化；`mlp_out`=down_proj（MoE 层还含专家路由/分组）。
-表尾会打印 `[act] INCOMPLETE layer=L op=…: only cp_balance=[…]` —— 表示该采样点只有单侧 dump（**不是"相同"**）。
+`gu_q`=gate_up 的**量化输入**（fp8 + e8m0 scale）；`gu_out`=gate_up 这个 GEMM；`dn_in`=silu 之后的 bf16；
+`dn_q`=down_proj 的量化输入；`mlp_out`=down_proj（MoE 层还含专家路由/分组）。
+`gu_q`/`dn_q` 与相邻行合起来把"同一个 bf16 输入却算出不同结果"拆成互斥的两种根因：
+
+| 观察 | 根因 |
+| --- | --- |
+| `mlp_in` 相同、**`gu_q` 不同** | **激活量化这一步**（同一批 bf16 行量化出不同 fp8/scale） |
+| `gu_q` 相同、**`gu_out` 不同** | **`npu_quant_matmul` 这个 GEMM 内核**（逐行数学与输入都相同 ⇒ tiling/workspace/确定性） |
+| `gu_out` 相同、**`dn_q` 不同** | silu 之后的**量化** |
+| `dn_q` 相同、**`mlp_out` 不同** | **down_proj 这个 GEMM**（含跨 rank 归约） |
+
+若某层没有 `gu_q`/`dn_q` 行（spec 没写 `qin:<层>`），判词会明确写"本层未打点 qin，无法区分"，
+**不会**把缺失当成"相同"。表尾会打印 `[act] INCOMPLETE layer=L op=…: only cp_balance=[…]`
+—— 表示该采样点只有单侧 dump（**不是"相同"**）。
 
 关键读表约定：
 
