@@ -3796,27 +3796,38 @@ class NPUModelRunner(GPUModelRunner):
             return None
 
         def _positions(rows: int):
-            """Token position (cache slot) of every row, or None when unknown."""
+            """``(positions, source)``; ``source`` records which rule produced them.
+
+            The rule is part of the evidence, not an implementation detail: a
+            comparison is only valid if both layouts keyed the sample by the same
+            *natural* token position, so the dump has to say whether the rows were
+            rank-local (``local``) or came from a FlashComm all-gather
+            (``gather_zigzag`` / ``gather_natural``).  Without it, a mis-keyed row
+            set looks exactly like a real numerical difference.
+            """
             ctx = _dsa_cp_context()
             if ctx is None or rows <= 0:
-                return None
+                return None, "none"
             local = getattr(ctx, "slot_mapping_cp", None)
             if isinstance(local, torch.Tensor) and local.numel() == rows:
-                return local.detach().to("cpu").to(torch.int64)
+                return local.detach().to("cpu").to(torch.int64), "local"
             natural = _natural_slots(rows)
             if isinstance(natural, torch.Tensor):
                 gather = getattr(ctx, "zigzag_gather_index", None)
                 if isinstance(gather, torch.Tensor) and gather.numel() >= rows:
                     try:
-                        return natural[gather[:rows]].detach().to("cpu").to(torch.int64)
+                        return (
+                            natural[gather[:rows]].detach().to("cpu").to(torch.int64),
+                            "gather_zigzag",
+                        )
                     except Exception as exc:  # pragma: no cover - diagnostics only
                         logger.warning(
                             "[CP_BALANCE][dump] zigzag gather order unusable (%s); "
                             "falling back to natural order",
                             exc,
                         )
-                return natural[:rows].detach().to("cpu").to(torch.int64)
-            return None
+                return natural[:rows].detach().to("cpu").to(torch.int64), "gather_natural"
+            return None, "none"
 
         def _emit(layer_idx, op, name, quant, scale, in_act, fused) -> None:
             key = (layer_idx, op)
@@ -3838,7 +3849,7 @@ class NPUModelRunner(GPUModelRunner):
                     )
                 return
             rows = int(quant.shape[0])
-            positions = _positions(rows)
+            positions, positions_from = _positions(rows)
             if positions is None:
                 if key not in skipped:
                     skipped.add(key)
@@ -3863,6 +3874,13 @@ class NPUModelRunner(GPUModelRunner):
                     "layer_name": name,
                     "layer_idx": layer_idx,
                     "fused": bool(fused),
+                    # Provenance of the row set: how many rows the GEMM actually
+                    # consumed and which rule turned them into token positions.
+                    # A cross-layout comparison is only meaningful when both sides
+                    # used the same *natural* positions; these two fields are what
+                    # makes that checkable after the round instead of assumed.
+                    "rows": rows,
+                    "positions_from": positions_from,
                     "positions": positions,
                     "q": quant.detach().to("cpu"),
                     "s": scale.detach().to("cpu")

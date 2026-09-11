@@ -229,6 +229,24 @@ python tools/cp_balance_compare/check_zigzag_dumps.py --dir /root/cp_probe \
 判读器会自己把相邻行合起来给结论：`gu_out` 先不等时，若同层 `gu_q` 也不等就指向量化，
 若 `gu_q` 逐位相同就明确指向 GEMM 内核；spec 没写 `qin:` 时会写明"本层未打点 qin，无法区分"。
 
+⚠️ **先确认这份判读本身可信**（否则整张表是错的）：
+1. 表里不能有 `[act] INCOMPLETE`（单侧缺失）——有就先解释来源，别当成"相同"。
+2. 出现 `[act] PROVENANCE …` 说明 B/C 的采样方式不同（`fused` 或 `rows` 不一致）：
+   `fused` 不一致本身就是根因候选（一侧走融合内核、另一侧在 `apply` 里量化），不要读成普通数值差。
+3. 一眼核对量子采样来源（**不需要重新加载模型**）：
+   ```bash
+   python - <<'PY'
+   import glob, torch
+   for p in sorted(glob.glob('/root/cp_probe/guq_*.pt'))[:4] + sorted(glob.glob('/root/cp_probe/dnq_*.pt'))[:4]:
+       d = torch.load(p, map_location='cpu')
+       print(p.split('/')[-1], 'op=', d['op'], 'fused=', d['fused'], 'rows=', d['rows'],
+             'pos_from=', d['positions_from'], 'q=', tuple(d['q'].shape), d['q'].dtype,
+             's=', None if d['s'] is None else tuple(d['s'].shape))
+   PY
+   ```
+   期望：`rows=256 & pos_from=local`（量化在本地行上做）或 `rows=2048 & pos_from=gather_zigzag`(C)/
+   `gather_natural`(B)（先量化后 all-gather）。两侧的坐标语义必须都是"自然 token 位置"。
+
 ### 5.2 后续候选（按需，别预先跑）
 
 - 落在"量化"分支 ⇒ 打该层量化/融合内核的**入参形状**（`npu_add_rms_norm_dynamic_mx_quant` 的 in/out 形状、

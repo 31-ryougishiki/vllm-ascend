@@ -1091,6 +1091,16 @@ def test_check_zigzag_act_qin_separates_quant_from_gemm() -> None:
         text = run()
         assert "[act] FIRST DIVERGENCE (act): layer 0 op=gu_q at token 4" in text, text
         assert "量化这一步" in text, text
+
+        # 3) a dispatch difference (one layout fused, the other quantizing inside
+        #    apply) must be called out, not silently averaged into the table.
+        for cpbal, (q, s) in ((0, (q_same, s_same)), (1, (q_other, s_other))):
+            payload = qin(q, s)
+            payload["fused"] = cpbal == 1
+            payload["rows"] = 8
+            save("guq", cpbal, payload)
+        text = run()
+        assert "[act] PROVENANCE" in text and "fused=False(B) vs True(C)" in text, text
     finally:
         shutil.rmtree(out, ignore_errors=True)
 

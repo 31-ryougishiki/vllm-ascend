@@ -998,6 +998,7 @@ def check_act(args) -> int:
 
     rows: list[dict] = []
     incomplete: list[str] = []
+    provenance: list[str] = []
     total = len(groups)
     for index, (layer, op) in enumerate(sorted(groups, key=lambda k: (k[0], _ACT_OP_ORDER.get(k[1], 9))), 1):
         variants = groups[(layer, op)]
@@ -1011,6 +1012,26 @@ def check_act(args) -> int:
             if not args.summary_only:
                 print(f"[act] {note}")
             continue
+        # Provenance check before comparing: a cross-layout comparison is only
+        # meaningful if both sides sampled the same thing the same way.  The two
+        # failures that produce a *false* verdict are a different row count (the
+        # sample sets differ) and, worse, one side taking the fused
+        # ``(fp8, scale)`` producer while the other quantizes inside ``apply`` --
+        # that would be a dispatch difference, i.e. a root-cause candidate by
+        # itself, and it must never be read as "the numbers differ".
+        prov = {}
+        for cpbal, paths in variants.items():
+            payload = _load(paths[0], warn=False)
+            if payload is not None:
+                prov[cpbal] = (payload.get("fused"), payload.get("rows"), payload.get("positions_from"))
+        mismatch = []
+        if "0" in prov and "1" in prov:
+            if prov["0"][0] != prov["1"][0]:
+                mismatch.append(f"fused={prov['0'][0]}(B) vs {prov['1'][0]}(C)")
+            if prov["0"][1] != prov["1"][1]:
+                mismatch.append(f"rows={prov['0'][1]}(B) vs {prov['1'][1]}(C)")
+        if mismatch:
+            provenance.append(f"layer={layer} op={op}: " + "; ".join(mismatch))
         left = _act_table(variants["0"])
         right = _act_table(variants["1"])
         if left is None or right is None:
@@ -1066,6 +1087,10 @@ def check_act(args) -> int:
         print()
         for note in incomplete:
             print(f"[act] INCOMPLETE {note}")
+    if provenance:
+        print()
+        for note in provenance:
+            print(f"[act] PROVENANCE (B/C 采样方式不同 -- 这本身可能就是根因，别当成普通数值差) {note}")
     print()
     if layer is None:
         print("[act] RESULT: traced activations are bit-identical across layouts")
