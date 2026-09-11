@@ -984,12 +984,14 @@ def test_check_zigzag_act_covers_mlp_boundary() -> None:
         for kind, data in (
             ("actin", base), ("actout", base),          # attention: identical
             ("mlpin", base),                            # MLP input: identical
+            ("guout", base),                            # gate_up output: identical
+            ("dnin", base),                             # down_proj input: identical
             ("mlpout", shifted),                        # MLP output: differs from token 4
         ):
             for cpbal, payload in ((0, base), (1, data)):
                 torch.save(
                     {
-                        "kind": "mlp" if kind.startswith("mlp") else "act",
+                        "kind": "mlp" if kind.startswith(("mlp", "gu", "dn")) else "act",
                         "positions": torch.tensor(positions, dtype=torch.int32),
                         "act": payload.clone(),
                         "num_actual_tokens": 8,
@@ -1002,7 +1004,7 @@ def test_check_zigzag_act_covers_mlp_boundary() -> None:
         text = buffer.getvalue()
         assert rc == 1, text + errors.getvalue()
         ops = [line.split()[2] for line in text.splitlines() if line.startswith("[act]     0 ")]
-        assert ops == ["in", "out", "mlp_in", "mlp_out"], ops
+        assert ops == ["in", "out", "mlp_in", "gu_out", "dn_in", "mlp_out"], ops
         assert "FIRST DIVERGENCE (act): layer 0 op=mlp_out at token 4" in text, text
         assert "MLP/MoE **内部**" in text, text
 

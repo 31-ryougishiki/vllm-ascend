@@ -3595,7 +3595,7 @@ class NPUModelRunner(GPUModelRunner):
                 return slots[:rows].detach().to("cpu").to(torch.int64)
             return None
 
-        def _summarise(name: str, layer_idx: int, op: str, value) -> None:
+        def _summarise(name: str, layer_idx: int, op: str, kind: str, value) -> None:
             if (layer_idx, op) in done:
                 return
             if getattr(_EXTRA_CTX, "in_profile_run", False):
@@ -3614,9 +3614,9 @@ class NPUModelRunner(GPUModelRunner):
                     ctx = _dsa_cp_context()
                     slots = getattr(ctx, "slot_mapping_cp", None) if ctx is not None else None
                     logger.warning(
-                        "[CP_BALANCE][dump] mlp_%s layer=%s skipped: no token positions "
+                        "[CP_BALANCE][dump] %s layer=%s skipped: no token positions "
                         "(rows=%s ctx=%s slot_mapping_cp=%s)",
-                        op,
+                        kind,
                         layer_idx,
                         int(value.shape[0]),
                         type(ctx).__name__ if ctx is not None else None,
@@ -3633,24 +3633,44 @@ class NPUModelRunner(GPUModelRunner):
                 "positions": positions[:rows],
                 "act": value.detach()[:rows].to("cpu"),
             }
-            _zigzag_dump(payload, layer_idx, f"mlp{op}", dump_dir)
+            _zigzag_dump(payload, layer_idx, kind, dump_dir)
 
-        def _make_hook(layer_idx: int, name: str):
+        def _make_hook(layer_idx: int, name: str, ops: tuple[tuple[str, str], ...], kind_prefix: str):
+            """One hook per traced module: ``ops`` maps (suffix, op) to a file kind.
+
+            The MLP itself gives ``mlp_in``/``mlp_out``; its two GEMMs split the
+            inside into three steps, because the MLP is *per token* math and yet
+            its output differs while its input is bit-identical::
+
+                mlp_in --gate_up_proj--> gu_out --act(+quant)--> dn_in --down_proj--> mlp_out
+            """
+
             def hook(module, args, output):  # noqa: ANN001 - torch hook signature
-                if args:
-                    _summarise(name, layer_idx, "in", args[0])
                 if isinstance(output, tuple):
                     output = output[0] if output else None
-                _summarise(name, layer_idx, "out", output)
+                for suffix, op in ops:
+                    if suffix == "in":
+                        if args:
+                            _summarise(name, layer_idx, op, f"{kind_prefix}{op}", args[0])
+                    else:
+                        if output is not None:
+                            _summarise(name, layer_idx, op, f"{kind_prefix}{op}", output)
 
             return hook
 
+        # (module suffix, [(which, op name)], file-kind prefix)
+        trace_targets = (
+            (".mlp", (("in", "in"), ("out", "out")), "mlp"),
+            (".mlp.gate_up_proj", (("out", "gu_out"),), "gu"),
+            (".mlp.down_proj", (("in", "dn_in"),), "dn"),
+        )
         installed = []
         for name, module in self.model.named_modules():
             for layer_idx in layers:
-                if name.endswith(f"layers.{layer_idx}.mlp"):
-                    module.register_forward_hook(_make_hook(layer_idx, name))
-                    installed.append((layer_idx, name))
+                for suffix, ops, kind_prefix in trace_targets:
+                    if name.endswith(f"layers.{layer_idx}{suffix}"):
+                        module.register_forward_hook(_make_hook(layer_idx, name, ops, kind_prefix))
+                        installed.append((layer_idx, name))
         if installed:
             logger.info(
                 "[CP_BALANCE][dump] mlp trace armed for %s -> %s",
@@ -3660,7 +3680,7 @@ class NPUModelRunner(GPUModelRunner):
         else:
             logger.warning(
                 "[CP_BALANCE][dump] mlp trace requested for layers %s but no "
-                "'layers.<L>.mlp' module matched",
+                "'layers.<L>.mlp*' module matched",
                 sorted(layers),
             )
 

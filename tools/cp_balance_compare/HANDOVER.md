@@ -183,22 +183,32 @@ python tools/cp_balance_compare/check_zigzag_dumps.py --dir /root/cp_probe \
     --kind act --summary-only --block-size 128 2>&1 | tee tools/cp_balance_compare/log.log
 ```
 
-**判据**（每层四行的紧凑表 + 一行结论；一行 = 一个 op，顺序 in → out → mlp_in → mlp_out）：
+**判据**（每层六行的紧凑表 + 一行结论；一行 = 一个 op，顺序即数据流顺序）：
 
-| 结论 | 含义 |
+```
+in --attention--> out --(pre-MLP norm)--> mlp_in --gate_up_proj--> gu_out --silu--> dn_in --down_proj--> mlp_out
+```
+
+| 最早不等的那一行 | 含义 |
 | --- | --- |
-| `op=out` 先不等 | 差异在本层 **attention 内部**（indexer/SFA/o_proj） |
-| `op=mlp_in` 先不等（同层 `out` 相同） | 差异在「attention 输出 → MLP 输入」之间：**pre-MLP norm / 残差 / 跨 rank 归约** |
-| `op=mlp_out` 先不等（同层 `mlp_in` 相同） | 差异在本层 **MLP/MoE 内部**：激活量化 / GEMM 分组与内核 tiling / 专家计算 |
-| `op=in` 先不等（上一层 `mlp_out` 相同） | 差异在层与层之间（残差 / 下一层 pre-attention norm） |
+| `op=in` | 层与层之间（残差 / pre-attention norm / 上一层输出） |
+| `op=out`（同层 `in` 相同） | 本层 **attention 内部**（indexer/SFA/o_proj） |
+| `op=mlp_in`（同层 `out` 相同） | 「attention 输出 → MLP 输入」之间：**pre-MLP norm / 残差 / 跨 rank 归约** |
+| `op=gu_out`（同层 `mlp_in` 相同） | **gate_up_proj 这一个 GEMM 内部**：激活量化（A-quant）/ GEMM 内核 tiling |
+| `op=dn_in`（同层 `gu_out` 相同） | **silu 激活（或其量化）** 这一步 |
+| `op=mlp_out`（同层 `dn_in` 相同） | **down_proj** 这一步（MoE 层则还包括专家路由/分组） |
 | `none` | 这几层全精度逐字节相同 → `export DUMP_SPEC=act:3,4,mlp:3,4` 再跑一轮 |
+
+**已实测（TP=8，layer 0）**：`in`/`out`/`mlp_in` 全 0 差异，**`mlp_out` 从 token 256 起 1664/2048 行不同**
+（`max|d|=9.77e-04`，`rel=7.5e-3`）⇒ 分歧诞生在 **layer 0 的 dense MLP 内部**（layer 0/1/2 是 dense MLP，
+`first_k_dense_replace=3`，没有专家、没有路由）⇒ 下一刀就是上面的 `gu_out`/`dn_in` 两点。
 
 `mlp` 打点挂在哪里（换模型也适用，重要）：vLLM 在本站是**装好的包**（`/usr/local/python3.11.10/lib/python3.11/site-packages/vllm`，0.26.0），
 而 `glm_moe_dsa`（GLM-5.2）用的是 `vllm/models/deepseek_v32/nvidia/model.py` 的 `DeepseekV32DecoderLayer/Model`，
 **不是** vllm-ascend `patch/worker/patch_deepseek_v2.py` patch 的 `DeepseekV2DecoderLayer/Model`
 ⇒ 那些 patch 对本模型不生效。所以打点不写模型代码，而是在 worker 里按模块名挂 hook：
-`worker/model_runner_v1.py::_install_cp_balance_mlp_dumps()` 给每个 `layers.<L>.mlp` 注册 forward hook，
-dump 输入/输出（dense MLP 与 MoE 同一套钩子 ✓）。
+`worker/model_runner_v1.py::_install_cp_balance_mlp_dumps()` 给每个 `layers.<L>.mlp`、`…mlp.gate_up_proj`、
+`…mlp.down_proj` 注册 forward hook（dense MLP 与 MoE 同一套钩子 ✓）。
 
 ⚠️ **位置键的坑（第一轮就踩了）**：`_EXTRA_CTX.zigzag_cp_context` **只在 zigzag 生效时才有值**
 （`ascend_forward_context._find_zigzag_cp_context()` 要求 `ctx.zigzag_index is not None`），所以只读它会让

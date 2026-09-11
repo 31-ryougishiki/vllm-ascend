@@ -65,7 +65,7 @@ except ImportError:  # pragma: no cover - the target host always has torch
     raise
 
 NAME_RE = re.compile(
-    r"(?P<kind>topk|kv|actin|actout|mlpin|mlpout)_cpbal(?P<cpbal>\d+)_layer(?P<layer>-?\d+)"
+    r"(?P<kind>topk|kv|actin|actout|mlpin|mlpout|guout|dnin)_cpbal(?P<cpbal>\d+)_layer(?P<layer>-?\d+)"
     r"_rank(?P<rank>\d+)_pid(?P<pid>\d+)_(?P<ts>\d+)\.pt$"
 )
 
@@ -75,15 +75,18 @@ NAME_RE = re.compile(
 _KIND_GLOBS = {
     "topk": ("topk_*.pt",),
     "kv": ("kv_*.pt",),
-    "act": ("actin_*.pt", "actout_*.pt", "mlpin_*.pt", "mlpout_*.pt"),
+    "act": ("actin_*.pt", "actout_*.pt", "mlpin_*.pt", "guout_*.pt", "dnin_*.pt", "mlpout_*.pt"),
 }
-# Row order inside one layer: attention input/output first, then the MLP boundary
-# (the MLP sits between attention out and the next layer's attention input).
-_ACT_OP_ORDER = {"in": 0, "out": 1, "mlp_in": 2, "mlp_out": 3}
+# Row order inside one layer: attention input/output, then the MLP pipeline
+# (input -> gate_up output -> down_proj input -> output).  Anything that differs
+# earlier in this order is where the divergence is born.
+_ACT_OP_ORDER = {"in": 0, "out": 1, "mlp_in": 2, "gu_out": 3, "dn_in": 4, "mlp_out": 5}
 _FILE_KIND_OP = {
     "actin": "in",
     "actout": "out",
     "mlpin": "mlp_in",
+    "guout": "gu_out",
+    "dnin": "dn_in",
     "mlpout": "mlp_out",
 }
 
@@ -1026,6 +1029,13 @@ def check_act(args) -> int:
         print(f"[act] -> layer {layer} 的 **MLP 输入**先不等，而同一层的 attention 输出相同"
               "（见同层 op=out 那一行）⇒ 分歧产生在「attention 输出 → MLP 输入」之间："
               "pre-MLP 的 norm / 残差 / 跨 rank 归约（不是 MLP 本身，也不是 attention）")
+    elif op == "gu_out":
+        print(f"[act] -> layer {layer} 的 **gate_up_proj 输出**先不等，而 MLP 输入逐字节相同"
+              "⇒ 分歧产生在这一个 GEMM 内部：**激活量化（A-quant）** 或 GEMM 内核的 tiling/累加顺序。"
+              "下一步：把该线性层的动态量化 scale（per-token 还是 per-tensor）与 GEMM 入参形状打出来对比")
+    elif op == "dn_in":
+        print(f"[act] -> layer {layer} 的 **down_proj 输入**先不等，而 gate_up_proj 输出相同"
+              "⇒ 分歧产生在中间的**激活函数（silu）或其量化**这一步")
     elif op == "mlp_out":
         print(f"[act] -> layer {layer} 的 **MLP/MoE 输出**先不等，而它的输入相同（见同层 mlp_in 那一行）"
               "⇒ 分歧产生在这一层的 MLP/MoE **内部**：激活量化 / GEMM 分组与内核 tiling / 专家计算")
