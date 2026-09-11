@@ -604,6 +604,129 @@ def test_check_zigzag_kv_handles_fp8_dumps() -> None:
         shutil.rmtree(out, ignore_errors=True)
 
 
+def test_check_zigzag_act_joins_by_position() -> None:
+    """The activation trace must be compared by token position, never by row.
+
+    With ``cp_size=2`` and 8 tokens the blocks are ``[0,1] [2,3] [4,5] [6,7]``:
+    the continuous layout gives rank 0 the range ``[0,4)``, while zigzag gives it
+    ``[0,1] + [6,7]``.  The same row index is therefore a different token, so a
+    row-wise comparison would report a difference in ``in`` (which is identical)
+    and would mis-place the first divergence.  Joining by position must report
+    ``in`` as clean and the first ``out`` difference at token 2 -- the first
+    token whose causal window crosses a block boundary.
+    """
+    if checker is None:
+        print("[skip] torch not available (check_zigzag_dumps needs it)")
+        return
+    import argparse
+
+    import torch
+
+    out = _temp_dir("cp_ab_act_")
+    try:
+        torch.manual_seed(21)
+        base = torch.randn(8, 4).to(torch.bfloat16)
+        shifted = base.float().clone()
+        shifted[2:] += 0.5  # from token 2 on: the first token past the first block
+        shifted = shifted.to(torch.bfloat16)
+
+        def save(kind: str, cpbal: int, rank: int, positions: list[int], data, ts: int = 0) -> None:
+            # position -1 models a padding row (slot -1): it must be dropped.
+            torch.save(
+                {
+                    "kind": "act",
+                    "op": kind[3:],
+                    "positions": torch.tensor(positions, dtype=torch.int32),
+                    "act": data[[max(p, 0) for p in positions]],
+                    "num_actual_tokens": 8,
+                },
+                out / f"{kind}_cpbal{cpbal}_layer0_rank{rank}_pid{100 + rank}_{(1000 + cpbal) if not ts else ts}.pt",
+            )
+
+        for rank in range(2):
+            positions = list(range(4 * rank, 4 * rank + 4))  # continuous slice
+            save("actin", 0, rank, positions, base)
+            save("actout", 0, rank, positions, base)
+        padding = {0: [0, 1, 6, 7, -1], 1: [2, 3, 4, 5, -1]}  # zigzag + one pad row
+        for rank, positions in padding.items():
+            save("actin", 1, rank, positions, base)
+            save("actout", 1, rank, positions, shifted)
+
+        buffer, errors = io.StringIO(), io.StringIO()
+        with redirect_stdout(buffer), redirect_stderr(errors):
+            rc = checker.check_act(argparse.Namespace(dir=str(out), summary_only=True))
+        text = buffer.getvalue()
+        assert rc == 1, text + errors.getvalue()
+        # `in` is bit-identical once compared by position: proof that the join is
+        # by token and not by row.
+        assert "[act]     0   in         8        0" in text, text
+        assert "[act]     0  out         8        6" in text, text
+        assert "FIRST DIVERGENCE (act): layer 0 op=out at token 2" in text, text
+        assert "attention 内部产生" in text, text
+
+        # Identical layouts (both ops) must report no divergence at all.
+        for rank, positions in padding.items():
+            save("actout", 1, rank, positions, base, ts=1002)
+        buffer = io.StringIO()
+        with redirect_stdout(buffer):
+            rc = checker.check_act(argparse.Namespace(dir=str(out), summary_only=True))
+        text = buffer.getvalue()
+        assert rc == 0, text
+        assert "FIRST DIVERGENCE (act): none" in text, text
+    finally:
+        shutil.rmtree(out, ignore_errors=True)
+
+
+def test_check_zigzag_act_pins_moe_divergence() -> None:
+    """Equal attention output + different next-layer input means the MoE/MLP did it.
+
+    Layer 0 is clean in both ops; layer 1's *input* differs while its attention
+    output does not.  The verdict must name layer 1 / op=in (not op=out) and point
+    at the MoE/MLP of layer 0, otherwise the trace cannot bisect attention vs MLP.
+    """
+    if checker is None:
+        print("[skip] torch not available (check_zigzag_dumps needs it)")
+        return
+    import argparse
+
+    import torch
+
+    out = _temp_dir("cp_ab_act_moe_")
+    try:
+        torch.manual_seed(22)
+        base = torch.randn(8, 4).to(torch.bfloat16)
+        shifted = base.float().clone()
+        shifted[3:] += 0.5  # the MoE/MLP of layer 0 diverges from token 3 on
+        shifted = shifted.to(torch.bfloat16)
+        ranks = {0: [0, 1, 6, 7], 1: [2, 3, 4, 5]}
+        for layer in (0, 1):
+            for rank, positions in ranks.items():
+                for cpbal in (0, 1):
+                    data_in = base if (layer == 0 or cpbal == 0) else shifted
+                    for op in ("in", "out"):
+                        torch.save(
+                            {
+                                "kind": "act",
+                                "op": op,
+                                "positions": torch.tensor(positions, dtype=torch.int32),
+                                "act": (data_in if op == "in" else base)[positions],
+                                "num_actual_tokens": 8,
+                            },
+                            out / f"act{op}_cpbal{cpbal}_layer{layer}_rank{rank}_pid{100 + rank}_{1000 + cpbal}.pt",
+                        )
+        buffer, errors = io.StringIO(), io.StringIO()
+        with redirect_stdout(buffer), redirect_stderr(errors):
+            rc = checker.check_act(argparse.Namespace(dir=str(out), summary_only=True))
+        text = buffer.getvalue()
+        assert rc == 1, text + errors.getvalue()
+        assert "[act]     0  out         8        0" in text, text
+        assert "[act]     1   in         8        5" in text, text
+        assert "FIRST DIVERGENCE (act): layer 1 op=in at token 3" in text, text
+        assert "MoE/MLP" in text, text
+    finally:
+        shutil.rmtree(out, ignore_errors=True)
+
+
 def test_load_prompts_file() -> None:
     out = Path(_temp_dir("cp_ab_pf_"))
     try:

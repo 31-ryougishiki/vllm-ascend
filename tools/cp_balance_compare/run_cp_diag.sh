@@ -4,6 +4,7 @@
 # 在 vllm-ascend 仓库根目录执行：
 #   bash tools/cp_balance_compare/run_cp_diag.sh baseline   # T0+T2+T3：基线 B/C/B2 + topk/KV dump
 #   bash tools/cp_balance_compare/run_cp_diag.sh sweep      # 多层扫描：B/C（无 B2）+ 全层 KV+FP dump
+#   bash tools/cp_balance_compare/run_cp_diag.sh probe      # op 级打点：B/C（无 B2）+ attention in/out 全精度剖面
 #   bash tools/cp_balance_compare/run_cp_diag.sh 2call      # T1：回退 prev/next 两次调用
 #   bash tools/cp_balance_compare/run_cp_diag.sh l1024      # T4：MIN_TOKENS=1024
 #   bash tools/cp_balance_compare/run_cp_diag.sh check      # CPU 侧判读已有 dump（不需要 NPU）
@@ -18,10 +19,11 @@
 #   TP_SIZE      默认 8（launcher 的 tensor-parallel-size，同时决定 zigzag 的 cp_size）
 #   CP_SIZE      默认取 TP_SIZE（driver 的 --cp-size，必须等于 TP_SIZE）
 #   OUT_ROOT     默认 /dev/shm/cp_ab        BASE_PORT  默认 8034
-#   DUMP_SPEC    默认 topk:6,kv:0,6（置空=不 dump；支持 kv:all / topk:all）
+#   KIND         check 模式的判读类型（默认 both；probe 轮用 KIND=act）
+#   DUMP_SPEC    默认 topk:6,kv:0,6（置空=不 dump；支持 kv:all / topk:all / act:0,1,2,3）
 #   DUMP_DIR     默认 /dev/shm/cp_balance_dump（**writer 与 checker 共用这一个**；
-#                kv:all 是 GB 级，/dev/shm 小就指到真实磁盘——写满 /dev/shm 还会把
-#                server 自己搞死，它的 IPC/prometheus 目录都在那里）
+#                kv:all 是 GB 级、act 是百 MB 级，/dev/shm 小就指到真实磁盘——写满
+#                /dev/shm 还会把 server 自己搞死，它的 IPC/prometheus 目录都在那里）
 #
 # 说明：digest 变量在 B/C 两个 server 上取值相同，dump 文件名自带 cpbal{0|1}，
 # 所以一轮就能同时拿到 B 与 C 的数据。每轮输出到 $OUT_ROOT/<round>。
@@ -112,13 +114,38 @@ case "${mode}" in
       dump_active=true
     fi
     ;;
+  probe)
+    # op 级全精度打点：attention 的输入（= 上一层的输出）与输出（= 本层 attention
+    # 的贡献）各存一份，按**全局 token 位置**打点，所以 B/C 可以直接逐 token 比。
+    # 判据见 README「激活剖面」：in 相同 + out 不同 => attention 内部先不等；
+    # out 相同 + 下一层 in 不同 => 中间那层的 MoE/MLP 先不等。
+    # 规模：每层每个 sample ≈ 全 rank 合计 hidden*2B*2048（hidden=7168 时约 29MB），
+    # 4 层 × 2 sample × 2 配置 ≈ 470MB → 必须落真实磁盘，默认 /root/cp_probe。
+    round_name="r_probe"
+    repeat_a=0
+    dump_spec="${DUMP_SPEC:-act:0,1,2,3,kv:0,1,2,3}"
+    out_root="${OUT_ROOT:-/dev/shm/cp_ab_probe}"
+    if [[ -z "${DUMP_DIR:-}" ]]; then
+      dump_dir="/root/cp_probe"
+    fi
+    if [[ -n "${dump_spec}" ]]; then
+      extra_env+=(--env "VLLM_ASCEND_CP_BALANCE_DUMP=${dump_spec}")
+      dump_active=true
+    fi
+    ;;
   check)
-    echo "[run_cp_diag] analysing ${dump_dir}"
-    exec python "${checker}" --dir "${dump_dir}" --kind both
+    kind="${KIND:-both}"
+    check_args=(--dir "${dump_dir}" --kind "${kind}")
+    if [[ "${kind}" == "act" ]]; then
+      # 一层两行（in/out）的紧凑表才对得上判据
+      check_args+=(--summary-only)
+    fi
+    echo "[run_cp_diag] analysing ${dump_dir} (kind=${kind})"
+    exec python "${checker}" "${check_args[@]}"
     ;;
   *)
     echo "unknown mode: ${mode}" >&2
-    echo "usage: $0 {baseline|sweep|2call|l1024|check|list} [--no-repeat]" >&2
+    echo "usage: $0 {baseline|sweep|probe|2call|l1024|check|list} [--no-repeat]" >&2
     exit 2
     ;;
 esac
@@ -153,11 +180,19 @@ echo "[run_cp_diag] mode=${mode} round=${round_name}"
 echo "[run_cp_diag] prompt_lens=${prompt_lens} min_tokens=${min_tokens} cp_size=${cp_size} repeat_a=${repeat_a} out=${out}"
 [[ -n "${dump_spec}" ]] && echo "[run_cp_diag] dump=${dump_spec} dir=${dump_dir}"
 
+# Which way this round's dumps are judged (probe = the activation profile).
+check_kind="both"
+check_extra=""
+if [[ "${mode}" == "probe" ]]; then
+  check_kind="act"
+  check_extra=" --summary-only"
+fi
+
 if [[ "${dry_run}" == true ]]; then
   printf '[run_cp_diag] command:\n  '
   printf '%q ' "${cmd[@]}"
   printf '\n[run_cp_diag] then:\n'
-  printf '  python %q --dir %s --kind both\n' "${checker}" "${dump_dir}"
+  printf '  python %q --dir %s --kind %s%s\n' "${checker}" "${dump_dir}" "${check_kind}" "${check_extra}"
   printf '  python %q baseline=%s 2call=%s\n' "${comparer}" "${out_root}/r1_baseline" "${out_root}/r2_2call"
   exit 0
 fi
@@ -196,6 +231,6 @@ fi
 
 echo
 echo "[run_cp_diag] round finished (rc=${rc}); analyse with:"
-echo "  python ${checker} --dir ${dump_dir} --kind both"
+echo "  python ${checker} --dir ${dump_dir} --kind ${check_kind}${check_extra}"
 echo "  python ${comparer} baseline=${out_root}/r1_baseline 2call=${out_root}/r2_2call"
 exit "${rc}"

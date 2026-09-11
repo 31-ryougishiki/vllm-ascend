@@ -9,6 +9,19 @@
     # 2) 逐 token 比较 B(CP_BALANCE=0) 与 C(CP_BALANCE=1) 的 KV cache
     python tools/cp_balance_compare/check_zigzag_dumps.py --kind kv --dir /dev/shm/cp_balance_dump
 
+    # 3) 逐 token 比较 attention 的输入/输出（B vs C，按 token 位置对齐）
+    python tools/cp_balance_compare/check_zigzag_dumps.py --kind act --dir /root/cp_probe --summary-only
+
+`act` mode answers "which step diverges first" at full precision: for every
+traced layer the dump stores the attention *input* (the previous layer's output)
+and the attention *output* (this layer's attention contribution), each keyed by
+**global token position** -- never by row, because under zigzag a rank owns
+``[prev_block, next_block]`` while the continuous slice owns
+``[local_start, local_end)``.  ``in`` equal + ``out`` different pins the
+divergence to attention; ``out`` of layer L equal + ``in`` of layer L+1
+different pins it to the MoE/MLP in between.  Unlike the KV copy this is not
+quantized, so a single-ULP difference is visible.
+
 `topk` mode answers P1 of the precision triage: for prompts shorter than
 ``sparse_count`` the LightningIndexer is expected to emit either the identity
 range ``[0..p]`` (A5/arch35: the ``validS2Len < topkCount_`` shortcut) or, on
@@ -52,8 +65,17 @@ except ImportError:  # pragma: no cover - the target host always has torch
     raise
 
 NAME_RE = re.compile(
-    r"(?P<kind>topk|kv)_cpbal(?P<cpbal>\d+)_layer(?P<layer>-?\d+)_rank(?P<rank>\d+)_pid(?P<pid>\d+)_(?P<ts>\d+)\.pt$"
+    r"(?P<kind>topk|kv|actin|actout)_cpbal(?P<cpbal>\d+)_layer(?P<layer>-?\d+)_rank(?P<rank>\d+)_pid(?P<pid>\d+)_(?P<ts>\d+)\.pt$"
 )
+
+# ``act`` is one logical kind with two ops in the file name; the other kinds map
+# to themselves so ``--kind kv``/``--kind act`` glob exactly their own files.
+_KIND_GLOBS = {
+    "topk": ("topk_*.pt",),
+    "kv": ("kv_*.pt",),
+    "act": ("actin_*.pt", "actout_*.pt"),
+}
+_ACT_OP_ORDER = {"in": 0, "out": 1}
 
 
 def _load(path: str, warn: bool = True) -> dict | None:
@@ -91,24 +113,34 @@ def _as_list(value) -> list[int]:
 
 
 def _iter_dumps(dump_dir: str, kind: str):
-    pattern = os.path.join(dump_dir, f"{kind}_*.pt")
-    for path in sorted(glob.glob(pattern)):
-        match = NAME_RE.search(os.path.basename(path))
-        if match is None or match.group("kind") != kind:
-            continue
-        yield path, match.groupdict()
+    """Yield ``(path, meta)`` for every dump of ``kind``.
+
+    ``act`` is one logical kind stored under two file kinds (``actin`` /
+    ``actout``), so it matches both; every other kind matches itself.
+    """
+    for pattern in _KIND_GLOBS.get(kind, (f"{kind}_*.pt",)):
+        for path in sorted(glob.glob(os.path.join(dump_dir, pattern))):
+            match = NAME_RE.search(os.path.basename(path))
+            if match is None:
+                continue
+            file_kind = match.group("kind")
+            if file_kind == kind or (kind == "act" and file_kind.startswith("act")):
+                yield path, match.groupdict()
 
 
-def _latest_per_server(files):
-    """Keep the newest dump per (layer, rank, cp_balance).
+def _latest_per_server(files, fields: tuple[str, ...] = ("layer", "rank", "cpbal")):
+    """Keep the newest dump per key.
 
     Several rounds share one dump directory (the file name carries pid and
-    timestamp), so an older round must not be mistaken for the current one.
+    timestamp), so an older round must not be mistaken for the current one.  The
+    key is ``(layer, rank, cp_balance)`` by default; the activation trace also
+    needs the op (the file-name kind carries it) because one layer has both an
+    ``in`` and an ``out`` sample.
     """
-    latest: dict[tuple[int, int, str], tuple[str, dict]] = {}
-    counts: dict[tuple[int, int, str], int] = defaultdict(int)
+    latest: dict[tuple, tuple[str, dict]] = {}
+    counts: dict[tuple, int] = defaultdict(int)
     for path, meta in files:
-        key = (int(meta["layer"]), int(meta["rank"]), str(meta["cpbal"]))
+        key = tuple(meta[field] if field != "layer" else int(meta["layer"]) for field in fields)
         counts[key] += 1
         current = latest.get(key)
         if current is None or int(meta["ts"]) > int(current[1]["ts"]):
@@ -523,6 +555,206 @@ def check_kv(args) -> int:
     return 0
 
 
+def _act_rows(payload: dict) -> tuple[np.ndarray, np.ndarray, np.ndarray, int] | None:
+    """``(positions, raw_bytes, float32, itemsize)`` of one activation dump.
+
+    ``raw_bytes`` is the exact stored representation (bf16/fp16/fp32 viewed as
+    bytes), so the comparison is bit-exact; ``float32`` exists only to quantify
+    the magnitude of a difference.
+    """
+    act = payload.get("act")
+    positions = payload.get("positions")
+    if not isinstance(act, torch.Tensor) or not isinstance(positions, torch.Tensor):
+        return None
+    rows = min(int(act.shape[0]), int(positions.numel()))
+    if rows == 0 or act.ndim != 2:
+        return None
+    pos = positions[:rows].detach().to("cpu").to(torch.int64).numpy()
+    kept = act.detach()[:rows].to("cpu").contiguous()
+    raw = kept.view(torch.uint8).numpy()
+    width = int(kept.shape[1])
+    itemsize = max(1, raw.shape[1] // width) if width else 1
+    return pos, raw, kept.float().numpy(), itemsize
+
+
+def _act_table(paths: list[str]):
+    """Concatenate one layout's ranks into a position-indexed table.
+
+    Ranks hold disjoint token sets, so concatenating them rebuilds the sequence;
+    padding positions (``>= num_actual_tokens``) are dropped because their
+    content is meaningless in both layouts.
+    """
+    pos_parts: list[np.ndarray] = []
+    raw_parts: list[np.ndarray] = []
+    fp_parts: list[np.ndarray] = []
+    itemsize = 1
+    for path in paths:
+        payload = _load(path)
+        if payload is None:
+            continue
+        rows = _act_rows(payload)
+        if rows is None:
+            continue
+        pos, raw, fp, itemsize = rows
+        limit = int(payload.get("num_actual_tokens") or 0)
+        # Padding rows carry slot -1 (and land past num_actual_tokens): their
+        # content is meaningless in both layouts, so they must not be compared.
+        keep = pos >= 0
+        if limit > 0:
+            keep &= pos < limit
+        if not keep.any():
+            continue
+        pos_parts.append(pos[keep])
+        raw_parts.append(raw[keep])
+        fp_parts.append(fp[keep])
+    if not pos_parts:
+        return None
+    pos = np.concatenate(pos_parts)
+    raw = np.concatenate(raw_parts, axis=0)
+    fp = np.concatenate(fp_parts, axis=0)
+    order = np.argsort(pos, kind="stable")
+    return pos[order], raw[order], fp[order], itemsize
+
+
+def _print_act_summary(rows: list[dict], ignored: int) -> tuple[int | None, str | None, dict | None]:
+    """Compact per-(layer, op) table plus the first divergence, in layer order."""
+    print()
+    if ignored:
+        print(f"[act] {ignored} older dump(s) ignored (newest per (layer, op, rank, cp_bal) wins)")
+    print(f"[act] {'layer':>5}  {'op':>3}  {'compared':>8}  {'differ':>7}  {'first_pos':>9}  "
+          f"{'max|d|':>10}  {'rel':>9}  {'block':>7}")
+    first: tuple[int, str, dict] | None = None
+    for stats in sorted(rows, key=lambda s: (s["layer"], _ACT_OP_ORDER.get(s["op"], 9))):
+        span = "-" if stats["first_pos"] is None else str(stats["first_pos"])
+        block = "-"
+        if stats["first_pos"] is not None and stats["block"]:
+            block = str(stats["first_pos"] // stats["block"])
+        detail = (
+            f"{stats['max_abs']:>10.3e}  {stats['max_rel']:>9.2e}"
+            if stats["differ"]
+            else f"{'-':>10}  {'-':>9}"
+        )
+        print(f"[act] {stats['layer']:>5}  {stats['op']:>3}  {stats['compared']:>8}  "
+              f"{stats['differ']:>7}  {span:>9}  {detail}  {block:>7}")
+        if stats["differ"] and first is None:
+            first = (stats["layer"], stats["op"], stats)
+    if first is None:
+        print("[act] FIRST DIVERGENCE (act): none -- every compared token is bit-identical "
+              "in both layouts on the traced layers")
+        return None, None, None
+    layer, op, stats = first
+    print(
+        f"[act] FIRST DIVERGENCE (act): layer {layer} op={op} at token {stats['first_pos']} "
+        f"({stats['differ']}/{stats['compared']} tokens differ, max|d|={stats['max_abs']:.3e}, "
+        f"rel={stats['max_rel']:.2e})"
+    )
+    return layer, op, stats
+
+
+def check_act(args) -> int:
+    """Compare the per-layer activation trace of B and C token by token.
+
+    The dumps are keyed by **global token position** (never by row: under zigzag
+    a rank holds ``[prev_block, next_block]``, under the continuous slice it
+    holds ``[local_start, local_end)``).  ``in`` is the layer input (the previous
+    layer's output), ``out`` is this layer's attention output, so one traced
+    layer decides whether attention or the MoE/MLP in between introduced the
+    difference:
+
+    * ``in`` equal, ``out`` different -> attention (indexer / SFA / o_proj);
+    * ``out`` of layer L equal, ``in`` of layer L+1 different -> MoE/MLP.
+    """
+    files = list(_iter_dumps(args.dir, "act"))
+    if not files:
+        print(f"[act] no dump found under {args.dir}", file=sys.stderr)
+        return 2
+    latest, counts = _latest_per_server(files, fields=("kind", "layer", "rank", "cpbal"))
+    groups: dict[tuple[int, str], dict[str, list[str]]] = defaultdict(lambda: defaultdict(list))
+    ignored = 0
+    for key in sorted(latest, key=lambda k: (int(k[1]), k[0], int(k[2]), int(k[3]))):
+        file_kind, layer, rank, cpbal = key
+        op = "in" if file_kind == "actin" else "out"
+        if counts[key] > 1:
+            ignored += counts[key] - 1
+        groups[(layer, op)][cpbal].append(latest[key][0])
+    if not groups:
+        print(f"[act] no usable dump under {args.dir}", file=sys.stderr)
+        return 2
+
+    rows: list[dict] = []
+    total = len(groups)
+    for index, (layer, op) in enumerate(sorted(groups, key=lambda k: (k[0], _ACT_OP_ORDER.get(k[1], 9))), 1):
+        variants = groups[(layer, op)]
+        if len(variants) < 2:
+            if not args.summary_only:
+                print(f"[act] layer={layer} op={op}: only cp_balance={sorted(variants)} dumped, "
+                      "need both 0 (B) and 1 (C) to compare")
+            continue
+        left = _act_table(variants["0"])
+        right = _act_table(variants["1"])
+        if left is None or right is None:
+            print(f"[act] layer={layer} op={op}: no usable rows on one side", file=sys.stderr)
+            continue
+        pos_l, raw_l, fp_l, itemsize = left
+        pos_r, raw_r, fp_r, _ = right
+        index_l = {int(p): i for i, p in enumerate(pos_l)}
+        index_r = {int(p): i for i, p in enumerate(pos_r)}
+        common = sorted(set(index_l) & set(index_r))
+        stats = {
+            "layer": layer, "op": op, "compared": len(common), "differ": 0,
+            "first_pos": None, "max_abs": 0.0, "max_rel": 0.0, "block": None,
+            "cols": None, "ncols": None, "width": int(raw_l.shape[1]) // max(1, itemsize),
+        }
+        if common:
+            rows_l = np.fromiter((index_l[p] for p in common), dtype=np.int64, count=len(common))
+            rows_r = np.fromiter((index_r[p] for p in common), dtype=np.int64, count=len(common))
+            mask = (raw_l[rows_l] != raw_r[rows_r]).any(axis=1)
+            stats["differ"] = int(mask.sum())
+            if stats["differ"]:
+                where = np.nonzero(mask)[0]
+                first_at = int(where[0])
+                stats["first_pos"] = common[first_at]
+                delta = np.abs(fp_l[rows_l[where]] - fp_r[rows_r[where]])
+                stats["max_abs"] = float(delta.max())
+                scale = float(np.abs(fp_l[rows_l[where]]).max()) or 1.0
+                stats["max_rel"] = stats["max_abs"] / scale
+                row_l = raw_l[rows_l[first_at]]
+                row_r = raw_r[rows_r[first_at]]
+                cols = np.nonzero(row_l != row_r)[0]
+                stats["ncols"] = int(cols.size)
+                stats["cols"] = [int(c) // max(1, itemsize) for c in cols[:8]]
+        rows.append(stats)
+        if not args.summary_only and stats["differ"]:
+            print(f"\n[act] layer={layer} op={op}: first differing token={stats['first_pos']} "
+                  f"({stats['ncols']}/{stats['width']} elements differ on that row), "
+                  f"differing tokens={stats['differ']}/{stats['compared']} "
+                  f"(tokens {common[int(np.nonzero(mask)[0][0])]}..{common[-1]}), "
+                  f"max|d|={stats['max_abs']:.3e} rel={stats['max_rel']:.2e}, "
+                  f"first columns={stats['cols']}")
+        if index % 8 == 0 or index == total:
+            print(f"[act] compared {index}/{total} (layer, op) groups", file=sys.stderr)
+
+    layer, op, stats = _print_act_summary(rows, ignored)
+    print()
+    if layer is None:
+        print("[act] RESULT: traced activations are bit-identical across layouts")
+        return 0
+    if op == "in":
+        if layer == 0:
+            print("[act] -> layer 0 的输入是 embedding（与排布无关）却在两种排布下不同："
+                  "说明差异不是从层内来的，而是 token→rank 的映射/位置（positions）本身不一致")
+        else:
+            print(f"[act] -> layer {layer} 的 attention 输入（= layer {layer - 1} 的输出）先不等，"
+                  f"而 attention 输出尚未确认；差异是在 layer {layer - 1} 的 MoE/MLP（或其间 norm/残差）里进入的。"
+                  f"下一步：对比该 layer 的 attention 输出（op=out）以确认")
+    else:
+        print(f"[act] -> layer {layer} 的 attention 输出先不等（输入见 op=in 那一行）："
+              "差异在这一层的 attention 内部产生（indexer 选点顺序 / SFA 归约顺序 / o_proj），"
+              "不是上一层传进来的")
+    print("[act] RESULT: traced activations differ between B (cp_balance=0) and C (cp_balance=1)")
+    return 1
+
+
 def main(argv=None) -> int:
     try:
         # Keep the Chinese summary in the docstring from crashing on hosts with
@@ -533,13 +765,14 @@ def main(argv=None) -> int:
         pass
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("--dir", default="/dev/shm/cp_balance_dump", help="dump directory")
-    parser.add_argument("--kind", choices=("topk", "kv", "both"), default="both")
+    parser.add_argument("--kind", choices=("topk", "kv", "act", "both", "all"), default="both")
     parser.add_argument("--list", action="store_true", help="only list the dumps found")
     parser.add_argument(
         "--summary-only",
         action="store_true",
         help="print only the compact tables (kv: per-layer rows/ranks/first token/max|int8|; "
-        "topk: one line per dump) plus the RESULT lines -- use this for a multi-layer sweep",
+        "act: per-layer op/compared/differ/first token/magnitude; topk: one line per dump) "
+        "plus the RESULT lines -- use this for a multi-layer sweep",
     )
     args = parser.parse_args(argv)
 
@@ -552,10 +785,12 @@ def main(argv=None) -> int:
         return 0
 
     rc = 0
-    if args.kind in ("topk", "both"):
+    if args.kind in ("topk", "both", "all"):
         rc |= check_topk(args)
-    if args.kind in ("kv", "both"):
+    if args.kind in ("kv", "both", "all"):
         rc |= check_kv(args)
+    if args.kind in ("act", "all"):
+        rc |= check_act(args)
     return rc
 
 

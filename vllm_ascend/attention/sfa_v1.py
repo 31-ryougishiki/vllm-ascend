@@ -206,7 +206,7 @@ def _dump_dir() -> str:
     return os.getenv("VLLM_ASCEND_CP_BALANCE_DUMP_DIR", "").strip() or SFA_ZIGZAG_DUMP_DIR
 
 
-_ZIGZAG_DUMP_KINDS = ("topk", "kv")
+_ZIGZAG_DUMP_KINDS = ("topk", "kv", "act")
 _ZIGZAG_ALL_LAYERS = set(range(1 << 20))
 _ZIGZAG_WARNED_KEYS: set[str] = set()
 
@@ -249,6 +249,7 @@ def _parse_dump_spec(raw: Any) -> dict[str, set[int]]:
         topk:6              # layer 6, top-k dump
         kv:0,6              # layers 0 and 6, KV dump
         topk:6,kv:0,6       # both
+        act:0,1             # layers 0 and 1, attention input + output trace
         topk:all            # every layer
 
     A token containing ``:`` opens a new kind; bare numbers are appended to the
@@ -335,6 +336,33 @@ def _natural_order_fp(
     except Exception as exc:  # pragma: no cover - diagnostics only
         logger.warning("[CP_BALANCE][dump] kv_fp natural-order prep failed: %s", exc)
         return None
+
+
+def _act_positions(attn_metadata: Any, rows: int) -> torch.Tensor | None:
+    """Global cache slot (== natural token position) of every rank-local row.
+
+    The activation trace is joined **by token**, never by row: under B
+    (continuous slice) rank ``r`` holds ``[local_start, local_end_with_pad)``
+    while under C (zigzag) it holds ``[prev_block, next_block]`` -- the same row
+    index is a different token, so a row-wise comparison is meaningless (the trap
+    the top-k dump fell into).
+
+    ``slot_mapping_cp`` already encodes that mapping for both layouts: it is the
+    very array the KV writers scatter with, and its values are the token's global
+    position in the cache (``-1`` for padding rows).  Deriving the positions from
+    it cannot drift from the write path, unlike recomputing the layout here.
+    Returns ``None`` when neither the slot mapping nor the zigzag index is
+    available: a dump without a valid position key could not be compared across
+    layouts and would only produce a misleading verdict.
+    """
+    ctx = getattr(attn_metadata, "dsa_cp_context", None)
+    slots = getattr(ctx, "slot_mapping_cp", None) if ctx is not None else None
+    if isinstance(slots, torch.Tensor) and slots.numel() >= rows:
+        return slots[:rows].detach().to("cpu").to(torch.int64)
+    zigzag_index = getattr(ctx, "zigzag_index", None) if ctx is not None else None
+    if isinstance(zigzag_index, torch.Tensor) and zigzag_index.numel() >= rows:
+        return zigzag_index[:rows].detach().to("cpu").to(torch.int64)
+    return None
 
 
 def _cache_rows_natural(
@@ -1325,9 +1353,12 @@ class AscendSFAImpl(MLAAttentionImpl):
     _zigzag_dump_dir: str = SFA_ZIGZAG_DUMP_DIR
     _zigzag_dump_topk_layers: set[int] | None = None
     _zigzag_dump_kv_layers: set[int] | None = None
+    _zigzag_dump_act_layers: set[int] | None = None
     _zigzag_layer_idx: int | None = None
     _zigzag_dump_topk_done: bool = True
     _zigzag_dump_kv_done: bool = True
+    _zigzag_dump_act_in_done: bool = True
+    _zigzag_dump_act_out_done: bool = True
 
     def __init__(
         self,
@@ -1479,10 +1510,13 @@ class AscendSFAImpl(MLAAttentionImpl):
         dump_spec = _parse_dump_spec(ascend_envs.VLLM_ASCEND_CP_BALANCE_DUMP)
         self._zigzag_dump_topk_layers = dump_spec.get("topk")
         self._zigzag_dump_kv_layers = dump_spec.get("kv")
+        self._zigzag_dump_act_layers = dump_spec.get("act")
         self._zigzag_dump_dir = _dump_dir()
         self._zigzag_layer_idx = _zigzag_layer_idx(self.layer_name)
         self._zigzag_dump_topk_done = False
         self._zigzag_dump_kv_done = False
+        self._zigzag_dump_act_in_done = False
+        self._zigzag_dump_act_out_done = False
         if dump_spec and self._zigzag_layer_idx is None:
             _zigzag_warn_once(
                 "dump_no_layer_idx",
@@ -1607,6 +1641,57 @@ class AscendSFAImpl(MLAAttentionImpl):
             logger.warning("[CP_BALANCE][dump] kv dump prep failed: %s", exc)
             return
         _zigzag_dump(payload, self._zigzag_layer_idx, "kv", self._zigzag_dump_dir)
+
+    def _maybe_dump_act(
+        self, x: torch.Tensor, attn_metadata: M, op: str, rows: int | None = None
+    ) -> None:
+        """Dump one per-layer activation sample, keyed by global token position.
+
+        ``op`` is ``in`` (the hidden states this layer receives, i.e. the output
+        of the previous layer's MoE/MLP) or ``out`` (this layer's attention
+        output, before the residual).  Reading both for a few layers bisects the
+        divergence in one round:
+
+        * ``in`` equal, ``out`` different -> attention (indexer / SFA / o_proj)
+          introduced it in this layer;
+        * ``out`` of layer L equal, ``in`` of layer L+1 different -> the
+          MoE/MLP (or the norms around it) in between did.
+
+        Unlike the KV dump this is not quantized: the rows are stored as-is, so a
+        single-ULP difference is visible (the fp8 KV copy cannot see below one
+        quantization step and therefore only bounds the divergence depth).
+        """
+        done = self._zigzag_dump_act_out_done if op == "out" else self._zigzag_dump_act_in_done
+        if not self._zigzag_dump_enabled(self._zigzag_dump_act_layers, done):
+            return
+        if op == "out":
+            self._zigzag_dump_act_out_done = True
+        else:
+            self._zigzag_dump_act_in_done = True
+        try:
+            positions = _act_positions(attn_metadata, int(x.shape[0]) if rows is None else int(rows))
+            if positions is None:
+                _zigzag_warn_once(
+                    "act_no_positions",
+                    "no slot_mapping_cp / zigzag_index in the DSA-CP context: cannot key the "
+                    "activation trace by token, dump skipped (a row-keyed trace is not "
+                    "comparable across layouts)",
+                )
+                return
+            rows = min(int(x.shape[0]), int(positions.numel()))
+            payload = {
+                "kind": "act",
+                "op": op,
+                "layer_name": self.layer_name,
+                "layer_idx": self._zigzag_layer_idx,
+                "positions": positions[:rows],
+                "act": x.detach()[:rows].to("cpu"),
+                "num_actual_tokens": int(getattr(attn_metadata, "num_actual_tokens", 0) or 0),
+            }
+        except Exception as exc:  # pragma: no cover - diagnostics only
+            logger.warning("[CP_BALANCE][dump] act dump prep failed: %s", exc)
+            return
+        _zigzag_dump(payload, self._zigzag_layer_idx, f"act{op}", self._zigzag_dump_dir)
 
     @property
     def skip_topk(self) -> bool:
@@ -3037,6 +3122,13 @@ class AscendSFAImpl(MLAAttentionImpl):
                 output.fill_(0)
             return output
 
+        # Row count of the rank-local token set.  `output` may be padded to
+        # num_input_tokens, and the MLAPO/prolog preprocessing replaces
+        # hidden_states, so both the row count and the layer input are captured
+        # here, before anything touches them.
+        num_local_rows = int(hidden_states.shape[0])
+        self._maybe_dump_act(hidden_states, attn_metadata, "in", rows=num_local_rows)
+
         composed_kv_cache = self._compose_sfa_kv_cache(kv_cache)
         assert composed_kv_cache is not None
         kv_cache = composed_kv_cache
@@ -3402,6 +3494,7 @@ class AscendSFAImpl(MLAAttentionImpl):
                 # but a pure P node must still publish this layer's KV cache.
                 # Output rows stay in the rank-local zigzag order; the model
                 # boundary gathers and reranges them after the layer loop.
+                self._maybe_dump_act(result, attn_metadata, "out", rows=num_local_rows)
                 maybe_save_kv_layer_to_connector(layer_name, list(kv_cache))
                 return result
             attn_output = result
@@ -3418,6 +3511,7 @@ class AscendSFAImpl(MLAAttentionImpl):
 
         # zigzag output is NOT locally reranged here: the model boundary
         # performs the single gather + rerange after the layer loop.
+        self._maybe_dump_act(output_padded, attn_metadata, "out", rows=num_local_rows)
 
         maybe_save_kv_layer_to_connector(layer_name, list(kv_cache))
 
