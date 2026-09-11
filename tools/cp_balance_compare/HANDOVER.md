@@ -5,7 +5,7 @@
 
 ## 0. 一句话现状
 
-`cp_balance`（zigzag 切分）与连续切片（`VLLM_ASCEND_CP_BALANCE=0`）在 prefill 上**确实不等**，差异远超噪声地板（p99 ≈ 0.39~0.58 nats，top-1 翻转 17%~30%），且**差异幅度随 rank 数减少而变大**；已确认 **不是 indexer 选点错**、**不是 KV 重排写错**，分歧**从"第一个跨 block 的 token"开始**。尚未定位到具体是哪一步先不等 —— 下一步是拿全层 KV 剖面（命令已就绪）并按层号分支。
+`cp_balance`（zigzag 切分）与连续切片（`VLLM_ASCEND_CP_BALANCE=0`）在 prefill 上**确实不等**，差异远超噪声地板（p99 ≈ 0.39~0.58 nats，top-1 翻转 17%~30%），且**差异幅度随 rank 数减少而变大**；已确认 **不是 indexer 选点错**、**不是 KV 重排写错**，分歧**从"第一个跨 block 的 token"开始**。KV 剖面的数据已在盘上（`/root/cp_dump`，1248 个 dump）**但还没判读** —— 这是当前的第一步；若 fp8 掩盖让 KV 剖面看不出起点，就直接上已经写好的 **`probe` 模式**（op 级、全精度、按 token 位置对齐的 attention in/out 剖面，见 4.2）。
 
 ## 1. 环境与版本（接手时先对齐）
 
@@ -77,28 +77,42 @@
 
 ## 4. 下一步（按优先级；每步一条命令 + 判据）
 
-### 4.1 拿全层 KV 剖面（数据已在盘上，几秒，不需要 NPU）
+### 4.1 拿全层 KV 剖面（数据已在盘上，几秒，不需要 NPU）——**当前这一步**
 
 ```bash
+cd /home/z30055003/vllm-ascend
+echo "HEAD=$(git rev-parse --short HEAD) dirty=$(git status --porcelain | wc -l)"
+ls /root/cp_dump/*.pt 2>/dev/null | wc -l          # 期望 1248 = 78 层 x 8 rank x 2 配置
 python tools/cp_balance_compare/check_zigzag_dumps.py --dir /root/cp_dump --kind kv --summary-only \
-    2>&1 | tee tools/cp_balance_compare/log.log
+    2>/tmp/kv_profile.err | tee tools/cp_balance_compare/log.log
+tail -3 /tmp/kv_profile.err                        # 期望 "loaded 1248/1248 dumps"
 ```
 
 **判据**：`[kv/fp]` 表 78 行 + `FIRST DIVERGENCE (fp): layer L`；各层 `first_token` 期望 = **128**（TP=8 的块大小）。
 - `L = 0` → 只可能出自**写 KV / rope / 布局本身** → 查 `vllm_ascend/layers/cp_zigzag.py` 的分片映射与 `sfa_v1.py` 里重排后的 slot 写入；
-- `L = 1` → **layer 0 的 attention 输出**先不等 → 查 `sfa_v1.py` 里 layer 0 的 SFA/indexer（zigzag 选取 + 合并元数据）；
-- `L > 1` → 是 **L−1 层的输出**先不等 → 在那一层加 op 级打点（见 4.2）；
-- 注意上界性质：因 fp8 掩盖，真实起点**可能更早**。
+- `L = 1` → **layer 0 的 attention 输出**先不等 → 直接进 4.2（`probe` 会把它钉死在 op=out）；
+- `L > 1` → 是 **L−1 层的输出**先不等 → 4.2 用 `in`/`out` 两条线区分 attention 与 MoE/MLP；
+- 注意上界性质：因 fp8 掩盖，真实起点**可能更早**（这也是 4.2 必须做的原因）。
 
-### 4.2 op 级打点（我建议的下一步实现，尚未写）
+⚠️ 两个已知前提：① 这份判读要 `check_zigzag_dumps.py` 是**带 fp8 支持**的版本（`2091b4a8d` 及以后，HEAD 即可）；若远端更旧会直接崩在
+`Got unsupported ScalarType Float8_e4m3fn` / `failed finding central directory`（`log.log` 里那份 traceback 的行号正对应
+`e38bb25b7`，即修复前的版本——先 `git rev-parse HEAD` 确认，别拿旧代码判读）；② 全量加载约 3.4GB 内存、十几秒。
 
-目的：把"哪一步先不等"钉死。设计要点（避免重蹈 topk dump 的覆辙）：
+### 4.2 op 级激活剖面（`probe` 模式，**已实现**，2 次模型加载 ≈ 20 分钟）
 
-- **key 必须跨排布可比**：在 zigzag 与连续切片下，同一个 rank 持有的 token 集合不同，所以**不能按 rank 局部行序对比**；必须按**全局 token 位置**（或自然序）打点；
-- 打**摘要**而不是张量：每行 `(pos, hash, norm, absmax)`，几十字节/行（78 层 × rank × 2 配置 × 2048 行 ≈ 几十 MB）；
-- 挂点：attention 输入、attention 输出、MoE 输出各一处（能区分 attention vs MLP/MoE）；
-- 落盘格式建议 CSV（一个 `(layer, op, config)` 一个文件），checker 加 `--kind trace`：按 `pos` join，报出**第一个 hash 不同的 (layer, op, pos)** 与 norm 相对差。
-- 现成可复用的机制：`sfa_v1.py` 的 `_zigzag_dump_enabled`（每层每进程一次、跳过 profile/warmup）、`_dump_dir()`（目录可用 `VLLM_ASCEND_CP_BALANCE_DUMP_DIR` 覆盖）、`check_zigzag_dumps.py` 的 summary/verdict 结构。
+目的：把"哪一步先不等"从"第几层的 KV"细化到 **attention 内部 vs MoE/MLP**，而且是**全精度**（不像 KV 那样被 fp8 量化掩盖）。
+
+```bash
+bash tools/cp_balance_compare/run_cp_diag.sh probe          # B/C 无 B2 + act:0,1,2,3,kv:0,1,2,3 → /root/cp_probe
+python tools/cp_balance_compare/check_zigzag_dumps.py --dir /root/cp_probe --kind act --summary-only
+```
+
+**判据**（每层两行的紧凑表 + 一行结论）：
+- `FIRST DIVERGENCE (act): layer L op=out at token P` → 差异**在本层 attention 内部**产生（indexer 选点顺序 / SFA 归约顺序 / o_proj）；
+- `... op=in at token P` → 差异是**上一层（L−1）的 MoE/MLP**产生的；
+- `none` → 探测的这几层全精度逐字节相同，分歧在更深处 → `export DUMP_SPEC=act:4,5,6,7,8,9` 再来一轮（层数几乎免费，贵的是模型加载）。
+
+要点：位置键取自写 KV 用的同一个 `slot_mapping_cp`，跨布局可比；`slot=-1` 的 padding 行被丢弃；one-shot，所以只有第一个请求（2048）的数据。
 
 ### 4.3 两个未做的判别实验（各 2 次模型加载，约 20 分钟）
 
@@ -119,11 +133,13 @@ python tools/cp_balance_compare/check_zigzag_dumps.py --dir /root/cp_dump --kind
 | 一次自检（首跑/换机器时） | `python tools/cp_balance_compare/selfcheck.py` | `[verdict] READY`，无 FAIL |
 | 不加载模型校验站点/env/指纹 | `... selfcheck.py --preflight` 或 `ab_cp_compare.py --preflight` | `[preflight] all configs OK` |
 | 省掉每轮 source | `source tools/cp_balance_compare/prepare_env.sh` | 打印两段 source 耗时 + `CP_AB_SKIP_SOURCE=1` |
-| 诊断轮（2 次加载 + 全层 dump） | `export DUMP_DIR=/root/cp_dump; bash tools/cp_balance_compare/run_cp_diag.sh sweep` | `dump: +N file(s)`、`[runtime] C:{T,T}`、`[case.*] p99≈0.575` |
-| 判读 dump | `python tools/cp_balance_compare/check_zigzag_dumps.py --dir $DUMP_DIR --kind kv --summary-only` | `FIRST DIVERGENCE (fp): layer L` |
+| 诊断轮（2 次加载 + 全层 KV dump） | `export DUMP_DIR=/root/cp_dump; bash tools/cp_balance_compare/run_cp_diag.sh sweep` | `dump: +N file(s)`、`[runtime] C:{T,T}`、`[case.*] p99≈0.575` |
+| 判读 KV dump | `python tools/cp_balance_compare/check_zigzag_dumps.py --dir $DUMP_DIR --kind kv --summary-only` | `FIRST DIVERGENCE (fp): layer L` |
+| op 级剖面轮（2 次加载 + 全精度 in/out） | `bash tools/cp_balance_compare/run_cp_diag.sh probe` | `dump: +N file(s)`、`[runtime] C:{T,T}` |
+| 判读激活剖面 | `python tools/cp_balance_compare/check_zigzag_dumps.py --dir /root/cp_probe --kind act --summary-only` | `FIRST DIVERGENCE (act): layer L op=in|out at token P` |
 | 单配置手工调试 | `python tools/cp_balance_compare/run_single.py [--config C]` | `[http] <- 200` + `[result]` 行；server 默认保留 |
 | 收证据 | `python tools/cp_balance_compare/selfcheck.py --collect --out-root /dev/shm/cp_ab_sweep` | 一个文件里含 HEAD/dump 清单/指标/日志关键行 |
-| CPU 自测（改了代码就跑） | `python tools/cp_balance_compare/selftest_mock.py` | 末行 `SELFTEST OK`（38 项） |
+| CPU 自测（改了代码就跑） | `python tools/cp_balance_compare/selftest_mock.py` | 末行 `SELFTEST OK`（40 项） |
 
 ## 6. 踩过的坑（血泪清单，改代码前先看）
 
@@ -133,13 +149,17 @@ python tools/cp_balance_compare/check_zigzag_dumps.py --dir /root/cp_dump --kind
 4. **launcher 静默忽略 env 覆盖**会让 B≡C 看起来"完全一致" → driver 的 `--config-check strict` + `[cp-ab]`/`[cp-ab-cfg]` 指纹就是为堵这个；C 没打 `forward zigzag_active=1` 则整轮作废。
 5. **模块级用了未 import 的名字**（`sfa_v1.py` 把 stdlib import 放函数内）：会在**加载模型时**才炸 → 已加 AST 静态检查（`selftest_mock.py`）。
 6. **numpy 没有 fp8 类型**：fp8 张量转 numpy 必须先经 torch `.float()`（否则 `Got unsupported ScalarType Float8_e4m3fn`）。
-7. **topk dump 跨排布不可比**（rank 局部行序在不同排布下对应不同 token）→ 只用它做"局部选点 == 因果窗口"的断言，别拿来做 B/C 对比。
+7. **跨排布只能按 token 位置比，不能按行号比**（zigzag 下 rank 持有 `[prev,next]` 两块，连续切片下持有 `[local_start,local_end)`，同一个行号是不同 token）。`topk` dump 因此只能做"局部选点 == 因果窗口"的断言；`act` 剖面用写 KV 的同一个 `slot_mapping_cp` 做位置键，才跨布局可比。
 8. **截断的 dump** 会让判读崩（已改为跳过 + 告警）；无 dump 的轮次 `run_cp_diag.sh` 会以 rc=3 明确失败。
+9. **`act` 是 one-shot**：每层每进程只写一次、跳过 profile/warmup，所以只有第一个 prefill 请求（driver 发的 2048）有数据；想换层要改 `DUMP_SPEC` 再跑一轮，不是改判读。
+10. **`probe` 轮默认落 `/root/cp_probe`**（百 MB 级），别指回 `/root/cp_dump`：同一个目录混两轮会互相干扰（判读只按"最新一份"取）。
 
 ## 7. 相关提交（最近，按时间倒序）
 
 | commit | 内容 |
 | --- | --- |
+| `7b838e5ea` | op 级激活剖面：`act` dump（attention in/out，按 `slot_mapping_cp` 定位）+ `--kind act` 判读 + `probe` 模式 |
+| `cfb196b55` | 新增本交接说明 HANDOVER.md，并修正 README 中已过期的描述 |
 | `2091b4a8d` | 判读支持 fp8 dump；纠正"FP 副本"定性（同源副本，非量化前） |
 | `6dfa8013e` | 判读向量化 + 进度输出（全层 1248 文件从分钟级到秒级） |
 | `2a9fa0992` | 修 `_dump_dir` 的 `os` NameError；加 stdlib 静态检查用例 |
