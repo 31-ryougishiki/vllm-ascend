@@ -126,6 +126,10 @@ bash tools/cp_balance_compare/run_cp_diag.sh baseline
 # 只看将要执行的命令、不真跑：
 bash tools/cp_balance_compare/run_cp_diag.sh baseline --dry-run
 
+# 2b) 多层扫描诊断轮：B/C 两个配置（无 B2，噪声地板已知为 0）+ 全层 KV/FP dump，
+#     输出到 /dev/shm/cp_ab_sweep/r_sweep；一条命令、不依赖任何 env 前缀
+bash tools/cp_balance_compare/run_cp_diag.sh sweep
+
 # 3) T1：回退成 prev/next 两次调用
 bash tools/cp_balance_compare/run_cp_diag.sh 2call
 
@@ -139,7 +143,9 @@ python tools/cp_balance_compare/compare_cp_rounds.py \
 python tools/cp_balance_compare/selfcheck.py --collect
 ```
 
-常用覆盖（`run_cp_diag.sh` 的环境变量）：`PROMPT_LENS`、`MIN_TOKENS`、`TP_SIZE`（launcher 的 TP，默认 16）、`CP_SIZE`（driver 的 `--cp-size`，默认取 `TP_SIZE`）、`REPEAT_A`（默认 1；`REPEAT_A=0` 跳过 B2 重复跑，**省一次模型加载**，噪声地板已知为 0 时用）、`OUT_ROOT`、`BASE_PORT`、`DUMP_SPEC`（置空=不 dump；支持 `kv:all` / `topk:all`）、`DUMP_DIR`、`LAUNCHER`。
+常用覆盖（`run_cp_diag.sh` 的环境变量）：`PROMPT_LENS`、`MIN_TOKENS`、`TP_SIZE`（launcher 的 TP，默认 16）、`CP_SIZE`（driver 的 `--cp-size`，默认取 `TP_SIZE`）、`REPEAT_A`（默认 1；`REPEAT_A=0` 或命令加 `--no-repeat` 跳过 B2 重复跑，**省一次模型加载**，噪声地板已知为 0 时用）、`OUT_ROOT`、`BASE_PORT`、`DUMP_SPEC`（置空=不 dump；支持 `kv:all` / `topk:all`）、`DUMP_DIR`、`LAUNCHER`。
+
+> 诊断轮优先用 **`sweep` 模式**而不是一堆 env 前缀：脚本模式写在同一行命令里，粘贴时不会像 `VAR=... cmd` 那样被折断后**静默退回默认值**（那样会白跑一轮 B2）。
 
 > **一轮的成本结构**：几乎全在模型加载（本机 TP=16 约 10 分钟/次），推理只要 ~2 秒/条。所以"加长度/加 dump 层数"几乎免费，而"多跑一个配置"（B2、2call）就是 +10 分钟。诊断轮按这个取舍：`REPEAT_A=0 DUMP_SPEC=kv:all` 是 2 次加载 + 全层数据。
 

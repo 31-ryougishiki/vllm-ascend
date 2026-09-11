@@ -3,10 +3,12 @@
 #
 # 在 vllm-ascend 仓库根目录执行：
 #   bash tools/cp_balance_compare/run_cp_diag.sh baseline   # T0+T2+T3：基线 B/C/B2 + topk/KV dump
+#   bash tools/cp_balance_compare/run_cp_diag.sh sweep      # 多层扫描：B/C（无 B2）+ 全层 KV+FP dump
 #   bash tools/cp_balance_compare/run_cp_diag.sh 2call      # T1：回退 prev/next 两次调用
 #   bash tools/cp_balance_compare/run_cp_diag.sh l1024      # T4：MIN_TOKENS=1024
 #   bash tools/cp_balance_compare/run_cp_diag.sh check      # CPU 侧判读已有 dump（不需要 NPU）
 #   bash tools/cp_balance_compare/run_cp_diag.sh list       # 只打印将要执行的命令
+#   加 --no-repeat 可跳过 B2（等价于 REPEAT_A=0）
 #
 # 可覆盖的环境变量：
 #   LAUNCHER     默认 bash tools/cp_balance_compare/launcher_glm52_w4a4c8_mxfp4.sh {port}
@@ -27,10 +29,12 @@ set -euo pipefail
 # 这样 `run_cp_diag.sh 2call --dry-run` 不会误触发一轮真实运行（2~3 次模型加载）。
 mode=""
 dry_run=false
+no_repeat=false
 for arg in "$@"; do
   case "${arg}" in
     -n|--dry-run|list|--list) dry_run=true ;;
     help|-h|--help) dry_run=true; mode="help" ;;
+    --no-repeat|--fast) no_repeat=true ;;
     *)
       if [[ -z "${mode}" ]]; then
         mode="${arg}"
@@ -55,6 +59,9 @@ prompt_lens="${PROMPT_LENS:-2048,2049,4096}"
 min_tokens="${MIN_TOKENS:-2048}"
 cp_size="${CP_SIZE:-${TP_SIZE:-16}}"
 repeat_a="${REPEAT_A:-1}"
+if [[ "${no_repeat}" == true ]]; then
+  repeat_a=0
+fi
 out_root="${OUT_ROOT:-/dev/shm/cp_ab}"
 base_port="${BASE_PORT:-8034}"
 dump_spec="${DUMP_SPEC:-topk:6,kv:0,6}"
@@ -82,13 +89,28 @@ case "${mode}" in
       extra_env+=(--env "VLLM_ASCEND_CP_BALANCE_DUMP=${dump_spec}")
     fi
     ;;
+  sweep)
+    # One-command multi-layer diagnostic round: no B2 (the noise floor is
+    # already known to be 0), KV dump for every layer (the dump also carries the
+    # pre-quantization FP copy), and its own output root so an earlier round is
+    # never overwritten.  Deliberately driven by the mode word instead of
+    # env prefixes: a long paste that loses "VAR=..." would silently fall back
+    # to the defaults, which is exactly how a round ends up running B2 again.
+    round_name="r_sweep"
+    repeat_a=0
+    dump_spec="${DUMP_SPEC:-kv:all}"
+    out_root="${OUT_ROOT:-/dev/shm/cp_ab_sweep}"
+    if [[ -n "${dump_spec}" ]]; then
+      extra_env+=(--env "VLLM_ASCEND_CP_BALANCE_DUMP=${dump_spec}")
+    fi
+    ;;
   check)
     echo "[run_cp_diag] analysing ${dump_dir}"
     exec python "${checker}" --dir "${dump_dir}" --kind both
     ;;
   *)
     echo "unknown mode: ${mode}" >&2
-    echo "usage: $0 {baseline|2call|l1024|check|list}" >&2
+    echo "usage: $0 {baseline|sweep|2call|l1024|check|list} [--no-repeat]" >&2
     exit 2
     ;;
 esac
