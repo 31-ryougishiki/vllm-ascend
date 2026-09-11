@@ -27,6 +27,7 @@
 | `mock_vllm_server.py` | 假 vLLM `/v1/completions` 服务（`/health` + echo/logprobs），用 offset 模拟 B/C 差异 | 否 |
 | `selftest_mock.py` | driver 的 CPU 自测（26 个 `test_*`），跑通全链路而不需要 NPU | 否 |
 | `selfcheck.py` | 一键自检：现场体检 + driver 自测 + 配置门（launcher `DRY_RUN=1` 指纹）+ 轮次命令预演；`--collect` 收集整轮证据 | 否 |
+| `run_single.py` | 单配置手工调试：单独拉起 Base（`B`）或 `C` 的 server + 用与 A/B **完全相同**的请求体发一次推理；失败时打印 HTTP 状态与响应正文，并把 payload/response 落盘供 curl 复现；默认保留 server | 是 |
 
 ## 二、三层测试
 
@@ -144,6 +145,21 @@ python tools/cp_balance_compare/selfcheck.py --collect
 python tools/cp_balance_compare/ab_cp_compare.py --out /dev/shm/cp_ab \
     --urls B=http://n1:8034,C=http://n2:8034,B2=http://n3:8034 --repeat-a
 ```
+
+### 单配置手工调试（推理报错时用这个）
+
+只拉起 **Base（`B`：DSA-CP on + `CP_BALANCE=0`）**，用与 A/B 轮完全相同的请求体发一次推理，然后把 server 留着继续调试；模型拉起日志实时打屏（前缀 `[B]`）。
+
+```bash
+# 拉起 Base + 发一次推理；server 默认保留，Ctrl-C 停止并释放 NPU
+python tools/cp_balance_compare/run_single.py
+# 换 zigzag（C）/ 只跑一个长度 / 推理完就停 / 只发请求（server 已在跑）
+python tools/cp_balance_compare/run_single.py --config C
+python tools/cp_balance_compare/run_single.py --prompt-lens 2048 --no-keep
+python tools/cp_balance_compare/run_single.py --url http://127.0.0.1:8034
+```
+
+报错时会打印 HTTP 状态码 + **响应正文**（真正的报错通常在那里）和异常 traceback，并给出 server 日志尾部；请求体/响应体落在 `--out`（默认 `/dev/shm/cp_single`）下的 `payload_*.json` / `response_*.txt`，可直接用脚本打印的 curl 命令原样复现。
 
 ## 六、产物
 

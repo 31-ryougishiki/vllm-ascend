@@ -47,6 +47,7 @@ def _load(name: str, filename: str):
 
 driver = _load("cp_balance_ab_cp_compare", "ab_cp_compare.py")
 mock = _load("cp_balance_mock_vllm_server", "mock_vllm_server.py")
+single = _load("cp_balance_run_single", "run_single.py")
 
 
 def _temp_dir(prefix: str) -> Path:
@@ -302,6 +303,63 @@ def test_launch_server_streams_log_to_screen() -> None:
         assert "[C] loading weights 2/2" in printed
     finally:
         shutil.rmtree(out, ignore_errors=True)
+
+
+def test_run_single_send_once_against_mock() -> None:
+    """The debug script must send and parse exactly what an A/B round does."""
+    servers, urls = mock.start_mock_servers({"B": 0.0})
+    out = _temp_dir("cp_ab_single_")
+    try:
+        args = driver.parse_args(["--out", str(out), "--topk", "3"])
+        prompts = [[11, 22, 33, 44]]
+        buffer = io.StringIO()
+        with redirect_stdout(buffer):
+            entries = single.send_once(driver, urls["B"], args, prompts, "single_L4", out)
+        assert entries is not None and len(entries) == 1, buffer.getvalue()
+        assert entries[0]["n_prompt"] == 4
+        printed = buffer.getvalue()
+        assert "[http] <- 200" in printed
+
+        # Both bodies are kept so a failing request can be replayed with curl.
+        payload = json.loads((out / "payload_single_L4.json").read_text(encoding="utf-8"))
+        assert payload["prompt"] == [11, 22, 33, 44]
+        assert payload["logprobs"] == 3 and payload["prompt_logprobs"] == 3
+        assert payload["max_tokens"] == 1 and payload["echo"] is True
+        assert payload["return_token_ids"] is True
+        assert payload["add_special_tokens"] is False
+        assert (out / "response_single_L4.txt").exists()
+    finally:
+        mock.stop_mock_servers(servers)
+        shutil.rmtree(out, ignore_errors=True)
+
+
+def test_run_single_url_mode_against_mock() -> None:
+    """End to end without an NPU: --url mode launches nothing and still reports."""
+    servers, urls = mock.start_mock_servers({"B": 0.0})
+    out = _temp_dir("cp_ab_single_main_")
+    try:
+        buffer = io.StringIO()
+        with redirect_stdout(buffer):
+            rc = single.main(
+                ["--url", urls["B"], "--out", str(out), "--prompt-lens", "4", "--topk", "3", "--no-keep"]
+            )
+        printed = buffer.getvalue()
+        assert rc == 0, printed
+        assert "[http] <- 200" in printed
+        assert "[result] single_L4.0 n_prompt=4" in printed
+        assert "[pass] 所有 case 推理成功" in printed
+    finally:
+        mock.stop_mock_servers(servers)
+        shutil.rmtree(out, ignore_errors=True)
+
+
+def test_run_single_rejects_unknown_config() -> None:
+    """'A' (DSA-CP off) is not part of this tool: the debug script must say so."""
+    buffer = io.StringIO()
+    with redirect_stdout(buffer):
+        rc = single.main(["--config", "A", "--url", "http://127.0.0.1:1"])
+    assert rc == 2
+    assert "不支持" in buffer.getvalue()
 
 
 def test_load_prompts_file() -> None:

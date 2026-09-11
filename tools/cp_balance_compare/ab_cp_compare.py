@@ -791,9 +791,15 @@ def report_token_budget(case_id: str, entries: list[dict[str, Any]], min_tokens:
         )
 
 
-def query_batch(url: str, args: argparse.Namespace, prompts: list[Prompt]) -> list[dict[str, Any]]:
+def completion_payload(
+    args: argparse.Namespace, prompts: list[Prompt]
+) -> tuple[dict[str, Any], list[list[int] | None]]:
+    """The exact ``/v1/completions`` body the comparison sends, plus the sent ids.
+
+    Kept in one place so a manual reproduction (``run_single.py``, curl) can
+    never drift from what an A/B round actually sends.
+    """
     prompt_field: Any = prompts[0] if len(prompts) == 1 else prompts
-    sent_ids = [_prompt_token_hint(prompt) for prompt in prompts]
     payload = {
         "model": args.model,
         "prompt": prompt_field,
@@ -814,6 +820,11 @@ def query_batch(url: str, args: argparse.Namespace, prompts: list[Prompt]) -> li
         # is only valid when the echoed tokens are exactly the tokens we sent.
         "add_special_tokens": False,
     }
+    return payload, [_prompt_token_hint(prompt) for prompt in prompts]
+
+
+def query_batch(url: str, args: argparse.Namespace, prompts: list[Prompt]) -> list[dict[str, Any]]:
+    payload, sent_ids = completion_payload(args, prompts)
     last_err: Exception | None = None
     for attempt in range(args.http_retries):
         try:
