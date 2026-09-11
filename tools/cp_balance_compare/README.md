@@ -12,7 +12,7 @@
 
 因为两条路径的 kernel、模型、权重完全相同，只有 token 排布不同，所以 **`C-B` 的差值就是 cp_balance 的账**；`B2-B` 给出它必须打败的噪声地板。原设计里的 “A（关 DSA-CP）锚点” 已下线：它走的是不同代码路径，只能给粗参照，要 A 会被 driver 直接报错拒绝。
 
-> 本目录所有工具（含后续新增的诊断脚本）必须遵守[第八节](#八工具与脚本的四条硬要求)的四条要求。
+> 本目录所有工具（含后续新增的诊断脚本）必须遵守[第八节](#八工具与脚本的五条硬要求)的五条要求。
 
 ## 一、目录里各文件的角色
 
@@ -104,13 +104,14 @@ driver 对每个 case 的每个请求算：
 前置：在 vllm-ascend 仓库根目录执行，宿主机已 source 站点环境（CANN / vendor `set_env.bash`），`MODEL_PATH` 指向 GLM-5.2 权重。
 
 ```bash
-# 0) 一键自检（不需要 NPU；跑真实验之前先跑这个，跑完看 [verdict]）
+# 0) 一键自检（不需要 NPU）——只在首跑、或换了机器/挂载点/launcher/TP 时跑一次，
+#    日常迭代不用重复跑，直接执行下面的目标命令即可
 python tools/cp_balance_compare/selfcheck.py
 #    跳过最慢的 mock 自测 / 指定站点 launcher：
 #    python tools/cp_balance_compare/selfcheck.py --skip-selftest \
 #        --launcher "bash tools/cp_balance_compare/launcher_glm52_w4a4c8_mxfp4.sh {port}"
 
-# 0b) 无 NPU 自测（改 driver 后先跑这个）
+# 0b) 无 NPU 自测（只有改了 driver/工具代码时才需要）
 python tools/cp_balance_compare/selftest_mock.py
 # 或 pytest tools/cp_balance_compare/selftest_mock.py -q
 
@@ -137,7 +138,7 @@ python tools/cp_balance_compare/compare_cp_rounds.py \
 python tools/cp_balance_compare/selfcheck.py --collect
 ```
 
-常用覆盖（`run_cp_diag.sh` 的环境变量）：`PROMPT_LENS`、`MIN_TOKENS`、`OUT_ROOT`、`BASE_PORT`、`DUMP_SPEC`（置空=不 dump）、`DUMP_DIR`、`LAUNCHER`。
+常用覆盖（`run_cp_diag.sh` 的环境变量）：`PROMPT_LENS`、`MIN_TOKENS`、`TP_SIZE`（launcher 的 TP，默认 16）、`CP_SIZE`（driver 的 `--cp-size`，默认取 `TP_SIZE`）、`OUT_ROOT`、`BASE_PORT`、`DUMP_SPEC`（置空=不 dump）、`DUMP_DIR`、`LAUNCHER`。
 
 已经有 server 在跑时，可以跳过拉起，直接驱动两个/三个地址（注意此模式无法读 server 日志，指纹与 zigzag 检查会被跳过）：
 
@@ -177,6 +178,7 @@ $OUT_ROOT/<round>/
 ## 七、注意事项
 
 - **顺序执行是设计前提**：TP=N 的 server 独占整机，所以 driver 一个一个拉起/停掉；多机场景请自己起 server 后用 `--urls`。
+- **TP 与 zigzag 的 `cp_size` 是同一个数**：`vllm_ascend` 把 `global_tp_size` 当作 zigzag 的 `cp_size`（SP padding 到 `2 * tp_size`，每条序列切成 `2 * cp_size` 块），所以 launcher 的 `TP_SIZE` 必须等于 driver 的 `--cp-size`。站点默认 16（`ASCEND_RT_VISIBLE_DEVICES` 默认 `0..15`，需要 16 张可见 NPU）；`run_cp_diag.sh`/`run_single.py` 用 `CP_SIZE`、`TP_SIZE` 统一取默认值，`selfcheck.py` 会核对 launcher 打印的 `tp=` 与 `--cp-size`，server 日志里的 `[CP_BALANCE] metadata zigzag=1 … cp_size=16` 是最终确认。
 - **C 没进 zigzag 就没有结论**：`VLLM_ASCEND_CP_BALANCE_MIN_TOKENS` 被 driver 显式钉住并写入指纹（源码默认是 8192），否则盒子默认值会让 C 悄悄留在连续切片路径上，看起来像“cp_balance 对精度无影响”。`run_cp_diag.sh` 用 `--zigzag-check strict --on-zigzag-miss skip` 兜底。
 - **阈值不是绝对精度判据**：`0.05` 只是起步线，真正的判据是它和 5×噪声地板取大者；没有 B2 就没有噪声地板，`--repeat-a` 应默认带上。
 - **dump 目录会跨轮累积**：判读只取每个 `(layer, rank, cpbal)` 的最新一份，旧文件被忽略（会打印提示），不要求手动清理。
@@ -184,9 +186,9 @@ $OUT_ROOT/<round>/
 - driver 需要 `requests` + `numpy`；`check_zigzag_dumps.py` 需要 `torch`（跑在 vLLM 宿主机上）；画图需要 `matplotlib`（缺了只警告跳过）。
 - 非 Linux 主机上，`selftest_mock.py` 里依赖 bash 的 launcher 用例会被跳过（`[skip] bash not usable`）或失败（Windows 上给假 `vllm` 置可执行位无效，`test_shipped_launchers_print_complete_fingerprint` 报 `vllm not found in PATH`），都属宿主差异，不是 driver 的问题。
 
-## 八、工具与脚本的四条硬要求
+## 八、工具与脚本的五条硬要求
 
-> 这四条是对本目录所有工具（含后续新增的诊断脚本）的固定要求，新增或修改代码时都必须满足。
+> 这五条是对本目录所有工具（含后续新增的诊断脚本）的固定要求，新增或修改代码时都必须满足。
 
 1. **修改代码直接 commit。** 不留未提交的改动：无论改的是 `vllm_ascend/` 里的实现还是本目录的诊断工具，改完就在当前仓库 commit，提交信息写清动机、改动点和验证方式。诊断轮次靠 `git rev-parse HEAD` 对齐版本（`selfcheck.py` 会打印 HEAD 与工作区改动），未提交的改动会让“这一轮结果对应哪份代码”无法追溯。
 
@@ -195,4 +197,6 @@ $OUT_ROOT/<round>/
 3. **必须说明需要得到的结果。** 每个脚本、每一轮测试都要明确给出“期望看到什么”：判据是哪个数字/哪个阈值/哪一行标记，`PASS`/`WARN`/`FAIL`/`[skip]` 各代表什么，以及不满足时下一步去查什么。只打印数据、不给判据的脚本视为未完成——没有判据就无法下结论。范例见 `selfcheck.py`：每个检查项都会打印一行 `期望结果:`。
 
 4. **一次只给一步。** 每次只说明当前要执行的一步：一条命令 + 这一步需要得到的结果；上一步的结果确认后再给下一步，不预先罗列后续步骤。每一步的产出决定下一步走向，一次给多步会诱导跳过判据、在错误的假设上继续跑。
+
+5. **不要每次都跑 `selfcheck.py`。** 自检是入口门槛，只在首跑、或换了机器/挂载点/launcher/TP 配置、或怀疑环境变化时跑一次；日常迭代（改代码、单配置调试、跑轮次）直接执行目标命令，不做重复自检。
 

@@ -23,6 +23,11 @@
 #   1. every cp_balance knob can be overridden through the environment,
 #   2. it prints one "[cp-ab] ..." fingerprint line (--config-check).
 #
+# TP=16 by default: the zigzag layout's cp_size IS the tensor parallel size
+# (vllm_ascend passes global_tp_size as cp_size and pads to 2 * tp_size), so
+# `TP_SIZE` here must stay in sync with the driver's `--cp-size`, and the run
+# needs 16 visible NPUs.
+#
 # Usage (port can be $1 or $2, so both call styles work):
 #   bash launcher_glm52_w4a4c8_mxfp4.sh <port>
 #   bash launcher_glm52_w4a4c8_mxfp4.sh x <port>
@@ -94,7 +99,9 @@ export OMP_PROC_BIND=false
 export OMP_NUM_THREADS=10
 export PYTORCH_NPU_ALLOC_CONF=expandable_segments:True
 
-export ASCEND_RT_VISIBLE_DEVICES="${ASCEND_RT_VISIBLE_DEVICES:-0,1,2,3,4,5,6,7}"
+# 16 chips by default: TP=16 needs ASCEND_RT_VISIBLE_DEVICES to cover all of
+# them (override if the box exposes a different set).
+export ASCEND_RT_VISIBLE_DEVICES="${ASCEND_RT_VISIBLE_DEVICES:-0,1,2,3,4,5,6,7,8,9,10,11,12,13,14,15}"
 export TASK_QUEUE_ENABLE=1
 
 plog_dir="${PWD}/$(date +%Y%m%d_%H%M%S)/plog"
@@ -150,7 +157,7 @@ DEFAULT_KV_TRANSFER_CONFIG='{"kv_connector": "MooncakeConnectorV1",
                 "use_ascend_direct": true,
                 "prefill": {
                         "dp_size": 1,
-                        "tp_size": 8
+                        "tp_size": 16
                 },
                 "decode": {
                         "dp_size": 32,
@@ -224,14 +231,14 @@ if [ -n "${DRY_RUN:-}" ]; then
   if [ "${dry_rc}" -ne 0 ]; then
     exit "${dry_rc}"
   fi
-  echo "[cp-ab][dry-run] OK vllm=$(command -v vllm) model=${MODEL_PATH} repo=${VLLM_ASCEND_REPO} vendor=${VENDOR_SET_ENV:-none} port=${port} tp=${TP_SIZE:-8}"
+  echo "[cp-ab][dry-run] OK vllm=$(command -v vllm) model=${MODEL_PATH} repo=${VLLM_ASCEND_REPO} vendor=${VENDOR_SET_ENV:-none} port=${port} tp=${TP_SIZE:-16}"
   exit 0
 fi
 
 vllm serve "${MODEL_PATH}" \
   --host 0.0.0.0 \
   --port "${port}" \
-  --tensor-parallel-size "${TP_SIZE:-8}" \
+  --tensor-parallel-size "${TP_SIZE:-16}" \
   --enable-expert-parallel \
   --distributed-executor-backend mp \
   --max_model_len "${MAX_MODEL_LEN:-135000}" \

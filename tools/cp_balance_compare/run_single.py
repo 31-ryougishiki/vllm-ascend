@@ -71,7 +71,7 @@ def load_driver():
     return module
 
 
-def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
+def parse_args(argv: list[str] | None = None, cp_default: int = 16) -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter
     )
@@ -86,6 +86,12 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--prompt-lens", default="2048,2049,4096", help="与 A/B 轮一致，可用 2048 缩小")
     parser.add_argument("--min-tokens", type=int, default=2048)
     parser.add_argument("--topk", type=int, default=20)
+    parser.add_argument(
+        "--cp-size",
+        type=int,
+        default=cp_default,
+        help="zigzag 的 cp_size == launcher 的 TP_SIZE（默认取 $CP_SIZE/$TP_SIZE，否则 16）",
+    )
     parser.add_argument("--out", default=DEFAULT_OUT)
     parser.add_argument("--url", default="", help="只发请求，不拉起 server")
     parser.add_argument("--env", action="append", default=[], metavar="K=V", help="额外的 server env 覆盖")
@@ -111,6 +117,7 @@ def driver_args(driver: Any, cfg: argparse.Namespace) -> argparse.Namespace:
         "--out", cfg.out,
         "--prompt-lens", cfg.prompt_lens,
         "--cp-balance-min-tokens", str(cfg.min_tokens),
+        "--cp-size", str(cfg.cp_size),
         "--topk", str(cfg.topk),
         "--config-check", "warn",
         "--zigzag-check", "off",
@@ -214,8 +221,8 @@ def main(argv: list[str] | None = None) -> int:
         sys.stderr.reconfigure(errors="replace")
     except Exception:  # noqa: BLE001
         pass
-    cfg = parse_args(argv)
     driver = load_driver()
+    cfg = parse_args(argv, driver.cp_size_default())
     name = cfg.config.strip().upper()
     if name not in driver.SUPPORTED_CONFIGS:
         print(f"[single] --config {name} 不支持；可选 {list(driver.SUPPORTED_CONFIGS)}（B = Base, C = zigzag）")

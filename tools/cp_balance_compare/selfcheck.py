@@ -263,14 +263,16 @@ def check_host(report: Report, base_port: int, dump_dir: str, out_root: str) -> 
             lines = info.stdout.splitlines()
             # Each *physical* chip has exactly one "<id> Ascend910..." Name row.
             chips = sum(1 for line in lines if "Ascend910" in line)
+            want = int(os.environ.get("TP_SIZE", "16"))
             report.say("[INFO] npu-smi info (前 16 行):")
             for line in lines[:16]:
                 report.say(f"         {line}")
             report.item(
-                PASS if chips >= 8 else WARN,
+                PASS if chips >= want else WARN,
                 "NPU 可见性",
-                f"npu-smi 报告 {chips} 个 Ascend910",
-                ">= 8 个 Ascend910 可见（launcher 默认 TP=8、ASCEND_RT_VISIBLE_DEVICES=0..7）",
+                f"npu-smi 报告 {chips} 个 Ascend910（需要 >= TP_SIZE={want}）",
+                f">= {want} 个 Ascend910 可见（launcher 默认 TP={want}；不够就减 TP_SIZE "
+                "或调整 ASCEND_RT_VISIBLE_DEVICES）",
             )
         else:
             report.item(WARN, "NPU 可见性", "npu-smi info 执行失败", "8 张卡空闲")
@@ -416,6 +418,18 @@ def load_driver(report: Report):
         return None
 
 
+def _token_int(text: str, key: str) -> int | None:
+    """Value of a ``key=<int>`` token in a one-line log/echo line."""
+    for token in text.split():
+        name, sep, value = token.partition("=")
+        if sep and name == key:
+            try:
+                return int(value)
+            except ValueError:
+                return None
+    return None
+
+
 def _evaluate_launcher(
     report: Report, driver: Any, args: argparse.Namespace, name: str
 ) -> None:
@@ -469,6 +483,13 @@ def _evaluate_launcher(
     if any("WARN" in line for line in err_lines):
         notes.append("launcher 有 WARN（重点看 vendor set_env.bash 是否找到）")
 
+    tp = _token_int(dry_line, "tp")
+    if tp is not None and tp != int(args.cp_size):
+        notes.append(
+            f"launcher tp={tp} 与 driver --cp-size={args.cp_size} 不一致"
+            "（zigzag 的 cp_size 就是 tensor parallel size，两者必须相等）"
+        )
+
     status = FAIL if problems else (WARN if notes else PASS)
     detail = "; ".join(problems + notes) if (problems or notes) else "指纹与 additional_config 全部一致"
     if actual:
@@ -498,10 +519,15 @@ def check_config_gate(
             "--configs", "B,C",
             "--repeat-a",
             "--base-port", str(base_port),
+            "--cp-size", str(driver.cp_size_default()),
             "--repo-root", str(repo_root),
         ]
     )
     names = ["B", "C", "B2"]
+    report.say(
+        f"[INFO] zigzag cp_size（= tensor parallel size）= {args.cp_size}；"
+        "launcher dry-run 打印的 tp= 必须与它一致（$CP_SIZE/$TP_SIZE 可覆盖）"
+    )
     report.say("[INFO] driver 期望指纹（由 ab_cp_compare 自己算出来的）:")
     for name in names:
         report.say(f"         {name}: {json.dumps(driver.expected_fingerprint(name, args), sort_keys=True)}")
@@ -562,6 +588,8 @@ def preview_round(report: Report, repo_root: Path, base_port: int) -> None:
         detail += " | 注意: 命令里没有 --repeat-a，拿不到噪声地板"
     if "VLLM_ASCEND_CP_BALANCE_DUMP" not in out:
         detail += " | 注意: 命令里没有 DUMP，T2/T3 无法判读"
+    if "--cp-size" not in out:
+        detail += " | 注意: 命令里没有 --cp-size，zigzag 分片标注会错"
     if f"--base-port {base_port}" not in out:
         detail += f" | 注意: 端口不是 {base_port}"
     report.item(

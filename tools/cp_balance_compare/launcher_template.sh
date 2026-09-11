@@ -32,6 +32,10 @@
 #
 # Adapt MODEL_PATH / PRE_LAUNCH_SCRIPT / TP_SIZE and any site specific flags
 # (HCCL, custom_transformer set_env.bash, ...) to your environment.
+#
+# NOTE: the zigzag layout's cp_size IS the tensor parallel size (vllm_ascend
+# passes global_tp_size as cp_size and pads tokens to 2 * tp_size), so TP_SIZE
+# here must match the driver's `--cp-size`.
 
 set -euo pipefail
 
@@ -103,14 +107,14 @@ if [ -n "${DRY_RUN:-}" ]; then
     echo "[cp-ab][dry-run] ERROR: vllm not found in PATH" >&2
     exit 2
   fi
-  echo "[cp-ab][dry-run] OK vllm=$(command -v vllm) model=${MODEL_PATH} port=${port}"
+  echo "[cp-ab][dry-run] OK vllm=$(command -v vllm) model=${MODEL_PATH} port=${port} tp=${TP_SIZE:-16}"
   exit 0
 fi
 
 vllm serve "${MODEL_PATH}" \
   --host 0.0.0.0 \
   --port "${port}" \
-  --tensor-parallel-size "${TP_SIZE:-8}" \
+  --tensor-parallel-size "${TP_SIZE:-16}" \
   --enable-expert-parallel \
   --distributed-executor-backend mp \
   --max_model_len "${MAX_MODEL_LEN:-135000}" \

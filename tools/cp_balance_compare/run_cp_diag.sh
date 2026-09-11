@@ -11,6 +11,8 @@
 # 可覆盖的环境变量：
 #   LAUNCHER     默认 bash tools/cp_balance_compare/launcher_glm52_w4a4c8_mxfp4.sh {port}
 #   PROMPT_LENS  默认 2048,2049,4096        MIN_TOKENS 默认 2048
+#   TP_SIZE      默认 16（launcher 的 tensor-parallel-size，同时决定 zigzag 的 cp_size）
+#   CP_SIZE      默认取 TP_SIZE（driver 的 --cp-size，必须等于 TP_SIZE）
 #   OUT_ROOT     默认 /dev/shm/cp_ab        BASE_PORT  默认 8034
 #   DUMP_SPEC    默认 topk:6,kv:0,6（置空=不 dump）
 #   DUMP_DIR     默认 /dev/shm/cp_balance_dump
@@ -49,6 +51,7 @@ comparer="tools/cp_balance_compare/compare_cp_rounds.py"
 launcher="${LAUNCHER:-bash tools/cp_balance_compare/launcher_glm52_w4a4c8_mxfp4.sh {port}}"
 prompt_lens="${PROMPT_LENS:-2048,2049,4096}"
 min_tokens="${MIN_TOKENS:-2048}"
+cp_size="${CP_SIZE:-${TP_SIZE:-16}}"
 out_root="${OUT_ROOT:-/dev/shm/cp_ab}"
 base_port="${BASE_PORT:-8034}"
 dump_spec="${DUMP_SPEC:-topk:6,kv:0,6}"
@@ -93,6 +96,7 @@ cmd=(python "${driver}"
      --configs B,C --repeat-a
      --prompt-lens "${prompt_lens}"
      --cp-balance-min-tokens "${min_tokens}"
+     --cp-size "${cp_size}"
      --base-port "${base_port}"
      --config-check strict --zigzag-check strict --on-zigzag-miss skip
      --out "${out}")
@@ -101,7 +105,7 @@ if (( ${#extra_env[@]} )); then
 fi
 
 echo "[run_cp_diag] mode=${mode} round=${round_name}"
-echo "[run_cp_diag] prompt_lens=${prompt_lens} min_tokens=${min_tokens} out=${out}"
+echo "[run_cp_diag] prompt_lens=${prompt_lens} min_tokens=${min_tokens} cp_size=${cp_size} out=${out}"
 [[ -n "${dump_spec}" ]] && echo "[run_cp_diag] dump=${dump_spec} dir=${dump_dir}"
 
 if [[ "${dry_run}" == true ]]; then
