@@ -291,7 +291,8 @@ python tools/cp_balance_compare/check_zigzag_dumps.py --dir /root/cp_probe \
 
 | commit | 内容 |
 | --- | --- |
-| `c8f863dbe` | 本文档与 README 重构（目标/结论/机制/易错点/工作流程） |
+| `51a4383fd` | 量化输入打点（`qin:<层>`）：一轮区分"量化"与"GEMM"两种根因；MLP hook 的元组静默跳过改为告警；probe 默认 spec 收敛到 layer 0/1 |
+| `c17005a01` | 文档 review：修 10 处事实/一致性/可执行性问题 |
 | `0877aa35a` | MLP 内部再切三段：`gate_up_proj`/`down_proj` 打点（`gu_out`/`dn_in`） |
 | `dc5748126` | 修"MLP 打点只写出 C 侧"（B 侧拿不到位置键被静默跳过）+ 单侧缺失报 `INCOMPLETE` |
 | `94baf11ed` | MLP 边界打点（worker 按模块名挂 hook）+ probe 默认带 `mlp:` |
