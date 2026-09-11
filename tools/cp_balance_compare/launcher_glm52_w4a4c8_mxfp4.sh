@@ -70,7 +70,15 @@ PROFILER_DIR="${PROFILER_DIR:-/home/z30055003/profiling_no_pooling}"
 unset ftp_proxy FTP_PROXY
 unset https_proxy HTTPS_PROXY
 unset http_proxy HTTP_PROXY
-if [ -f /root/.bashrc ]; then
+# CP_AB_SKIP_SOURCE=1: the caller already sourced the site rc + vendor env once
+# (see README "省掉每次 source 的启动时间") and the driver passes that
+# environment straight to this process, so sourcing again only costs time.
+# Everything below (HCCL ifnames, timeouts, ...) is still applied.
+skip_source="${CP_AB_SKIP_SOURCE:-0}"
+if [ "${skip_source}" = "1" ]; then
+  echo "[cp-ab] CP_AB_SKIP_SOURCE=1: 跳过 source /root/.bashrc 与 vendor set_env（沿用调用者环境）"
+  echo "[cp-ab] env check: ASCEND_HOME_PATH=${ASCEND_HOME_PATH:-<unset>} LD_LIBRARY_PATH=${#LD_LIBRARY_PATH}B PYTHONPATH=${PYTHONPATH:-<unset>}"
+elif [ -f /root/.bashrc ]; then
   # shellcheck disable=SC1091
   # Site rc files are not written for `set -u` (e.g. /etc/bashrc reads
   # BASHRCSOURCED unguarded): relax -u while sourcing, restore it after.
@@ -111,11 +119,15 @@ export ASCEND_PROCESS_LOG_PATH="${plog_dir}"
 
 # NOTE: fastokens (VLLM_USE_FASTOKENS) is deliberately NOT used by this
 # launcher: the B/C comparison is tokenizer-sensitive and must run on the stock
-# HF tokenizer.  /root/.bashrc is sourced above and may still export it, so it is
-# dropped explicitly instead of relying on the vllm default (which is off).
+# HF tokenizer.  The site rc (sourced above unless CP_AB_SKIP_SOURCE=1) may still
+# export it, so it is dropped explicitly instead of relying on the vllm default
+# (which is off).
 unset VLLM_USE_FASTOKENS
 
-if [ -n "${VENDOR_SET_ENV}" ] && [ -f "${VENDOR_SET_ENV}" ]; then
+if [ "${skip_source}" = "1" ]; then
+  # Already sourced by the caller; only report which vendor env that was.
+  echo "[cp-ab] vendor env: ${VENDOR_SET_ENV:-none} (CP_AB_SKIP_SOURCE=1, 未重复 source)"
+elif [ -n "${VENDOR_SET_ENV}" ] && [ -f "${VENDOR_SET_ENV}" ]; then
   # shellcheck disable=SC1090
   # Vendor setup scripts may also reference unset variables.
   echo "[cp-ab] vendor env: ${VENDOR_SET_ENV}"

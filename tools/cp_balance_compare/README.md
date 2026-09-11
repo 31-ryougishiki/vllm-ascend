@@ -28,6 +28,7 @@
 | `selftest_mock.py` | driver 的 CPU 自测（26 个 `test_*`），跑通全链路而不需要 NPU | 否 |
 | `selfcheck.py` | 一键自检：现场体检 + driver 自测 + 配置门（launcher `DRY_RUN=1` 指纹）+ 轮次命令预演；`--collect` 收集整轮证据 | 否 |
 | `run_single.py` | 单配置手工调试：单独拉起 Base（`B`）或 `C` 的 server + 用与 A/B **完全相同**的请求体发一次推理；失败时打印 HTTP 状态与响应正文，并把 payload/response 落盘供 curl 复现；默认保留 server | 是 |
+| `prepare_env.sh` | 一次性准备环境（`source` 站点 rc + vendor `set_env.bash`，并 `export CP_AB_SKIP_SOURCE=1`），省掉每轮 launcher 的两次 source；**必须 source**，不能直接执行 | 否 |
 
 ## 二、三层测试
 
@@ -156,6 +157,27 @@ python tools/cp_balance_compare/ab_cp_compare.py --out /dev/shm/cp_ab \
     --urls B=http://n1:8034,C=http://n2:8034,B2=http://n3:8034 --repeat-a
 ```
 
+### 省掉每次 source 的启动时间（可选，每轮省两次 source）
+
+launcher 每次启动都会 `source /root/.bashrc` + vendor `set_env.bash`，而一轮要起 2~3 次 server；如果这两个脚本在站点上很慢，就白付好几次。因为 driver 起 server 用的是 `env = os.environ.copy()`，所以**在跑轮次的那个 shell 里先 source 一次**与"launcher 自己 source"对 server 完全等价。
+
+```bash
+# 每个 shell / tmux 会话做一次（必须 source，会打印两段 source 的耗时）
+source tools/cp_balance_compare/prepare_env.sh
+# 之后照常跑，launcher 会跳过 source：
+bash tools/cp_balance_compare/run_cp_diag.sh sweep
+```
+
+等价的显式写法（不想用脚本时）：
+
+```bash
+source /root/.bashrc
+source /mnt/share/l00622059/vendors/custom_transformer/bin/set_env.bash   # 路径以 launcher DRY_RUN 打印的 vendor= 为准
+export CP_AB_SKIP_SOURCE=1
+```
+
+判据：日志里应出现 `[cp-ab] CP_AB_SKIP_SOURCE=1: 跳过 source …` 和 `[cp-ab] env check: ASCEND_HOME_PATH=… LD_LIBRARY_PATH=…B PYTHONPATH=…`——**必须确认这两行里的路径/长度是你要的那套环境**，否则 server 会在缺 CANN/custom ops 的环境里起步。必须 `export`（不是仅赋值），且要在同一个 shell 里；恢复原行为：`unset CP_AB_SKIP_SOURCE`。指纹行不受影响（`selfcheck.py`/driver 的配置门照常校验）。
+
 ### 单配置手工调试（推理报错时用这个）
 
 只拉起 **Base（`B`：DSA-CP on + `CP_BALANCE=0`）**，用与 A/B 轮完全相同的请求体发一次推理，然后把 server 留着继续调试；模型拉起日志实时打屏（前缀 `[B]`）。
@@ -193,7 +215,7 @@ $OUT_ROOT/<round>/
 - **dump 目录会跨轮累积**：判读只取每个 `(layer, rank, cpbal)` 的最新一份，旧文件被忽略（会打印提示），不要求手动清理。
 - **`--kind topk` 对短 prompt 才最有信息量**：长 prompt 下 indexer 不做 `validS2Len < topkCount_` 快捷路径，identity 断言不再适用。
 - driver 需要 `requests` + `numpy`；`check_zigzag_dumps.py` 需要 `torch`（跑在 vLLM 宿主机上）；画图需要 `matplotlib`（缺了只警告跳过）。
-- 非 Linux 主机上，`selftest_mock.py` 里依赖 bash 的 launcher 用例会被跳过（`[skip] bash not usable`）或失败（Windows 上给假 `vllm` 置可执行位无效，`test_shipped_launchers_print_complete_fingerprint` 报 `vllm not found in PATH`），都属宿主差异，不是 driver 的问题。
+- 非 Linux 主机上，`selftest_mock.py` 里依赖 bash 的 launcher 用例会打印 `[skip]`（`bash not usable on this host` / 假 `vllm` 无法置可执行位时的 `fake vllm is not executable on this host`），属宿主差异，不是 driver 的问题；fingerprint 格式校验那半边仍会跑。
 
 ## 八、工具与脚本的五条硬要求
 

@@ -739,23 +739,9 @@ def test_shipped_launchers_print_complete_fingerprint() -> None:
     launchers = ["launcher_template.sh", "launcher_glm52_w4a4c8_mxfp4.sh"]
     out = _temp_dir("cp_ab_launcher_")
     try:
-        fake_model = out / "model"
-        fake_model.mkdir()
-        fake_bin = out / "bin"
-        fake_bin.mkdir()
-        fake_vllm = fake_bin / "vllm"
-        fake_vllm.write_text("#!/usr/bin/env bash\nexit 0\n")
-        os.chmod(fake_vllm, 0o755)
-
         # Every knob is set explicitly so the check does not depend on the
         # launcher's own defaults.
-        overrides = {
-            "MODEL_PATH": str(fake_model),
-            "PRE_LAUNCH_SCRIPT": "",
-            "VENDOR_SET_ENV": "",
-            "PATH": f"{fake_bin}{os.pathsep}{os.environ.get('PATH', '')}",
-            "VLLM_ASCEND_ENABLE_FLASHCOMM1": "1",
-        }
+        overrides = _launcher_dry_run_env(out)
         for launcher in launchers:
             for config in ("B", "C", "B2"):
                 args = driver.parse_args(["--no-kv-connector"])
@@ -771,12 +757,19 @@ def test_shipped_launchers_print_complete_fingerprint() -> None:
                         env=env,
                         capture_output=True,
                         text=True,
+                        encoding="utf-8",
+                        errors="replace",
                         timeout=120,
                     )
                 except (OSError, subprocess.SubprocessError) as exc:
                     print(f"[skip] {launcher}: cannot execute bash ({exc})")
                     return
                 text = proc.stdout + proc.stderr
+                if "vllm not found in PATH" in text:
+                    # Windows/msys cannot give the fake `vllm` an exec bit; the
+                    # fingerprint-format half of this check already ran above.
+                    print("[skip] fake vllm is not executable on this host")
+                    return
                 assert proc.returncode == 0, f"{launcher} {config}: rc={proc.returncode}\n{text}"
                 line = driver.find_fingerprint(text)
                 assert line is not None, f"{launcher} {config}: no fingerprint line\n{text}"
@@ -784,6 +777,79 @@ def test_shipped_launchers_print_complete_fingerprint() -> None:
                     f"{launcher} {config}: fingerprint mismatch\n  got      {driver.parse_fingerprint(line)}\n"
                     f"  expected {driver.expected_fingerprint(config, args)}"
                 )
+    finally:
+        shutil.rmtree(out, ignore_errors=True)
+
+
+def _launcher_dry_run_env(out: Path) -> dict[str, str]:
+    """A model dir plus a fake ``vllm`` on PATH, so a shipped launcher's DRY_RUN passes.
+
+    Every knob is set explicitly so the check never depends on the launcher's
+    own defaults (and no site path or vendor env is needed).
+    """
+    import os
+
+    fake_model = out / "model"
+    fake_model.mkdir(exist_ok=True)
+    fake_bin = out / "bin"
+    fake_bin.mkdir(exist_ok=True)
+    fake_vllm = fake_bin / "vllm"
+    fake_vllm.write_text("#!/usr/bin/env bash\nexit 0\n")
+    os.chmod(fake_vllm, 0o755)
+    return {
+        "MODEL_PATH": str(fake_model),
+        # The site launcher's DRY_RUN validates the repo path too; point it at an
+        # existing dir so the check is host independent.
+        "VLLM_ASCEND_REPO": str(out),
+        "PRE_LAUNCH_SCRIPT": "",
+        "VENDOR_SET_ENV": "",
+        "PATH": f"{fake_bin}{os.pathsep}{os.environ.get('PATH', '')}",
+        "VLLM_ASCEND_ENABLE_FLASHCOMM1": "1",
+    }
+
+
+def test_launcher_skip_source_keeps_fingerprint_complete() -> None:
+    """CP_AB_SKIP_SOURCE=1 (caller already sourced the site env) must not break the gate.
+
+    Skipping the two sources only removes work; the fingerprint line the driver
+    compares must still be printed, otherwise every round would fail
+    ``--config-check strict`` on a machine that uses the fast path.
+    """
+    if not _bash_usable():
+        print("[skip] bash not usable on this host")
+        return
+    import os
+    import shlex
+    import subprocess
+
+    out = _temp_dir("cp_ab_skip_source_")
+    try:
+        args = driver.parse_args(["--no-kv-connector"])
+        env = os.environ.copy()
+        env.update(driver.config_env("C", args))
+        env.update(_launcher_dry_run_env(out))
+        env["DRY_RUN"] = "1"
+        env["CP_AB_SKIP_SOURCE"] = "1"
+        cmd = f"bash {shlex.quote((HERE / 'launcher_glm52_w4a4c8_mxfp4.sh').as_posix())} {args.base_port}"
+        proc = subprocess.run(
+            ["bash", "-lc", cmd],
+            cwd=str(HERE),
+            env=env,
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            timeout=120,
+        )
+        text = proc.stdout + proc.stderr
+        if "vllm not found in PATH" in text:
+            print("[skip] fake vllm is not executable on this host")
+            return
+        assert proc.returncode == 0, f"rc={proc.returncode}\n{text}"
+        assert "CP_AB_SKIP_SOURCE=1" in text, text
+        line = driver.find_fingerprint(text)
+        assert line is not None, text
+        assert driver.parse_fingerprint(line) == driver.expected_fingerprint("C", args), text
     finally:
         shutil.rmtree(out, ignore_errors=True)
 

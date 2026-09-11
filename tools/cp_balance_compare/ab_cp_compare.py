@@ -1187,7 +1187,12 @@ def parse_urls(spec: str) -> dict[str, str]:
 
 
 def _launcher_dry_run(args: argparse.Namespace, name: str, timeout: float = 60.0):
-    """Run the launcher with DRY_RUN=1 and return (rc, stdout, stderr)."""
+    """Run the launcher with DRY_RUN=1 and return (rc, stdout, stderr).
+
+    The launcher prints UTF-8 (it echoes site paths and a Chinese note when
+    ``CP_AB_SKIP_SOURCE=1``); decoding it with the host locale instead would
+    crash the reader thread on a non-UTF-8 console and hand back ``None``.
+    """
     env = os.environ.copy()
     env.update(config_env(name, args))
     env["DRY_RUN"] = "1"
@@ -1199,6 +1204,8 @@ def _launcher_dry_run(args: argparse.Namespace, name: str, timeout: float = 60.0
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
         text=True,
+        encoding="utf-8",
+        errors="replace",
         start_new_session=True,
     )
     try:
