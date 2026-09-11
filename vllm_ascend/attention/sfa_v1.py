@@ -285,8 +285,8 @@ def _parse_dump_spec(raw: Any) -> dict[str, set[int]]:
 def _natural_order_fp(
     kv_fp: torch.Tensor | None,
     gather_index: torch.Tensor | None,
-    slots: torch.Tensor,
-    valid: torch.Tensor,
+    slots_cpu: torch.Tensor,
+    valid_cpu: torch.Tensor,
 ) -> torch.Tensor | None:
     """Pre-quantization KV rows in natural token order, aligned with ``kv_nat``.
 
@@ -295,21 +295,61 @@ def _natural_order_fp(
     natural order, so its inverse puts the rows back.  The continuous path is
     already natural.  Rows are then filtered by the same ``valid`` mask as the
     packed-cache dump, so row p is token p in both layouts.
+
+    Everything is done on CPU with the (*small*) fused tensor: the packed-cache
+    readback needs an NPU index_select that is not reliable on every site
+    (seen: aclnnIndexSelect 161002), and the diagnostic must not depend on it.
     """
     if not isinstance(kv_fp, torch.Tensor):
         return None
     try:
-        rows = kv_fp
+        rows = kv_fp.detach().to("cpu")
         if isinstance(gather_index, torch.Tensor) and gather_index.numel() >= rows.shape[0]:
-            inverse = torch.empty_like(gather_index)
-            inverse[gather_index] = torch.arange(
-                gather_index.numel(), dtype=gather_index.dtype, device=gather_index.device
-            )
+            index = gather_index.detach().to("cpu").to(torch.int64)
+            inverse = torch.empty_like(index)
+            inverse[index] = torch.arange(index.numel(), dtype=index.dtype)
             rows = rows.index_select(0, inverse)
-        rows = rows[: slots.numel()]
-        return rows[valid].detach().to("cpu")
+        rows = rows[: slots_cpu.numel()]
+        return rows[valid_cpu]
     except Exception as exc:  # pragma: no cover - diagnostics only
         logger.warning("[CP_BALANCE][dump] kv_fp natural-order prep failed: %s", exc)
+        return None
+
+
+def _cache_rows_natural(
+    cache_rows: torch.Tensor,
+    slots: torch.Tensor,
+    valid: torch.Tensor,
+) -> torch.Tensor | None:
+    """Best-effort readback of the packed cache in natural token order.
+
+    Returns ``None`` (with a one-time warning + the index range, so the failure
+    is diagnosable) instead of raising: the FP copy does not need the cache, and
+    losing the whole round's diagnostics to an unsupported NPU op is worse than
+    dumping FP only.
+    """
+    try:
+        wanted = slots[valid]
+        total = int(cache_rows.shape[0])
+        if wanted.numel():
+            low, high = int(wanted.min()), int(wanted.max())
+            if low < 0 or high >= total:
+                _zigzag_warn_once(
+                    "dump_slot_range",
+                    "slot index out of range for the packed cache view: min=%s max=%s rows=%s; "
+                    "int8 copy skipped (the FP copy is still dumped)",
+                    low,
+                    high,
+                    total,
+                )
+                return None
+        return cache_rows.index_select(0, wanted).detach().to("cpu")
+    except Exception as exc:
+        _zigzag_warn_once(
+            "dump_cache_readback",
+            "packed-cache readback failed (%s); dumping the FP copy only",
+            exc,
+        )
         return None
 
 
@@ -1516,21 +1556,30 @@ class AscendSFAImpl(MLAAttentionImpl):
         try:
             slots = slot_mapping_sfa[:num_actual_tokens].to(torch.int64)
             # Padding rows carry slot -1: drop them instead of relying on the
-            # index op's negative-index behaviour.
-            valid = slots >= 0
-            kv_nat = kv_cache_row_view.index_select(0, slots[valid]).detach().to("cpu")
+            # index op's negative-index behaviour.  The mask lives on CPU too so
+            # the FP copy never depends on an NPU index op.
+            slots_cpu = slots.detach().to("cpu")
+            valid_cpu = slots_cpu >= 0
             payload = {
                 "kind": "kv",
                 "layer_name": self.layer_name,
                 "layer_idx": self._zigzag_layer_idx,
-                "kv_nat": kv_nat,  # [num_valid, packed_head_dim], natural token order
-                "slots": slots[valid].to("cpu"),
+                "slots": slots_cpu[valid_cpu],
                 "num_actual_tokens": int(num_actual_tokens),
-                "num_valid": int(valid.sum().item()),
+                "num_valid": int(valid_cpu.sum().item()),
             }
-            fp_nat = _natural_order_fp(kv_fp, gather_index, slots, valid)
+            fp_nat = _natural_order_fp(kv_fp, gather_index, slots_cpu, valid_cpu)
             if fp_nat is not None:
                 payload["kv_fp_nat"] = fp_nat
+            # Packed (int8/fp8) copy: best effort.  It is the quantized view of
+            # the same tokens, useful as a cross-check, but the FP copy above is
+            # the sensitive one -- so a failing readback must not lose the dump.
+            kv_nat = _cache_rows_natural(kv_cache_row_view, slots, valid_cpu.to(slots.device))
+            if kv_nat is not None:
+                payload["kv_nat"] = kv_nat  # [num_valid, packed_head_dim], natural token order
+            if fp_nat is None and kv_nat is None:
+                logger.warning("[CP_BALANCE][dump] nothing to dump for layer=%s", self._zigzag_layer_idx)
+                return
         except Exception as exc:  # pragma: no cover - diagnostics only
             logger.warning("[CP_BALANCE][dump] kv dump prep failed: %s", exc)
             return

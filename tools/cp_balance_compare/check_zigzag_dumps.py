@@ -290,11 +290,15 @@ def _print_kv_summary(per_layer: dict[int, dict], ignored: int) -> None:
         stats = per_layer[layer]
         if not stats["compared"]:
             continue
+        if not stats["rows"]:
+            print(f"[kv/int8] {layer:>5}  n/a (no kv_nat in dump -- int8 copy skipped on this site)")
+            continue
         rows = stats["rows"]
         span = f"{min(rows)}-{max(rows)}" if rows else "-"
         first = "-" if stats["first"] is None else str(stats["first"])
+        suffix = f"  [{stats['no_int8']} rank(s) without kv_nat]" if stats["no_int8"] else ""
         print(f"[kv/int8] {layer:>5}  {stats['differ']:>4}/{stats['compared']:<5}  {span:>13}  "
-              f"{first:>11}  {stats['max']:>7}")
+              f"{first:>11}  {stats['max']:>7}{suffix}")
 
     have_fp = any(stats["fp_rows"] for stats in per_layer.values())
     if have_fp:
@@ -326,10 +330,16 @@ def _print_kv_summary(per_layer: dict[int, dict], ignored: int) -> None:
             f"max|int8| {stats['max']}"
         )
     print(f"[kv] FIRST DIVERGENCE ({which}): layer {first_layer} is the first layer whose KV already differs ({detail})")
-    print(
-        f"[kv] -> 该层 KV 是「该层输入隐状态」的投影，所以分歧是在上一层（layer {first_layer - 1}）"
-        "的输出里进入的；下一步按这一层去定位是哪一步先不等"
-    )
+    if first_layer == 0:
+        print(
+            "[kv] -> layer 0 的 KV 直接来自 embedding（与排布无关），所以分歧不是从上一层传进来的，"
+            "而是写 KV / rope / 布局本身在这一层就不一样"
+        )
+    else:
+        print(
+            f"[kv] -> 该层 KV 是「该层输入隐状态」的投影，所以分歧是在上一层（layer {first_layer - 1}）"
+            "的输出里进入的；下一步按这一层去定位是哪一步先不等"
+        )
 
 
 def check_kv(args) -> int:
@@ -351,7 +361,7 @@ def check_kv(args) -> int:
         by_layer[(layer, rank)][cpbal] = (path, _load(path))
     per_layer: dict[int, dict] = defaultdict(
         lambda: {
-            "compared": 0, "differ": 0, "rows": [], "first": None, "max": 0,
+            "compared": 0, "differ": 0, "rows": [], "first": None, "max": 0, "no_int8": 0,
             "fp_differ": 0, "fp_rows": [], "fp_first": None, "fp_max_abs": 0.0, "fp_max_rel": 0.0,
         }
     )
@@ -368,13 +378,26 @@ def check_kv(args) -> int:
         left_key, right_key = keys[0], keys[-1]
         left_path, left = variants[left_key]
         right_path, right = variants[right_key]
-        left_rows = _kv_rows(left)
-        right_rows = _kv_rows(right)
-        n = min(len(left_rows), len(right_rows))
-        diff_rows = [idx for idx in range(n) if left_rows[idx] != right_rows[idx]]
+        # The packed (int8/fp8) copy is best effort: a site whose NPU
+        # index_select fails produces FP-only dumps, which are still decisive.
+        int8_available = isinstance(left.get("kv_nat"), torch.Tensor) and isinstance(
+            right.get("kv_nat"), torch.Tensor
+        )
+        if int8_available:
+            left_rows = _kv_rows(left)
+            right_rows = _kv_rows(right)
+            n = min(len(left_rows), len(right_rows))
+            diff_rows = [idx for idx in range(n) if left_rows[idx] != right_rows[idx]]
+        else:
+            left_rows = right_rows = []
+            n = 0
+            diff_rows = []
         stats = per_layer[layer]
         stats["compared"] += 1
-        stats["rows"].append(len(diff_rows))
+        if int8_available:
+            stats["rows"].append(len(diff_rows))
+        else:
+            stats["no_int8"] += 1
         fp_rows, fp_first, fp_max_abs, fp_max_rel = _fp_diff(left, right)
         if fp_rows:
             stats["fp_differ"] += 1
@@ -387,7 +410,11 @@ def check_kv(args) -> int:
         if not args.summary_only:
             print(
                 f"\n[kv] layer={layer} rank={rank} cpbal{left_key} vs cpbal{right_key}: "
-                f"rows {len(left_rows)} vs {len(right_rows)}, differing rows={len(diff_rows)}"
+                + (
+                    f"rows {len(left_rows)} vs {len(right_rows)}, differing rows={len(diff_rows)}"
+                    if int8_available
+                    else "no kv_nat in dump (int8 copy skipped on this site)"
+                )
                 + (
                     f" | fp rows={fp_rows} first={fp_first} max|d|={fp_max_abs:.3e} rel={fp_max_rel:.2e}"
                     if fp_rows is not None

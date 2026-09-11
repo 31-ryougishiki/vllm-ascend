@@ -438,6 +438,43 @@ def test_check_zigzag_kv_summary_names_first_diverging_layer() -> None:
         shutil.rmtree(out, ignore_errors=True)
 
 
+def test_check_zigzag_kv_summary_fp_only_dumps() -> None:
+    """FP-only dumps (a site whose NPU index_select fails) must still judge P2.
+
+    The packed copy is best effort; if it is missing the int8 table must say so
+    instead of reporting "identical", and the verdict must come from the FP copy.
+    """
+    if checker is None:
+        print("[skip] torch not available (check_zigzag_dumps needs it)")
+        return
+    import argparse
+
+    import torch
+
+    out = _temp_dir("cp_ab_fponly_")
+    try:
+        torch.manual_seed(7)
+        base = torch.randn(64, 8, dtype=torch.float16)
+        shifted = base.clone()
+        shifted[32:, :4] = (shifted[32:, :4].float() + 0.01).to(torch.float16)
+        for rank in range(2):
+            torch.save({"kv_fp_nat": base.clone()}, out / f"kv_cpbal0_layer0_rank{rank}_pid{rank}_1000.pt")
+            torch.save({"kv_fp_nat": shifted.clone()}, out / f"kv_cpbal1_layer0_rank{rank}_pid{rank}_1001.pt")
+            torch.save({"kv_fp_nat": base.clone()}, out / f"kv_cpbal0_layer1_rank{rank}_pid{rank}_1000.pt")
+            torch.save({"kv_fp_nat": base.clone()}, out / f"kv_cpbal1_layer1_rank{rank}_pid{rank}_1001.pt")
+        buffer = io.StringIO()
+        with redirect_stdout(buffer):
+            rc = checker.check_kv(argparse.Namespace(dir=str(out), summary_only=True))
+        text = buffer.getvalue()
+        assert rc == 1, text
+        assert "n/a (no kv_nat in dump" in text, text
+        assert "FIRST DIVERGENCE (fp): layer 0" in text, text
+        assert "first token 32" in text, text
+        assert "layer 0 的 KV 直接来自 embedding" in text, text
+    finally:
+        shutil.rmtree(out, ignore_errors=True)
+
+
 def test_load_prompts_file() -> None:
     out = Path(_temp_dir("cp_ab_pf_"))
     try:
