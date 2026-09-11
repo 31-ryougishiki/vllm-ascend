@@ -41,6 +41,14 @@ TP=8 的 server 会占满 8 张卡，两组配置无法同时在线；driver 会
 本仓库自带按这台机器定制的 launcher（eth2 / `7.246.78.76` /
 `/opt/its/z30055003/vllm-ascend` / `/opt/its/model/...`，均可被环境变量覆盖）：
 
+| 覆盖项 | 默认 | 说明 |
+| --- | --- | --- |
+| `MODEL_PATH` / `VLLM_ASCEND_REPO` / `LOCAL_IP` / `NIC_NAME` / `PROFILER_DIR` | 见 launcher 的 SITE 段 | 换机器/换挂载点时改这些 |
+| `VENDOR_SET_ENV` | 自动探测 | `vllm serve` 前要 `source` 的 vendor `set_env.bash`（CANN custom_transformer ops）。每个 checkout 自己构建，所以路径形如 `<repo>/vllm_ascend/_cann_ops_custom/vendors/custom_transformer/bin/set_env.bash`。三种用法：**不设置**=按候选链自动探测；**显式给路径**=用指定文件（不存在则 preflight 直接报 ERROR）；**置空**（`VENDOR_SET_ENV=`）=本机不需要，静默跳过 |
+
+> `--preflight` 的 OK 行会打印 `repo=` 与 `vendor=`，两者若指向**不同的 checkout**，
+> 说明 python 包与 custom ops 来源不一致，需要把 `VLLM_ASCEND_REPO` 对齐到 vendor 所在的那个 checkout。
+
 ```bash
 cd /opt/its/z30055003/vllm-ascend
 

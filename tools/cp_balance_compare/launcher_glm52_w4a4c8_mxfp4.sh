@@ -34,11 +34,28 @@ NIC_NAME="${NIC_NAME:-eth2}"
 LOCAL_IP="${LOCAL_IP:-7.246.78.76}"
 VLLM_ASCEND_REPO="${VLLM_ASCEND_REPO:-/opt/its/z30055003/vllm-ascend}"
 MODEL_PATH="${MODEL_PATH:-/opt/its/model/GLM-5.2-W4A8C8}"
-# Optional vendor environment (custom_transformer / CANN / torch_npu overrides)
-# that used to be sourced from a shared mount.  This site does not need it, so
-# the default is empty; point it at a set_env.bash if a future site requires one:
-#   VENDOR_SET_ENV=/path/to/set_env.bash bash launcher_glm52_w4a4c8_mxfp4.sh 8034
-VENDOR_SET_ENV="${VENDOR_SET_ENV:-}"
+# Vendor environment that must be sourced before `vllm serve` (CANN custom
+# transformer ops).  It is a build artifact of a vllm-ascend checkout
+# (vllm_ascend/_cann_ops_custom/vendors/... is not in git), so the candidates
+# below hold the site path first and the repo-local one second.
+#   unset                                -> auto-detect, first hit wins
+#   VENDOR_SET_ENV=                      -> skip the vendor env entirely
+#   VENDOR_SET_ENV=/path/to/set_env.bash -> use exactly that file
+VENDOR_SET_ENV_FALLBACKS=(
+  "/vllm-workspace/vllm-ascend/vllm_ascend/_cann_ops_custom/vendors/custom_transformer/bin/set_env.bash"
+  "${VLLM_ASCEND_REPO}/vllm_ascend/_cann_ops_custom/vendors/custom_transformer/bin/set_env.bash"
+)
+vendor_auto=false
+if [ -z "${VENDOR_SET_ENV+set}" ]; then
+  vendor_auto=true
+  VENDOR_SET_ENV=""
+  for candidate in "${VENDOR_SET_ENV_FALLBACKS[@]}"; do
+    if [ -n "${candidate}" ] && [ -f "${candidate}" ]; then
+      VENDOR_SET_ENV="${candidate}"
+      break
+    fi
+  done
+fi
 PROFILER_DIR="${PROFILER_DIR:-/opt/its/z30055003/profiling_no_pooling}"
 
 # ---------------------------------------------------------------------------
@@ -88,8 +105,18 @@ export VLLM_USE_FASTOKENS="${VLLM_USE_FASTOKENS:-1}"
 if [ -n "${VENDOR_SET_ENV}" ] && [ -f "${VENDOR_SET_ENV}" ]; then
   # shellcheck disable=SC1090
   # Vendor setup scripts may also reference unset variables.
+  echo "[cp-ab] vendor env: ${VENDOR_SET_ENV}"
   set +u; source "${VENDOR_SET_ENV}"; set -u
+elif [ "${vendor_auto}" = true ]; then
+  echo "[cp-ab] WARN: vendor set_env.bash not found; tried:" >&2
+  for candidate in "${VENDOR_SET_ENV_FALLBACKS[@]}"; do
+    echo "[cp-ab]   - ${candidate}" >&2
+  done
+  echo "[cp-ab]   set VENDOR_SET_ENV=/path/to/set_env.bash, or VENDOR_SET_ENV= to skip it" >&2
+elif [ -n "${VENDOR_SET_ENV}" ]; then
+  echo "[cp-ab] WARN: VENDOR_SET_ENV does not exist, vendor environment is NOT applied: ${VENDOR_SET_ENV}" >&2
 fi
+# VENDOR_SET_ENV= (explicitly empty) means "this site does not need it": stay quiet.
 
 export VLLM_DISABLE_COMPILE_CACHE=1
 export PYTHONPATH="${VLLM_ASCEND_REPO}:${PYTHONPATH:-}"
@@ -176,7 +203,11 @@ if [ -n "${DRY_RUN:-}" ]; then
     dry_rc=2
   fi
   if [ -n "${VENDOR_SET_ENV}" ] && [ ! -f "${VENDOR_SET_ENV}" ]; then
-    echo "[cp-ab][dry-run] WARN: VENDOR_SET_ENV not found, vendor env will be skipped: ${VENDOR_SET_ENV}" >&2
+    echo "[cp-ab][dry-run] ERROR: VENDOR_SET_ENV does not exist: ${VENDOR_SET_ENV}" >&2
+    dry_rc=2
+  elif [ "${vendor_auto}" = true ] && [ -z "${VENDOR_SET_ENV}" ]; then
+    echo "[cp-ab][dry-run] WARN: no vendor set_env.bash auto-detected; custom ops may be missing" >&2
+    echo "[cp-ab][dry-run]   set VENDOR_SET_ENV=/path/to/set_env.bash, or VENDOR_SET_ENV= to skip it" >&2
   fi
   if [ -n "${PROFILER_DIR}" ] && [ ! -d "$(dirname "${PROFILER_DIR}")" ]; then
     echo "[cp-ab][dry-run] WARN: PROFILER_DIR parent does not exist: ${PROFILER_DIR}" >&2
@@ -188,7 +219,7 @@ if [ -n "${DRY_RUN:-}" ]; then
   if [ "${dry_rc}" -ne 0 ]; then
     exit "${dry_rc}"
   fi
-  echo "[cp-ab][dry-run] OK vllm=$(command -v vllm) model=${MODEL_PATH} repo=${VLLM_ASCEND_REPO} port=${port} tp=${TP_SIZE:-8}"
+  echo "[cp-ab][dry-run] OK vllm=$(command -v vllm) model=${MODEL_PATH} repo=${VLLM_ASCEND_REPO} vendor=${VENDOR_SET_ENV:-none} port=${port} tp=${TP_SIZE:-8}"
   exit 0
 fi
 
