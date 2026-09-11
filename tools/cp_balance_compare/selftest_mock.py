@@ -475,6 +475,44 @@ def test_check_zigzag_kv_summary_fp_only_dumps() -> None:
         shutil.rmtree(out, ignore_errors=True)
 
 
+def test_check_zigzag_kv_skips_truncated_dumps() -> None:
+    """A truncated dump (the round ran out of disk) must not abort the analysis.
+
+    A full-layer sweep writes GBs; when the dump directory fills up, ``torch.save``
+    leaves partial files ("failed finding central directory").  The remaining
+    layers are still worth reading, so one bad file is skipped with a warning.
+    """
+    if checker is None:
+        print("[skip] torch not available (check_zigzag_dumps needs it)")
+        return
+    import argparse
+
+    import torch
+
+    out = _temp_dir("cp_ab_truncated_")
+    try:
+        torch.manual_seed(11)
+        base = torch.randn(32, 8, dtype=torch.float16)
+        for rank in (0, 1):
+            torch.save({"kv_fp_nat": base.clone()}, out / f"kv_cpbal0_layer0_rank{rank}_pid{rank}_1000.pt")
+            if rank == 0:
+                (out / f"kv_cpbal1_layer0_rank{rank}_pid{rank}_1001.pt").write_bytes(b"PK\x03\x04truncated")
+            else:
+                shifted = base.clone()
+                shifted[16:, :4] = (shifted[16:, :4].float() + 0.01).to(torch.float16)
+                torch.save({"kv_fp_nat": shifted.clone()}, out / f"kv_cpbal1_layer0_rank{rank}_pid{rank}_1001.pt")
+        buffer = io.StringIO()
+        with redirect_stdout(buffer):
+            rc = checker.check_kv(argparse.Namespace(dir=str(out), summary_only=True))
+        text = buffer.getvalue()
+        # The good rank is still compared (1/1), the truncated one is dropped.
+        assert rc == 1, text
+        assert "1/1" in text, text
+        assert "FIRST DIVERGENCE (fp): layer 0" in text, text
+    finally:
+        shutil.rmtree(out, ignore_errors=True)
+
+
 def test_load_prompts_file() -> None:
     out = Path(_temp_dir("cp_ab_pf_"))
     try:

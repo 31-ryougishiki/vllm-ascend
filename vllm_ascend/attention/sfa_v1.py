@@ -185,10 +185,20 @@ def _is_mtp_layer(
 # VLLM_ASCEND_CP_BALANCE_DUMP (see envs.py) and are inert when it is unset.
 # See CP_BALANCE_精度问题_下一步行动计划.md.
 # ---------------------------------------------------------------------------
-# Where VLLM_ASCEND_CP_BALANCE_DUMP writes its files.  Fixed on purpose: one
-# place to look, and the file name carries cp_balance/layer/rank/pid/time so
-# several servers and rounds can share the directory safely.
+# Where VLLM_ASCEND_CP_BALANCE_DUMP writes its files by default.  Fixed on
+# purpose: one place to look, and the file name carries cp_balance/layer/rank/
+# pid/time so several servers and rounds can share the directory safely.
+# A full-layer sweep is GBs, so VLLM_ASCEND_CP_BALANCE_DUMP_DIR can point the
+# writer at a real disk when /dev/shm is small (a full /dev/shm both loses the
+# dumps and can kill the server, which keeps its own IPC there).
 SFA_ZIGZAG_DUMP_DIR = "/dev/shm/cp_balance_dump"
+
+
+def _dump_dir() -> str:
+    """Directory the diagnostic dumps are written to (env override first)."""
+    return os.getenv("VLLM_ASCEND_CP_BALANCE_DUMP_DIR", "").strip() or SFA_ZIGZAG_DUMP_DIR
+
+
 _ZIGZAG_DUMP_KINDS = ("topk", "kv")
 _ZIGZAG_ALL_LAYERS = set(range(1 << 20))
 _ZIGZAG_WARNED_KEYS: set[str] = set()
@@ -1458,7 +1468,7 @@ class AscendSFAImpl(MLAAttentionImpl):
         dump_spec = _parse_dump_spec(ascend_envs.VLLM_ASCEND_CP_BALANCE_DUMP)
         self._zigzag_dump_topk_layers = dump_spec.get("topk")
         self._zigzag_dump_kv_layers = dump_spec.get("kv")
-        self._zigzag_dump_dir = SFA_ZIGZAG_DUMP_DIR
+        self._zigzag_dump_dir = _dump_dir()
         self._zigzag_layer_idx = _zigzag_layer_idx(self.layer_name)
         self._zigzag_dump_topk_done = False
         self._zigzag_dump_kv_done = False

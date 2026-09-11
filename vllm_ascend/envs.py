@@ -125,6 +125,12 @@ env_variables: dict[str, Callable[[], Any]] = {
     # overwrite each other. Read them with
     # tools/cp_balance_compare/check_zigzag_dumps.py.
     "VLLM_ASCEND_CP_BALANCE_DUMP": lambda: os.getenv("VLLM_ASCEND_CP_BALANCE_DUMP", ""),
+    # Where those dumps are written.  Default /dev/shm/cp_balance_dump, which is
+    # fine for a few layers but NOT for a full-layer sweep (kv:all is GBs): a
+    # full /dev/shm also breaks the server itself (its IPC/prometheus dirs live
+    # there), so point this at a real disk when shm is small.  run_cp_diag.sh
+    # forwards its DUMP_DIR here, so one knob controls writer and checker.
+    "VLLM_ASCEND_CP_BALANCE_DUMP_DIR": lambda: os.getenv("VLLM_ASCEND_CP_BALANCE_DUMP_DIR", ""),
     # Whether to enable weight cast format to FRACTAL_NZ.
     # 0: close nz;
     # 1: only quant case enable nz;

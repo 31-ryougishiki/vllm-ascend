@@ -19,7 +19,9 @@
 #   CP_SIZE      默认取 TP_SIZE（driver 的 --cp-size，必须等于 TP_SIZE）
 #   OUT_ROOT     默认 /dev/shm/cp_ab        BASE_PORT  默认 8034
 #   DUMP_SPEC    默认 topk:6,kv:0,6（置空=不 dump；支持 kv:all / topk:all）
-#   DUMP_DIR     默认 /dev/shm/cp_balance_dump
+#   DUMP_DIR     默认 /dev/shm/cp_balance_dump（**writer 与 checker 共用这一个**；
+#                kv:all 是 GB 级，/dev/shm 小就指到真实磁盘——写满 /dev/shm 还会把
+#                server 自己搞死，它的 IPC/prometheus 目录都在那里）
 #
 # 说明：digest 变量在 B/C 两个 server 上取值相同，dump 文件名自带 cpbal{0|1}，
 # 所以一轮就能同时拿到 B 与 C 的数据。每轮输出到 $OUT_ROOT/<round>。
@@ -120,6 +122,13 @@ case "${mode}" in
     exit 2
     ;;
 esac
+
+# One knob for both sides: the writer must put its files where the checker looks.
+# A full-layer sweep is GBs, so point DUMP_DIR at a real disk when /dev/shm is
+# small -- filling /dev/shm also kills the server (its IPC lives there).
+if [[ "${dump_active}" == true ]]; then
+  extra_env+=(--env "VLLM_ASCEND_CP_BALANCE_DUMP_DIR=${dump_dir}")
+fi
 
 out="${out_root}/${round_name}"
 cmd=(python "${driver}"

@@ -47,13 +47,27 @@ NAME_RE = re.compile(
 )
 
 
-def _load(path: str) -> dict:
+def _load(path: str, warn: bool = True) -> dict | None:
+    """Load one dump, or ``None`` when the file is unreadable.
+
+    A round whose dump directory ran out of space leaves truncated files
+    ("failed finding central directory"); one bad file must not abort the whole
+    analysis, otherwise a partially complete sweep is worth nothing.
+    """
+    payload = None
     try:
         payload = torch.load(path, map_location="cpu")
     except Exception:
-        payload = torch.load(path, map_location="cpu", weights_only=False)
+        try:
+            payload = torch.load(path, map_location="cpu", weights_only=False)
+        except Exception as exc:
+            if warn:
+                print(f"[dump] skipping unreadable dump {os.path.basename(path)}: {exc}", file=sys.stderr)
+            return None
     if not isinstance(payload, dict):
-        raise TypeError(f"{path}: unexpected payload {type(payload)}")
+        if warn:
+            print(f"[dump] skipping {os.path.basename(path)}: unexpected payload {type(payload)}", file=sys.stderr)
+        return None
     return payload
 
 
@@ -149,6 +163,8 @@ def check_topk(args) -> int:
                 print(f"[topk] {counts[key] - 1} older dump(s) for layer={key[0]} rank={key[1]} "
                       f"cpbal{key[2]} ignored (keeping the newest)")
         payload = _load(path)
+        if payload is None:
+            continue
         topk = payload.get("topk_indices")
         if not isinstance(topk, torch.Tensor):
             print(f"[topk] {os.path.basename(path)}: no topk_indices tensor, skipped")
@@ -358,7 +374,9 @@ def check_kv(args) -> int:
             if not args.summary_only:
                 print(f"[kv] {counts[key] - 1} older dump(s) for layer={layer} rank={rank} "
                       f"cpbal{cpbal} ignored (keeping the newest)")
-        by_layer[(layer, rank)][cpbal] = (path, _load(path))
+        payload = _load(path, warn=not args.summary_only)
+        if payload is not None:
+            by_layer[(layer, rank)][cpbal] = (path, payload)
     per_layer: dict[int, dict] = defaultdict(
         lambda: {
             "compared": 0, "differ": 0, "rows": [], "first": None, "max": 0, "no_int8": 0,
