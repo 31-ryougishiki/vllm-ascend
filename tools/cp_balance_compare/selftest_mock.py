@@ -513,6 +513,58 @@ def test_check_zigzag_kv_skips_truncated_dumps() -> None:
         shutil.rmtree(out, ignore_errors=True)
 
 
+def test_cp_balance_modules_import_locally_used_stdlib() -> None:
+    """A stdlib name used at module level without an import is a NameError at start-up.
+
+    This exact bug cost a round: ``_dump_dir()`` called ``os.getenv`` at import
+    time while ``sfa_v1.py`` only imported ``os`` inside one function.  Neither
+    py_compile nor importing the tool modules can see it, and the only symptom is
+    a server that dies while loading the model -- so check it statically here.
+    """
+    import ast
+
+    stdlib = {"os", "sys", "time", "math", "json", "shutil", "glob", "re", "threading"}
+    repo = HERE.parent.parent
+    problems: list[str] = []
+    for relative in ("vllm_ascend/attention/sfa_v1.py", "vllm_ascend/envs.py"):
+        path = repo / relative
+        if not path.is_file():
+            continue
+        tree = ast.parse(path.read_text(encoding="utf-8"))
+        # Only *top-level* imports count as module scope: a function-local
+        # `import os` must not make `os` look available to another function.
+        module_level: set[str] = set()
+        for node in tree.body:
+            if isinstance(node, ast.Import):
+                module_level.update(alias.asname or alias.name.split(".")[0] for alias in node.names)
+            elif isinstance(node, ast.ImportFrom):
+                module_level.update(alias.asname or alias.name for alias in node.names)
+
+        def imported_in(scope: ast.AST) -> set[str]:
+            names: set[str] = set()
+            for node in ast.walk(scope):
+                if isinstance(node, ast.Import):
+                    names.update(alias.asname or alias.name.split(".")[0] for alias in node.names)
+                elif isinstance(node, ast.ImportFrom):
+                    names.update(alias.asname or alias.name for alias in node.names)
+                elif isinstance(node, ast.Name) and isinstance(node.ctx, ast.Store):
+                    names.add(node.id)
+            return names
+
+        for func in [n for n in ast.walk(tree) if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef))]:
+            local = {arg.arg for arg in (*func.args.args, *func.args.kwonlyargs)} | imported_in(func)
+            for node in ast.walk(func):
+                if (
+                    isinstance(node, ast.Name)
+                    and isinstance(node.ctx, ast.Load)
+                    and node.id in stdlib
+                    and node.id not in local
+                    and node.id not in module_level
+                ):
+                    problems.append(f"{relative}:{node.lineno}: {func.name}() uses {node.id} without an import")
+    assert not problems, "\n".join(problems)
+
+
 def test_load_prompts_file() -> None:
     out = Path(_temp_dir("cp_ab_pf_"))
     try:

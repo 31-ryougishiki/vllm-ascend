@@ -195,7 +195,14 @@ SFA_ZIGZAG_DUMP_DIR = "/dev/shm/cp_balance_dump"
 
 
 def _dump_dir() -> str:
-    """Directory the diagnostic dumps are written to (env override first)."""
+    """Directory the diagnostic dumps are written to (env override first).
+
+    ``import os`` is local on purpose: this module deliberately keeps its stdlib
+    imports inside the functions that need them (see :func:`_zigzag_dump`), and a
+    module-level use of an unimported name only fails at server start-up.
+    """
+    import os
+
     return os.getenv("VLLM_ASCEND_CP_BALANCE_DUMP_DIR", "").strip() or SFA_ZIGZAG_DUMP_DIR
 
 
