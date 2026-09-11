@@ -198,7 +198,14 @@ python tools/cp_balance_compare/check_zigzag_dumps.py --dir /root/cp_probe \
 **不是** vllm-ascend `patch/worker/patch_deepseek_v2.py` patch 的 `DeepseekV2DecoderLayer/Model`
 ⇒ 那些 patch 对本模型不生效。所以打点不写模型代码，而是在 worker 里按模块名挂 hook：
 `worker/model_runner_v1.py::_install_cp_balance_mlp_dumps()` 给每个 `layers.<L>.mlp` 注册 forward hook，
-dump 输入/输出，位置键仍取 `_EXTRA_CTX.zigzag_cp_context.slot_mapping_cp`（dense MLP 与 MoE 同一套钩子 ✓）。
+dump 输入/输出（dense MLP 与 MoE 同一套钩子 ✓）。
+
+⚠️ **位置键的坑（第一轮就踩了）**：`_EXTRA_CTX.zigzag_cp_context` **只在 zigzag 生效时才有值**
+（`ascend_forward_context._find_zigzag_cp_context()` 要求 `ctx.zigzag_index is not None`），所以只读它会让
+**B 侧（连续切片）全部静默跳过** —— 现场表现是 `mlp=48`（只有 C）而 `act=96`（两侧都有），判读表里干脆没有
+mlp 行。现在钩子先读 `zigzag_cp_context`，拿不到再回退到**该次 forward 的 per-layer metadata** 里的
+`dsa_cp_context.slot_mapping_cp`（两种排布都有），并且**跳过时打一次 warning**（打印 rows/ctx/slot 数）；
+判读侧对"只有单侧 dump"的 op 也会打印 `[act] INCOMPLETE ...`，不再静默当"相同"。
 
 ### 4.3 路由抓取（预检**已通过**，留作 ≥layer 3 的 MoE 用）
 

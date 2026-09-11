@@ -941,13 +941,19 @@ def check_act(args) -> int:
         return 2
 
     rows: list[dict] = []
+    incomplete: list[str] = []
     total = len(groups)
     for index, (layer, op) in enumerate(sorted(groups, key=lambda k: (k[0], _ACT_OP_ORDER.get(k[1], 9))), 1):
         variants = groups[(layer, op)]
         if len(variants) < 2:
+            # Never drop a traced step silently: a one-sided op usually means the
+            # other layout's dump was skipped (e.g. no token positions available),
+            # and an unmentioned gap looks exactly like "this step is identical".
+            note = (f"layer={layer} op={op}: only cp_balance={sorted(variants)} dumped, "
+                    "need both 0 (B) and 1 (C) to compare")
+            incomplete.append(note)
             if not args.summary_only:
-                print(f"[act] layer={layer} op={op}: only cp_balance={sorted(variants)} dumped, "
-                      "need both 0 (B) and 1 (C) to compare")
+                print(f"[act] {note}")
             continue
         left = _act_table(variants["0"])
         right = _act_table(variants["1"])
@@ -1000,6 +1006,10 @@ def check_act(args) -> int:
             print(f"[act] compared {index}/{total} (layer, op) groups", file=sys.stderr)
 
     layer, op, stats = _print_act_summary(rows, ignored, getattr(args, "block_size", 0))
+    if incomplete:
+        print()
+        for note in incomplete:
+            print(f"[act] INCOMPLETE {note}")
     print()
     if layer is None:
         print("[act] RESULT: traced activations are bit-identical across layouts")

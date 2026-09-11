@@ -3556,10 +3556,40 @@ class NPUModelRunner(GPUModelRunner):
 
         dump_dir = _dump_dir()
         done: set[tuple[int, str]] = set()
+        skipped: set[tuple[int, str]] = set()
+
+        def _dsa_cp_context():
+            """The DSA-CP context of the current forward, zigzag or continuous.
+
+            ``_EXTRA_CTX.zigzag_cp_context`` is only set when the batch really
+            runs in the zigzag layout (``_find_zigzag_cp_context`` requires
+            ``ctx.zigzag_index is not None``), so relying on it alone makes the
+            B side (continuous slices) silently skip every dump -- which is
+            exactly what happened on the first run.  Fall back to the raw
+            per-layer metadata, which carries ``slot_mapping_cp`` in both
+            layouts.
+            """
+            ctx = getattr(_EXTRA_CTX, "zigzag_cp_context", None)
+            if ctx is not None and getattr(ctx, "slot_mapping_cp", None) is not None:
+                return ctx
+            try:
+                from vllm.forward_context import get_forward_context
+
+                meta = getattr(get_forward_context(), "attn_metadata", None)
+            except Exception:
+                return None
+            if meta is None:
+                return None
+            candidates = meta.values() if isinstance(meta, dict) else [meta]
+            for candidate in candidates:
+                ctx = getattr(candidate, "dsa_cp_context", None)
+                if ctx is not None and getattr(ctx, "slot_mapping_cp", None) is not None:
+                    return ctx
+            return None
 
         def _positions(rows: int):
             """Token position (cache slot) of every row, or None when unknown."""
-            ctx = getattr(_EXTRA_CTX, "zigzag_cp_context", None)
+            ctx = _dsa_cp_context()
             slots = getattr(ctx, "slot_mapping_cp", None) if ctx is not None else None
             if isinstance(slots, torch.Tensor) and slots.numel() >= rows:
                 return slots[:rows].detach().to("cpu").to(torch.int64)
@@ -3574,9 +3604,24 @@ class NPUModelRunner(GPUModelRunner):
                 return
             positions = _positions(int(value.shape[0]))
             if positions is None:
-                # Decode steps, non-zigzag batches and the all-gathered (padded)
+                # Decode steps, non-DSA-CP batches and the all-gathered (padded)
                 # row set cannot be keyed by token; skip instead of writing a
-                # dump that no two layouts could be compared on.
+                # dump that no two layouts could be compared on.  Warn once so a
+                # *systematic* skip (e.g. a layout with no context) is visible in
+                # the log instead of silently producing half the data.
+                if (layer_idx, op) not in skipped:
+                    skipped.add((layer_idx, op))
+                    ctx = _dsa_cp_context()
+                    slots = getattr(ctx, "slot_mapping_cp", None) if ctx is not None else None
+                    logger.warning(
+                        "[CP_BALANCE][dump] mlp_%s layer=%s skipped: no token positions "
+                        "(rows=%s ctx=%s slot_mapping_cp=%s)",
+                        op,
+                        layer_idx,
+                        int(value.shape[0]),
+                        type(ctx).__name__ if ctx is not None else None,
+                        "None" if slots is None else int(slots.numel()),
+                    )
                 return
             done.add((layer_idx, op))
             rows = int(positions.numel())

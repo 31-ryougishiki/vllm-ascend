@@ -1005,6 +1005,17 @@ def test_check_zigzag_act_covers_mlp_boundary() -> None:
         assert ops == ["in", "out", "mlp_in", "mlp_out"], ops
         assert "FIRST DIVERGENCE (act): layer 0 op=mlp_out at token 4" in text, text
         assert "MLP/MoE **内部**" in text, text
+
+        # A one-sided op must be reported, never silently omitted: dropping the
+        # C dump of mlp_out makes the step look "identical" in the table.
+        for cpbal in (1,):
+            path = out / f"mlpout_cpbal{cpbal}_layer0_rank0_pid100_{1000 + cpbal}.pt"
+            path.unlink()
+        buffer = io.StringIO()
+        with redirect_stdout(buffer):
+            checker.check_act(argparse.Namespace(dir=str(out), summary_only=True, block_size=4))
+        text = buffer.getvalue()
+        assert "[act] INCOMPLETE layer=0 op=mlp_out: only cp_balance=['0'] dumped" in text, text
     finally:
         shutil.rmtree(out, ignore_errors=True)
 
