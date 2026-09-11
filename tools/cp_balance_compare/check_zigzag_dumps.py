@@ -1,0 +1,299 @@
+#!/usr/bin/env python3
+"""Analyse the zigzag diagnostic dumps produced by sfa_v1.py.
+
+用法（在跑完 A/B 之后，CPU 侧执行，不需要 NPU）::
+
+    # 1) 核对 top-k：期望每行的有效值集合 == {0..valid-1}
+    python tools/cp_balance_compare/check_zigzag_dumps.py --kind topk --dir /dev/shm/cp_balance_dump
+
+    # 2) 逐 token 比较 B(CP_BALANCE=0) 与 C(CP_BALANCE=1) 的 KV cache
+    python tools/cp_balance_compare/check_zigzag_dumps.py --kind kv --dir /dev/shm/cp_balance_dump
+
+`topk` mode answers P1 of the precision triage: for prompts shorter than
+``sparse_count`` the LightningIndexer is expected to emit either the identity
+range ``[0..p]`` (A5/arch35: the ``validS2Len < topkCount_`` shortcut) or, on
+arch22/A3, the same *set* in score-descending order.  A row whose valid set is
+incomplete means the indexer told the SFA to attend to fewer positions than the
+causal window requires.
+
+`kv` mode answers P2: the dump stores the packed KV cache rows in natural token
+order, so row ``p`` of a cpbal0 dump and row ``p`` of a cpbal1 dump are the same
+token and can be compared byte for byte.  The first differing layer/token is the
+first place where the two layouts disagree.
+"""
+
+from __future__ import annotations
+
+import argparse
+import glob
+import os
+import re
+import sys
+from collections import defaultdict
+
+try:
+    import torch
+except ImportError:  # pragma: no cover - the target host always has torch
+    print("this script needs torch (run it on the vLLM host)", file=sys.stderr)
+    raise
+
+NAME_RE = re.compile(
+    r"(?P<kind>topk|kv)_cpbal(?P<cpbal>\d+)_layer(?P<layer>-?\d+)_rank(?P<rank>\d+)_pid(?P<pid>\d+)_(?P<ts>\d+)\.pt$"
+)
+
+
+def _load(path: str) -> dict:
+    try:
+        payload = torch.load(path, map_location="cpu")
+    except Exception:
+        payload = torch.load(path, map_location="cpu", weights_only=False)
+    if not isinstance(payload, dict):
+        raise TypeError(f"{path}: unexpected payload {type(payload)}")
+    return payload
+
+
+def _as_list(value) -> list[int]:
+    if value is None:
+        return []
+    if isinstance(value, torch.Tensor):
+        return [int(x) for x in value.reshape(-1).tolist()]
+    if isinstance(value, (list, tuple)):
+        return [int(x) for x in value]
+    return []
+
+
+def _iter_dumps(dump_dir: str, kind: str):
+    pattern = os.path.join(dump_dir, f"{kind}_*.pt")
+    for path in sorted(glob.glob(pattern)):
+        match = NAME_RE.search(os.path.basename(path))
+        if match is None or match.group("kind") != kind:
+            continue
+        yield path, match.groupdict()
+
+
+def _latest_per_server(files):
+    """Keep the newest dump per (layer, rank, cp_balance).
+
+    Several rounds share one dump directory (the file name carries pid and
+    timestamp), so an older round must not be mistaken for the current one.
+    """
+    latest: dict[tuple[int, int, str], tuple[str, dict]] = {}
+    counts: dict[tuple[int, int, str], int] = defaultdict(int)
+    for path, meta in files:
+        key = (int(meta["layer"]), int(meta["rank"]), str(meta["cpbal"]))
+        counts[key] += 1
+        current = latest.get(key)
+        if current is None or int(meta["ts"]) > int(current[1]["ts"]):
+            latest[key] = (path, meta)
+    return latest, counts
+
+
+def _expected_windows(payload: dict) -> tuple[list[tuple[int, int, int]], str]:
+    """Return [(row_prefix, q_len, kv_len)] per virtual batch, plus the shape name.
+
+    Both call shapes use the same per-batch convention: query lengths are prefix
+    sums (TND) and KV lengths are raw per-batch values (PA_BSND).  Therefore
+    ``per_row_valid(row) = (kv_len - q_len) + (row - row_prefix) + 1`` = the
+    token's absolute position + 1.
+    """
+    zigzag = bool(payload.get("zigzag_active"))
+    if zigzag:
+        q_prefix = _as_list(payload.get("actual_seq_lengths_query_zigzag"))
+        kv_raw = _as_list(payload.get("actual_seq_lengths_key_zigzag"))
+        name = "merged-2B"
+    else:
+        q_prefix = _as_list(payload.get("actual_seq_lengths_query"))
+        kv_raw = _as_list(payload.get("actual_seq_lengths_key"))
+        name = "continuous"
+    if not q_prefix:
+        return [], name
+    windows: list[tuple[int, int, int]] = []
+    prev = 0
+    for q_end, kv_len in zip(q_prefix, kv_raw):
+        windows.append((prev, max(0, int(q_end) - prev), int(kv_len)))
+        prev = int(q_end)
+    return windows, name
+
+
+def _row_windows(payload: dict) -> tuple[list[int], list[int], str]:
+    """Expand per-batch windows to per-row (absolute position + 1, kv_len)."""
+    windows, name = _expected_windows(payload)
+    positions: list[int] = []
+    kv_lens: list[int] = []
+    for row_prefix, q_len, kv_len in windows:
+        delta = kv_len - q_len
+        for row in range(q_len):
+            positions.append(delta + row + 1)
+            kv_lens.append(kv_len)
+    return positions, kv_lens, name
+
+
+def check_topk(args) -> int:
+    files = list(_iter_dumps(args.dir, "topk"))
+    if not files:
+        print(f"[topk] no dump found under {args.dir}", file=sys.stderr)
+        return 2
+    latest, counts = _latest_per_server(files)
+    failures = 0
+    for key in sorted(latest):
+        path, meta = latest[key]
+        if counts[key] > 1:
+            print(f"[topk] {counts[key] - 1} older dump(s) for layer={key[0]} rank={key[1]} "
+                  f"cpbal{key[2]} ignored (keeping the newest)")
+        payload = _load(path)
+        topk = payload.get("topk_indices")
+        if not isinstance(topk, torch.Tensor):
+            print(f"[topk] {os.path.basename(path)}: no topk_indices tensor, skipped")
+            continue
+        flat = topk.reshape(topk.shape[0], -1)
+        rows, width = flat.shape
+        positions, kv_lens, shape = _row_windows(payload)
+        print(
+            f"\n[topk] {os.path.basename(path)}\n"
+            f"       cp_balance={meta['cpbal']} layer={meta['layer']} rank={meta['rank']} "
+            f"call={shape} rows={rows} width={width} windows={len(positions)}"
+        )
+        if not positions:
+            print("       no query metadata in dump; cannot verify rows")
+            continue
+        if len(positions) != rows:
+            print(f"       WARNING: {len(positions)} expected rows vs {rows} dumped rows")
+        checked = identity = set_only = bad = 0
+        first_bad = None
+        for row in range(min(rows, len(positions))):
+            valid = min(int(positions[row]), width)
+            entries = [int(x) for x in flat[row, :valid].tolist()]
+            tail = [int(x) for x in flat[row, valid : min(width, valid + 8)].tolist()]
+            checked += 1
+            expected = list(range(valid))
+            if entries == expected:
+                identity += 1
+                continue
+            if sorted(entries) == expected:
+                set_only += 1
+                continue
+            bad += 1
+            if first_bad is None:
+                missing = sorted(set(expected) - set(entries))
+                extra = sorted(set(entries) - set(expected))
+                first_bad = (row, valid, missing[:8], extra[:8], tail[:4])
+        print(f"       rows checked={checked} identity={identity} set-only={set_only} mismatched={bad}")
+        if bad:
+            failures += 1
+            row, valid, missing, extra, tail = first_bad
+            print(
+                f"       first mismatch: row={row} valid={valid} "
+                f"missing={missing} extra={extra} tail_after_valid={tail}"
+            )
+        else:
+            print("       OK: every row's valid prefix is exactly the causal window")
+    print()
+    if failures:
+        print(f"[topk] RESULT: {failures} dump(s) with mismatched rows -> P1 violated (indexer/plumbing)")
+        return 1
+    print("[topk] RESULT: P1 holds on all dumps (top-k == causal window; indexer selection is not the cause)")
+    return 0
+
+
+def _kv_rows(payload: dict) -> list[bytes]:
+    kv = payload.get("kv_nat")
+    if not isinstance(kv, torch.Tensor):
+        return []
+    raw = kv.contiguous().view(torch.uint8)
+    return [bytes(raw[i].tolist()) for i in range(raw.shape[0])]
+
+
+def check_kv(args) -> int:
+    files = list(_iter_dumps(args.dir, "kv"))
+    if not files:
+        print(f"[kv] no dump found under {args.dir}", file=sys.stderr)
+        return 2
+    latest, counts = _latest_per_server(files)
+    by_layer: dict[tuple[int, int], dict[str, tuple[str, dict]]] = defaultdict(dict)
+    for key in sorted(latest):
+        layer, rank, cpbal = key
+        path, meta = latest[key]
+        if counts[key] > 1:
+            print(f"[kv] {counts[key] - 1} older dump(s) for layer={layer} rank={rank} "
+                  f"cpbal{cpbal} ignored (keeping the newest)")
+        by_layer[(layer, rank)][cpbal] = (path, _load(path))
+    failures = 0
+    for (layer, rank), variants in sorted(by_layer.items()):
+        if len(variants) < 2:
+            print(
+                f"[kv] layer={layer} rank={rank}: only cp_balance="
+                f"{sorted(variants)} dumped, need both 0 (B) and 1 (C) to compare"
+            )
+            continue
+        keys = sorted(variants)
+        left_key, right_key = keys[0], keys[-1]
+        left_path, left = variants[left_key]
+        right_path, right = variants[right_key]
+        left_rows = _kv_rows(left)
+        right_rows = _kv_rows(right)
+        n = min(len(left_rows), len(right_rows))
+        diff_rows = [idx for idx in range(n) if left_rows[idx] != right_rows[idx]]
+        print(
+            f"\n[kv] layer={layer} rank={rank} cpbal{left_key} vs cpbal{right_key}: "
+            f"rows {len(left_rows)} vs {len(right_rows)}, differing rows={len(diff_rows)}"
+        )
+        if len(left_rows) != len(right_rows):
+            print("     WARNING: row counts differ (num_actual_tokens/shape mismatch)")
+        if diff_rows:
+            failures += 1
+            first = diff_rows[0]
+            lb = left_rows[first]
+            rb = right_rows[first]
+            byte_diff = sum(1 for a, b in zip(lb, rb) if a != b)
+            # The first 512 bytes of the packed row are the quantized nope part:
+            # compare them as signed int8 for a magnitude estimate.
+            li = torch.frombuffer(bytearray(lb[:512]), dtype=torch.int8).float()
+            ri = torch.frombuffer(bytearray(rb[:512]), dtype=torch.int8).float()
+            print(
+                f"     first differing token={first} bytes_differing={byte_diff}/{len(lb)} "
+                f"max|int8(nope) diff|={float((li - ri).abs().max()):.1f}"
+            )
+            print(f"     B file: {os.path.basename(left_path)}")
+            print(f"     C file: {os.path.basename(right_path)}")
+        else:
+            print("     OK: identical packed KV for every token")
+    print()
+    if failures:
+        print(f"[kv] RESULT: {failures} layer(s) differ -> P2 violated (a token's KV content is not layout invariant)")
+        return 1
+    print("[kv] RESULT: P2 holds on the dumped layers (per-token KV identical across layouts)")
+    return 0
+
+
+def main(argv=None) -> int:
+    try:
+        # Keep the Chinese summary in the docstring from crashing on hosts with
+        # a legacy (non-UTF-8) console encoding.
+        sys.stdout.reconfigure(errors="replace")
+        sys.stderr.reconfigure(errors="replace")
+    except Exception:
+        pass
+    parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    parser.add_argument("--dir", default="/dev/shm/cp_balance_dump", help="dump directory")
+    parser.add_argument("--kind", choices=("topk", "kv", "both"), default="both")
+    parser.add_argument("--list", action="store_true", help="only list the dumps found")
+    args = parser.parse_args(argv)
+
+    if args.list or not os.path.isdir(args.dir):
+        for path in sorted(glob.glob(os.path.join(args.dir, "*.pt"))):
+            print(os.path.basename(path))
+        if not os.path.isdir(args.dir):
+            print(f"dump directory does not exist: {args.dir}", file=sys.stderr)
+            return 2
+        return 0
+
+    rc = 0
+    if args.kind in ("topk", "both"):
+        rc |= check_topk(args)
+    if args.kind in ("kv", "both"):
+        rc |= check_kv(args)
+    return rc
+
+
+if __name__ == "__main__":
+    sys.exit(main())

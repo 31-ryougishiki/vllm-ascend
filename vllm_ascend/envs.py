@@ -102,6 +102,29 @@ env_variables: dict[str, Callable[[], Any]] = {
     "VLLM_ASCEND_CP_BALANCE_DEBUG_LOG": lambda: bool(
         int(os.getenv("VLLM_ASCEND_CP_BALANCE_DEBUG_LOG", "0"))
     ),
+    # A/B knob for the zigzag Indexer/SFA call shape. 1 (default) keeps the
+    # merged single-call path that exposes prev/next as 2 * B batches; 0
+    # restores the prev/next two-call path. Both describe the same math, so a
+    # numerical difference between them isolates the merged-batch kernels from
+    # the shared metadata. Used by the precision triage in
+    # CP_BALANCE_精度问题_下一步行动计划.md (task T1).
+    "VLLM_ASCEND_CP_BALANCE_MERGED_CALL": lambda: bool(
+        int(os.getenv("VLLM_ASCEND_CP_BALANCE_MERGED_CALL", "1"))
+    ),
+    # Diagnostics for the zigzag precision triage
+    # (CP_BALANCE_精度问题_下一步行动计划.md). One switch covers both dumps; an
+    # empty value (default) disables them. Syntax: "kind:layers[,...]" where
+    # kind is topk (LightningIndexer output) or kv (packed KV cache rows in
+    # natural token order) and layers is "all" or a comma separated list, e.g.
+    #   VLLM_ASCEND_CP_BALANCE_DUMP=topk:6      (only layer 6, top-k)
+    #   VLLM_ASCEND_CP_BALANCE_DUMP=kv:0,6      (layers 0 and 6, KV)
+    #   VLLM_ASCEND_CP_BALANCE_DUMP=topk:6,kv:0,6
+    # Files land in sfa_v1.SFA_ZIGZAG_DUMP_DIR as
+    # <kind>_cpbal<N>_layer<L>_rank<R>_pid<P>_<ts>.pt, so the B
+    # (CP_BALANCE=0) and C (CP_BALANCE=1) servers of one A/B round never
+    # overwrite each other. Read them with
+    # tools/cp_balance_compare/check_zigzag_dumps.py.
+    "VLLM_ASCEND_CP_BALANCE_DUMP": lambda: os.getenv("VLLM_ASCEND_CP_BALANCE_DUMP", ""),
     # Whether to enable weight cast format to FRACTAL_NZ.
     # 0: close nz;
     # 1: only quant case enable nz;

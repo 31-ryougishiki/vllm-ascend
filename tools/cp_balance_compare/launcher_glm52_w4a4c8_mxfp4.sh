@@ -18,7 +18,7 @@
 # tools/cp_balance_compare/ab_cp_compare.py.
 #
 # It is a drop-in replacement for
-# /home/z30055003/script/start_server_prefill-w4a4c8-mxfp4.sh with two extra
+# /opt/its/z30055003/script/start_server_prefill-w4a4c8-mxfp4.sh with two extra
 # properties required by the B/C driver:
 #   1. every cp_balance knob can be overridden through the environment,
 #   2. it prints one "[cp-ab] ..." fingerprint line (--config-check).
@@ -31,11 +31,15 @@
 # SITE section: adapt these to the machine.
 # ---------------------------------------------------------------------------
 NIC_NAME="${NIC_NAME:-eth2}"
-LOCAL_IP="${LOCAL_IP:-141.61.133.104}"
-VLLM_ASCEND_REPO="${VLLM_ASCEND_REPO:-/home/z30055003/vllm-ascend}"
-MODEL_PATH="${MODEL_PATH:-/mnt/share/weights/GLM-5.2-w4a4c8-mxfp4}"
-VENDOR_SET_ENV="${VENDOR_SET_ENV:-/mnt/share/l00622059/vendors/custom_transformer/bin/set_env.bash}"
-PROFILER_DIR="${PROFILER_DIR:-/home/z30055003/profiling_no_pooling}"
+LOCAL_IP="${LOCAL_IP:-7.246.78.76}"
+VLLM_ASCEND_REPO="${VLLM_ASCEND_REPO:-/opt/its/z30055003/vllm-ascend}"
+MODEL_PATH="${MODEL_PATH:-/opt/its/model/GLM-5.2-W4A8C8}"
+# Optional vendor environment (custom_transformer / CANN / torch_npu overrides)
+# that used to be sourced from a shared mount.  This site does not need it, so
+# the default is empty; point it at a set_env.bash if a future site requires one:
+#   VENDOR_SET_ENV=/path/to/set_env.bash bash launcher_glm52_w4a4c8_mxfp4.sh 8034
+VENDOR_SET_ENV="${VENDOR_SET_ENV:-}"
+PROFILER_DIR="${PROFILER_DIR:-/opt/its/z30055003/profiling_no_pooling}"
 
 # ---------------------------------------------------------------------------
 # Site environment (same as the original prefill script).
@@ -81,7 +85,7 @@ mkdir -p "${plog_dir}"
 export ASCEND_PROCESS_LOG_PATH="${plog_dir}"
 
 export VLLM_USE_FASTOKENS="${VLLM_USE_FASTOKENS:-1}"
-if [ -f "${VENDOR_SET_ENV}" ]; then
+if [ -n "${VENDOR_SET_ENV}" ] && [ -f "${VENDOR_SET_ENV}" ]; then
   # shellcheck disable=SC1090
   # Vendor setup scripts may also reference unset variables.
   set +u; source "${VENDOR_SET_ENV}"; set -u
@@ -158,17 +162,33 @@ echo "[cp-ab-cfg] ${additional_config}"
 port="${2:-${1:-8034}}"
 
 # DRY_RUN=1: validate the environment without touching the NPUs (used by
-# `ab_cp_compare.py --preflight`).
+# `ab_cp_compare.py --preflight`).  Also checks the site paths from the SITE
+# section above, so a machine move (IP / repo / weights) fails here instead of
+# half-way through a model load.
 if [ -n "${DRY_RUN:-}" ]; then
+  dry_rc=0
   if [ ! -d "${MODEL_PATH}" ]; then
     echo "[cp-ab][dry-run] ERROR: MODEL_PATH does not exist: ${MODEL_PATH}" >&2
-    exit 2
+    dry_rc=2
+  fi
+  if [ ! -d "${VLLM_ASCEND_REPO}" ]; then
+    echo "[cp-ab][dry-run] ERROR: VLLM_ASCEND_REPO does not exist: ${VLLM_ASCEND_REPO}" >&2
+    dry_rc=2
+  fi
+  if [ -n "${VENDOR_SET_ENV}" ] && [ ! -f "${VENDOR_SET_ENV}" ]; then
+    echo "[cp-ab][dry-run] WARN: VENDOR_SET_ENV not found, vendor env will be skipped: ${VENDOR_SET_ENV}" >&2
+  fi
+  if [ -n "${PROFILER_DIR}" ] && [ ! -d "$(dirname "${PROFILER_DIR}")" ]; then
+    echo "[cp-ab][dry-run] WARN: PROFILER_DIR parent does not exist: ${PROFILER_DIR}" >&2
   fi
   if ! command -v vllm >/dev/null 2>&1; then
     echo "[cp-ab][dry-run] ERROR: vllm not found in PATH" >&2
-    exit 2
+    dry_rc=2
   fi
-  echo "[cp-ab][dry-run] OK vllm=$(command -v vllm) model=${MODEL_PATH} port=${port} tp=${TP_SIZE:-8}"
+  if [ "${dry_rc}" -ne 0 ]; then
+    exit "${dry_rc}"
+  fi
+  echo "[cp-ab][dry-run] OK vllm=$(command -v vllm) model=${MODEL_PATH} repo=${VLLM_ASCEND_REPO} port=${port} tp=${TP_SIZE:-8}"
   exit 0
 fi
 

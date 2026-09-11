@@ -176,6 +176,221 @@ def _is_mtp_layer(
     return layer_id >= num_hidden_layers
 
 
+# ---------------------------------------------------------------------------
+# CP_BALANCE zigzag diagnostics.
+#
+# The contract checks below are always on: they are pure Python, do no device
+# work, and only log a warning when a metadata invariant is violated, so a
+# silent defect becomes visible.  The dumps stay behind
+# VLLM_ASCEND_CP_BALANCE_DUMP (see envs.py) and are inert when it is unset.
+# See CP_BALANCE_精度问题_下一步行动计划.md.
+# ---------------------------------------------------------------------------
+# Where VLLM_ASCEND_CP_BALANCE_DUMP writes its files.  Fixed on purpose: one
+# place to look, and the file name carries cp_balance/layer/rank/pid/time so
+# several servers and rounds can share the directory safely.
+SFA_ZIGZAG_DUMP_DIR = "/dev/shm/cp_balance_dump"
+_ZIGZAG_DUMP_KINDS = ("topk", "kv")
+_ZIGZAG_ALL_LAYERS = set(range(1 << 20))
+_ZIGZAG_WARNED_KEYS: set[str] = set()
+
+
+def _zigzag_warn_once(key: str, message: str, *args: Any) -> None:
+    """Warn once per (process, key) so a 78-layer forward cannot flood logs."""
+    if key in _ZIGZAG_WARNED_KEYS:
+        return
+    _ZIGZAG_WARNED_KEYS.add(key)
+    logger.warning("[CP_BALANCE][check][%s] " + message, key, *args)
+
+
+def _check_zigzag_request_alignment(real_req_indices: Sequence[int], num_reqs: int) -> None:
+    """Warn when the filtered request indices are not a contiguous prefix.
+
+    ``_build`` drops zero-token requests from ``query_lens_cpu`` (so the zigzag
+    plan numbers its batches by *real* request order) while ``block_table`` and
+    its zigzag duplicate stay indexed by the *absolute* request index.  The two
+    orders only agree when the surviving requests are ``0..k``.  With a
+    zero-token request in the middle, virtual batch ``b`` would read another
+    request's block_table row and therefore another request's KV blocks.
+    """
+    indices = [int(x) for x in real_req_indices]
+    if indices and indices != list(range(len(indices))):
+        _zigzag_warn_once(
+            "request_alignment",
+            "zigzag query_lens kept request indices %s of %s; they are not a "
+            "contiguous prefix, so the merged batch order and the block_table "
+            "row order disagree",
+            indices,
+            num_reqs,
+        )
+
+
+def _parse_dump_spec(raw: Any) -> dict[str, set[int]]:
+    """Parse ``VLLM_ASCEND_CP_BALANCE_DUMP`` into ``{kind: layer indices}``.
+
+    Accepted forms::
+
+        topk:6              # layer 6, top-k dump
+        kv:0,6              # layers 0 and 6, KV dump
+        topk:6,kv:0,6       # both
+        topk:all            # every layer
+
+    A token containing ``:`` opens a new kind; bare numbers are appended to the
+    kind opened last.  An empty value yields ``{}`` (dumping disabled).
+    """
+    if raw is None:
+        return {}
+    text = str(raw).strip()
+    if not text:
+        return {}
+    spec: dict[str, set[int]] = {}
+    current: str | None = None
+    for token in text.split(","):
+        token = token.strip()
+        if not token:
+            continue
+        if ":" in token:
+            kind, _, layers = token.partition(":")
+            current = kind.strip().lower()
+            if current not in _ZIGZAG_DUMP_KINDS:
+                logger.warning(
+                    "[CP_BALANCE][dump] ignoring %r: kind must be one of %s",
+                    kind.strip(),
+                    "/".join(_ZIGZAG_DUMP_KINDS),
+                )
+                current = None
+                continue
+            spec.setdefault(current, set())
+            token = layers.strip()
+            if not token:
+                continue
+        if current is None:
+            logger.warning(
+                "[CP_BALANCE][dump] ignoring %r: expected kind:layers, e.g. topk:6,kv:0,6",
+                token,
+            )
+            continue
+        if token.lower() == "all":
+            spec[current] = set(_ZIGZAG_ALL_LAYERS)
+            continue
+        try:
+            spec[current].add(int(token))
+        except ValueError:
+            logger.warning("[CP_BALANCE][dump] ignoring invalid layer %r", token)
+    return {kind: layers for kind, layers in spec.items() if layers}
+
+
+def _zigzag_layer_idx(layer_name: str | None) -> int | None:
+    try:
+        return parse_layer_idx(layer_name or "")
+    except Exception:
+        return None
+
+
+def _zigzag_dump(obj: dict, layer_idx: int | None, kind: str, dump_dir: str) -> str | None:
+    """torch.save one diagnostic dump; never raises into the forward path."""
+    import os
+    import time
+
+    try:
+        os.makedirs(dump_dir, exist_ok=True)
+        path = os.path.join(
+            dump_dir,
+            f"{kind}_cpbal{int(bool(ascend_envs.VLLM_ASCEND_CP_BALANCE))}"
+            f"_layer{layer_idx}_rank{get_tp_group().rank_in_group}"
+            f"_pid{os.getpid()}_{time.time_ns()}.pt",
+        )
+        torch.save(obj, path)
+        logger.info("[CP_BALANCE][dump] %s layer=%s -> %s", kind, layer_idx, path)
+        return path
+    except Exception as exc:  # pragma: no cover - diagnostics must not break a run
+        logger.warning("[CP_BALANCE][dump] failed to save %s layer=%s: %s", kind, layer_idx, exc)
+        return None
+
+
+def _check_merged_zigzag_contracts(
+    *,
+    q_len_zigzag_list: Sequence[int],
+    kv_len_zigzag_list: Sequence[int],
+    q_len_prev_list: Sequence[int],
+    q_len_next_list: Sequence[int],
+    kv_len_prev_list: Sequence[int],
+    kv_len_next_list: Sequence[int],
+    local_tokens: int,
+    num_reqs_meta: int,
+    block_table_rows: int | None,
+) -> None:
+    """Log-only validation of the merged prev/next metadata.
+
+    Facts checked (all pure Python, no device sync):
+      1. the merged tensors expose exactly ``2 * num_reqs`` batches;
+      2. query lengths are non-decreasing prefix sums over
+         ``[all prevs, all nexts]`` and their total is the local token count;
+      3. every virtual batch satisfies ``kv_len >= q_len`` (the causal window
+         ``S2 - S1`` must not go negative, otherwise the SFA trims rows);
+      4. ``block_table.dim0 == 2 * num_reqs`` (the operator tiling requires
+         ``dim0 == len(actual_seq_lengths_query)``).
+
+    The zero-token-request / block_table misalignment is checked separately by
+    :func:`_check_zigzag_request_alignment`, because it can only be detected
+    where the raw request indices are still visible.
+    """
+    half = len(q_len_prev_list)
+    if len(q_len_zigzag_list) != 2 * half or len(kv_len_zigzag_list) != 2 * half:
+        _zigzag_warn_once(
+            "merged_len",
+            "merged zigzag metadata exposes %s query / %s kv batches, expected %s",
+            len(q_len_zigzag_list),
+            len(kv_len_zigzag_list),
+            2 * half,
+        )
+    if 2 * half != 2 * num_reqs_meta:
+        _zigzag_warn_once(
+            "merged_vs_num_reqs",
+            "merged zigzag metadata has %s batches but num_reqs=%s",
+            2 * half,
+            num_reqs_meta,
+        )
+    for prev, cur in zip(q_len_zigzag_list, q_len_zigzag_list[1:]):
+        if cur < prev:
+            _zigzag_warn_once(
+                "merged_prefix_sum",
+                "merged query lengths are not a non-decreasing prefix sum: %s -> %s",
+                prev,
+                cur,
+            )
+            break
+    if q_len_zigzag_list and q_len_zigzag_list[-1] != local_tokens:
+        _zigzag_warn_once(
+            "merged_local_tokens",
+            "merged query prefix sum ends at %s but the rank-local token count is %s",
+            q_len_zigzag_list[-1],
+            local_tokens,
+        )
+    if block_table_rows is not None and block_table_rows != len(q_len_zigzag_list):
+        _zigzag_warn_once(
+            "merged_block_table_rows",
+            "block_table has %s rows but the merged query metadata has %s batches",
+            block_table_rows,
+            len(q_len_zigzag_list),
+        )
+    for name, q_list, kv_list in (
+        ("prev", q_len_prev_list, kv_len_prev_list),
+        ("next", q_len_next_list, kv_len_next_list),
+    ):
+        for idx, (q_len, kv_len) in enumerate(zip(q_list, kv_list)):
+            if q_len > 0 and kv_len < q_len:
+                _zigzag_warn_once(
+                    f"kv_ge_q_{name}",
+                    "%s batch %s has kv_len=%s < q_len=%s; the causal window "
+                    "S2 - S1 would be negative and the SFA trims rows",
+                    name,
+                    idx,
+                    kv_len,
+                    q_len,
+                )
+                break
+
+
 class AscendSFABackend(AttentionBackend):
     accept_output_buffer: bool = True
 
@@ -333,6 +548,7 @@ def _build_zigzag_meta(
     device: torch.device,
     num_actual_tokens: int | None = None,
     num_reqs_meta: int | None = None,
+    block_table_rows: int | None = None,
 ) -> dict[str, Any]:
     """Build device-side zigzag metadata for a multi-request prefill batch.
 
@@ -415,6 +631,20 @@ def _build_zigzag_meta(
     else:
         zigzag_actual_gather_index = _int64_tensor(plan.actual_gather_index)
         zigzag_actual_rows = _int64_tensor(plan.actual_rows)
+
+    # Pure Python, no device sync: turns a silent metadata defect into a
+    # warning.  Never raises, so a false positive cannot break a run.
+    _check_merged_zigzag_contracts(
+        q_len_zigzag_list=q_len_zigzag_list,
+        kv_len_zigzag_list=kv_len_zigzag_list,
+        q_len_prev_list=q_len_prev_list,
+        q_len_next_list=q_len_next_list,
+        kv_len_prev_list=kv_len_prev_list,
+        kv_len_next_list=kv_len_next_list,
+        local_tokens=plan.local_tokens,
+        num_reqs_meta=int(num_reqs_meta),
+        block_table_rows=block_table_rows,
+    )
 
     return {
         "zigzag_index": zigzag_index,
@@ -716,6 +946,11 @@ class AscendSFAMetadataBuilder(MLACommonMetadataBuilder[AscendSFAMetadata]):
                 full_o_proj=dsa_cp_with_o_proj_tp_for_config(self.vllm_config),
             ):
                 assert query_lens_cpu is not None and prefix_lens_cpu is not None
+                if real_req_indices:
+                    # Zigzag is really being taken for this batch: verify that
+                    # the ragged token stream and block_table agree on request
+                    # order (log-only, pure Python).
+                    _check_zigzag_request_alignment(real_req_indices, num_reqs)
                 zigzag = _build_zigzag_meta(
                     num_tokens_pad,
                     global_tp_size,
@@ -725,6 +960,10 @@ class AscendSFAMetadataBuilder(MLACommonMetadataBuilder[AscendSFAMetadata]):
                     slot_mapping.device,
                     num_actual_tokens,
                     num_reqs_meta=num_reqs,
+                    # block_table_zigzag duplicates each request row, so the
+                    # operator sees 2 * num_reqs rows; checked against the
+                    # merged batch count (shape read only, no sync).
+                    block_table_rows=int(block_table.shape[0]) * 2,
                 )
                 # The merged single-call operators treat prev and next as two
                 # batches per request.  block_table rows must follow the same
@@ -984,6 +1223,17 @@ class AscendSFAImpl(MLAAttentionImpl):
     q_hadamard: torch.Tensor | None = None
     k_hadamard: torch.Tensor | None = None
 
+    # CP_BALANCE diagnostics defaults.  Declared on the class so a subclass that
+    # builds itself through a different __init__ chain can never trip over a
+    # missing attribute from the diagnostic paths.
+    _zigzag_merged_call: bool = True
+    _zigzag_dump_dir: str = SFA_ZIGZAG_DUMP_DIR
+    _zigzag_dump_topk_layers: set[int] | None = None
+    _zigzag_dump_kv_layers: set[int] | None = None
+    _zigzag_layer_idx: int | None = None
+    _zigzag_dump_topk_done: bool = True
+    _zigzag_dump_kv_done: bool = True
+
     def __init__(
         self,
         num_heads: int,
@@ -1126,6 +1376,120 @@ class AscendSFAImpl(MLAAttentionImpl):
 
         if self.enable_dsa_cp:
             self.local_num_heads = self.num_heads * self.tp_size
+
+        # ---- CP_BALANCE zigzag diagnostics (inert unless DUMP is set) ----
+        # Read once at init: the forward path must not pay an os.environ lookup
+        # per call.  See CP_BALANCE_精度问题_下一步行动计划.md.
+        self._zigzag_merged_call = bool(ascend_envs.VLLM_ASCEND_CP_BALANCE_MERGED_CALL)
+        dump_spec = _parse_dump_spec(ascend_envs.VLLM_ASCEND_CP_BALANCE_DUMP)
+        self._zigzag_dump_topk_layers = dump_spec.get("topk")
+        self._zigzag_dump_kv_layers = dump_spec.get("kv")
+        self._zigzag_dump_dir = SFA_ZIGZAG_DUMP_DIR
+        self._zigzag_layer_idx = _zigzag_layer_idx(self.layer_name)
+        self._zigzag_dump_topk_done = False
+        self._zigzag_dump_kv_done = False
+        if dump_spec and self._zigzag_layer_idx is None:
+            _zigzag_warn_once(
+                "dump_no_layer_idx",
+                "zigzag dump is enabled but the layer index could not be parsed "
+                "from layer_name=%r; no dump will be produced",
+                self.layer_name,
+            )
+
+    def _zigzag_dump_enabled(self, layers: set[int] | None, done: bool) -> bool:
+        """Whether a diagnostic dump should run for this layer right now."""
+        if layers is None or done:
+            return False
+        try:
+            in_profile_run = bool(getattr(_EXTRA_CTX, "in_profile_run", False))
+        except Exception:
+            in_profile_run = False
+        if in_profile_run:
+            # The profile/warmup forward uses dummy metadata; dumping it would
+            # waste the one-shot budget before the measured prefill.
+            return False
+        return self._zigzag_layer_idx is not None and self._zigzag_layer_idx in layers
+
+    def _maybe_dump_topk(
+        self,
+        topk_indices: torch.Tensor,
+        attn_metadata: M,
+        zigzag_active: bool,
+    ) -> None:
+        """Dump the LightningIndexer output plus the metadata needed to map
+        its rows back to absolute token positions (task T2)."""
+        if not self._zigzag_dump_enabled(self._zigzag_dump_topk_layers, self._zigzag_dump_topk_done):
+            return
+        self._zigzag_dump_topk_done = True
+        ctx = getattr(attn_metadata, "dsa_cp_context", None)
+        payload: dict[str, Any] = {
+            "kind": "topk",
+            "layer_name": self.layer_name,
+            "layer_idx": self._zigzag_layer_idx,
+            "zigzag_active": bool(zigzag_active),
+            "topk_indices": topk_indices.detach().to("cpu"),
+            "num_actual_tokens": int(attn_metadata.num_actual_tokens),
+            "num_input_tokens": int(attn_metadata.num_input_tokens),
+        }
+        if ctx is not None:
+            for key in (
+                "actual_seq_lengths_query_zigzag",
+                "actual_seq_lengths_key_zigzag",
+                "actual_seq_lengths_query",
+                "actual_seq_lengths_key",
+                "actual_seq_q_prev_list",
+                "actual_seq_q_next_list",
+                "kv_len_prev_list",
+                "kv_len_next_list",
+                "q_len_prev",
+                "q_len_next",
+                "kv_len_prev",
+                "kv_len_next",
+                "local_start",
+                "local_end",
+                "local_end_with_pad",
+            ):
+                value = getattr(ctx, key, None)
+                if isinstance(value, torch.Tensor):
+                    payload[key] = value.detach().to("cpu")
+                elif value is not None:
+                    payload[key] = value
+        _zigzag_dump(payload, self._zigzag_layer_idx, "topk", self._zigzag_dump_dir)
+
+    def _maybe_dump_kv(
+        self,
+        kv_cache_row_view: torch.Tensor,
+        slot_mapping_sfa: torch.Tensor,
+        num_actual_tokens: int,
+    ) -> None:
+        """Dump the packed KV cache rows in natural token order (task T3).
+
+        Reading them back through ``slot_mapping`` makes the dump directly
+        comparable across the B (continuous) and C (zigzag) configurations:
+        row p of the dump is token p in both.
+        """
+        if not self._zigzag_dump_enabled(self._zigzag_dump_kv_layers, self._zigzag_dump_kv_done):
+            return
+        self._zigzag_dump_kv_done = True
+        try:
+            slots = slot_mapping_sfa[:num_actual_tokens].to(torch.int64)
+            # Padding rows carry slot -1: drop them instead of relying on the
+            # index op's negative-index behaviour.
+            valid = slots >= 0
+            kv_nat = kv_cache_row_view.index_select(0, slots[valid]).detach().to("cpu")
+            payload = {
+                "kind": "kv",
+                "layer_name": self.layer_name,
+                "layer_idx": self._zigzag_layer_idx,
+                "kv_nat": kv_nat,  # [num_valid, packed_head_dim], natural token order
+                "slots": slots[valid].to("cpu"),
+                "num_actual_tokens": int(num_actual_tokens),
+                "num_valid": int(valid.sum().item()),
+            }
+        except Exception as exc:  # pragma: no cover - diagnostics only
+            logger.warning("[CP_BALANCE][dump] kv dump prep failed: %s", exc)
+            return
+        _zigzag_dump(payload, self._zigzag_layer_idx, "kv", self._zigzag_dump_dir)
 
     @property
     def skip_topk(self) -> bool:
@@ -2115,6 +2479,88 @@ class AscendSFAImpl(MLAAttentionImpl):
             block_table=block_table,
         )
 
+    def _indexer_select_post_process_zigzag(
+        self,
+        x: torch.Tensor,
+        q_c: torch.Tensor | tuple[torch.Tensor, torch.Tensor],
+        kv_cache: tuple[torch.Tensor, ...],
+        attn_metadata: M,
+        cos: torch.Tensor,
+        sin: torch.Tensor,
+    ) -> torch.Tensor:
+        """Run the LightningIndexer twice over the prev/next zigzag halves.
+
+        This is the pre-merge call shape (see git 143b3a573, which replaced it
+        with the merged 2 * B single call).  It is kept behind
+        ``VLLM_ASCEND_CP_BALANCE_MERGED_CALL=0`` so a single A/B round can tell
+        the merged-batch kernels apart from the shared metadata: both shapes
+        describe exactly the same math, with the same per-batch
+        ``(actual_seq_lengths_query, actual_seq_lengths_key)`` conventions.
+
+        ``x``, ``q_c`` and the derived weights are already in
+        [all_prev_blocks, all_next_blocks] local order.  The split point is
+        ``total_q_prev_tokens``, so multi-request and uneven blocks are split
+        at the true prev/next boundary instead of a hard-coded ``q_half``.
+        """
+        ctx = attn_metadata.dsa_cp_context
+        assert ctx is not None and ctx.zigzag_index is not None
+        split = ctx.total_q_prev_tokens
+        if split <= 0:
+            raise RuntimeError(
+                "zigzag indexer split point must be positive, got "
+                f"total_q_prev_tokens={split}"
+            )
+
+        assert self.wk_weights_proj is not None
+        kw, _ = self.wk_weights_proj(x)
+        weights = kw[:, self.head_dim :]
+        q_li, q_li_scale, q_li_shape_ori = self._indexer_qk_proj(
+            q_c, cos, sin, output_dtype=x.dtype
+        )
+        record_attention_compute_start()
+
+        parts = []
+        for split_idx, (token_count, q_len, kv_len) in enumerate(
+            (
+                (split, ctx.q_len_prev, ctx.kv_len_prev),
+                (ctx.total_q_next_tokens, ctx.q_len_next, ctx.kv_len_next),
+            )
+        ):
+            start = 0 if split_idx == 0 else split
+            if q_li_shape_ori is None:
+                q_li_h = q_li[start : start + token_count]
+                q_li_scale_h = None
+            else:
+                # LI-C8 flattens q_li to [T * n_head, head_dim].
+                head_start = start * self.n_head
+                head_end = head_start + token_count * self.n_head
+                q_li_h = q_li[head_start:head_end]
+                q_li_scale_h = (
+                    q_li_scale[head_start:head_end] if q_li_scale is not None else None
+                )
+            shape_h = (
+                (token_count, *q_li_shape_ori[1:])
+                if q_li_shape_ori is not None
+                else None
+            )
+            weights_h = weights[start : start + token_count]
+            parts.append(
+                DeviceOperator.indexer_select_post_process(
+                    self,
+                    q_li_h,
+                    q_li_scale_h,
+                    shape_h,
+                    weights_h,
+                    kv_cache,
+                    attn_metadata,
+                    q_len,
+                    kv_len,
+                    self.enable_sparse_li_c8,
+                    self.use_torch_npu_lightning_indexer,
+                )
+            )
+        return torch.cat(parts, dim=0)
+
     def _get_indexcache_topk_indices(self, num_tokens: int) -> torch.Tensor:
         if self.topk_indices_buffer is None:
             raise RuntimeError("IndexCache requires topk_indices_buffer when skip_topk is enabled.")
@@ -2329,6 +2775,14 @@ class AscendSFAImpl(MLAAttentionImpl):
                         kv_cache[0].view(-1, fused_kv_no_split.shape[-1]),
                         scatter_slots.view(-1, 1),
                         fused_kv_actual,
+                    )
+                    # Diagnostics: read the packed cache back in natural token
+                    # order so B (continuous) and C (zigzag) dumps are directly
+                    # comparable per token.  No-op unless the dump env is set.
+                    self._maybe_dump_kv(
+                        kv_cache[0].view(-1, fused_kv_no_split.shape[-1]),
+                        slot_mapping_sfa,
+                        attn_metadata.num_actual_tokens,
                     )
                     k_pe = None
                     k_nope = None
@@ -2696,26 +3150,39 @@ class AscendSFAImpl(MLAAttentionImpl):
                 assert q_c is not None
                 assert attn_metadata.dsa_cp_context is not None
                 ctx = attn_metadata.dsa_cp_context
-                assert ctx.actual_seq_lengths_query_zigzag is not None
-                assert ctx.actual_seq_lengths_key_zigzag is not None
-                assert ctx.block_table_zigzag is not None
-                # Single LightningIndexer call: prev and next are two batches
-                # per request in the same TND tensor, distinguished by the
-                # merged cumulative query lengths / per-batch KV lengths and
-                # the duplicated block_table rows.
-                topk_indices = self.indexer_select_post_process(
-                    x=hidden_states,
-                    q_c=q_c,
-                    kv_cache=kv_cache,
-                    attn_metadata=attn_metadata,
-                    cos=cos,
-                    sin=sin,
-                    actual_seq_lengths_query=ctx.actual_seq_lengths_query_zigzag,
-                    actual_seq_lengths_key=ctx.actual_seq_lengths_key_zigzag,
-                    block_table=ctx.block_table_zigzag,
-                )
+                if self._zigzag_merged_call:
+                    assert ctx.actual_seq_lengths_query_zigzag is not None
+                    assert ctx.actual_seq_lengths_key_zigzag is not None
+                    assert ctx.block_table_zigzag is not None
+                    # Single LightningIndexer call: prev and next are two batches
+                    # per request in the same TND tensor, distinguished by the
+                    # merged cumulative query lengths / per-batch KV lengths and
+                    # the duplicated block_table rows.
+                    topk_indices = self.indexer_select_post_process(
+                        x=hidden_states,
+                        q_c=q_c,
+                        kv_cache=kv_cache,
+                        attn_metadata=attn_metadata,
+                        cos=cos,
+                        sin=sin,
+                        actual_seq_lengths_query=ctx.actual_seq_lengths_query_zigzag,
+                        actual_seq_lengths_key=ctx.actual_seq_lengths_key_zigzag,
+                        block_table=ctx.block_table_zigzag,
+                    )
+                else:
+                    # A/B knob: prev/next as two single-batch calls.  Same math,
+                    # same metadata conventions, no duplicated block_table.
+                    topk_indices = self._indexer_select_post_process_zigzag(
+                        x=hidden_states,
+                        q_c=q_c,
+                        kv_cache=kv_cache,
+                        attn_metadata=attn_metadata,
+                        cos=cos,
+                        sin=sin,
+                    )
                 if self.use_index_cache:
                     self._update_indexcache_topk_indices(topk_indices)
+                self._maybe_dump_topk(topk_indices, attn_metadata, True)
             else:
                 if not self.has_indexer:
                     raise RuntimeError(f"skip_topk is False but indexer is None. layer_name={self.layer_name}.")
@@ -2732,25 +3199,54 @@ class AscendSFAImpl(MLAAttentionImpl):
                 )
                 if self.use_index_cache:
                     self._update_indexcache_topk_indices(topk_indices)
+                self._maybe_dump_topk(topk_indices, attn_metadata, False)
 
         if zigzag_active:
             assert attn_metadata.dsa_cp_context is not None
             ctx = attn_metadata.dsa_cp_context
-            assert ctx.actual_seq_lengths_query_zigzag is not None
-            assert ctx.actual_seq_lengths_key_zigzag is not None
-            assert ctx.block_table_zigzag is not None
-            # Single SFA call: Q and topk_indices stay in [prev, next] local
-            # order; the merged metadata describes each half as one batch.
-            attn_output = self._execute_sparse_flash_attention_process(
-                ql_nope,
-                q_pe,
-                kv_cache,
-                topk_indices,
-                attn_metadata,
-                ctx.actual_seq_lengths_query_zigzag,
-                ctx.actual_seq_lengths_key_zigzag,
-                block_table=ctx.block_table_zigzag,
-            )
+            if self._zigzag_merged_call:
+                assert ctx.actual_seq_lengths_query_zigzag is not None
+                assert ctx.actual_seq_lengths_key_zigzag is not None
+                assert ctx.block_table_zigzag is not None
+                # Single SFA call: Q and topk_indices stay in [prev, next] local
+                # order; the merged metadata describes each half as one batch.
+                attn_output = self._execute_sparse_flash_attention_process(
+                    ql_nope,
+                    q_pe,
+                    kv_cache,
+                    topk_indices,
+                    attn_metadata,
+                    ctx.actual_seq_lengths_query_zigzag,
+                    ctx.actual_seq_lengths_key_zigzag,
+                    block_table=ctx.block_table_zigzag,
+                )
+            else:
+                # A/B knob: prev/next as two single-batch SFA calls, split at
+                # the true prev/next boundary.
+                split = ctx.total_q_prev_tokens
+                if split <= 0:
+                    raise RuntimeError(
+                        f"zigzag SFA split point must be positive, got total_q_prev_tokens={split}"
+                    )
+                attn_prev = self._execute_sparse_flash_attention_process(
+                    ql_nope[:split],
+                    q_pe[:split],
+                    kv_cache,
+                    topk_indices[:split],
+                    attn_metadata,
+                    ctx.q_len_prev,
+                    ctx.kv_len_prev,
+                )
+                attn_next = self._execute_sparse_flash_attention_process(
+                    ql_nope[split:],
+                    q_pe[split:],
+                    kv_cache,
+                    topk_indices[split:],
+                    attn_metadata,
+                    ctx.q_len_next,
+                    ctx.kv_len_next,
+                )
+                attn_output = torch.cat([attn_prev, attn_next], dim=0)
         else:
             attn_output = self._execute_sparse_flash_attention_process(
                 ql_nope,

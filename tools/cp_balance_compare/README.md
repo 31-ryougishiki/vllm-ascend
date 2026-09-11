@@ -23,7 +23,7 @@
 | 文件 | 作用 |
 | --- | --- |
 | `ab_cp_compare.py` | 主 driver：拉起/连接 server、采集逐位置 logprob、算 diff、出图 |
-| `launcher_glm52_w4a4c8_mxfp4.sh` | 本机（`/home/z30055003`、eth2、GLM-5.2-w4a4c8-mxfp4）可直接用的 launcher |
+| `launcher_glm52_w4a4c8_mxfp4.sh` | 本机（`/opt/its/z30055003`、eth2、GLM-5.2-W4A8C8）可直接用的 launcher |
 | `launcher_template.sh` | 通用参考 launcher：演示 driver 要求的 env 覆盖 + 配置指纹约定 |
 | `mock_vllm_server.py` | 模拟 vLLM `/v1/completions` 的 mock server（无 NPU 自测/联调用） |
 | `selftest_mock.py` | 用 mock server 端到端自测 driver（`pytest` 或直接运行） |
@@ -38,11 +38,11 @@ TP=8 的 server 会占满 8 张卡，两组配置无法同时在线；driver 会
 完成"拉起 → `/health` 就绪 → 打请求 → 杀进程 → 下一个 → 对比"。默认端口 **8034**
 （`--base-port` 可改），拉起的 server 也从同一个端口起。
 
-本仓库自带按这台机器定制的 launcher（eth2 / `141.61.133.104` /
-`/home/z30055003/vllm-ascend` / `/mnt/share/weights/...`，均可被环境变量覆盖）：
+本仓库自带按这台机器定制的 launcher（eth2 / `7.246.78.76` /
+`/opt/its/z30055003/vllm-ascend` / `/opt/its/model/...`，均可被环境变量覆盖）：
 
 ```bash
-cd /home/z30055003/vllm-ascend
+cd /opt/its/z30055003/vllm-ascend
 
 # 0) 先在节点上自检 driver（不需要 NPU）
 python tools/cp_balance_compare/selftest_mock.py
@@ -50,7 +50,7 @@ python tools/cp_balance_compare/selftest_mock.py
 # 0.5) preflight：用 DRY_RUN 校验 launcher/env/指纹/vllm/模型路径，不加载模型
 python tools/cp_balance_compare/ab_cp_compare.py \
   --preflight \
-  --repo-root /home/z30055003/vllm-ascend \
+  --repo-root /opt/its/z30055003/vllm-ascend \
   --launcher "bash tools/cp_balance_compare/launcher_glm52_w4a4c8_mxfp4.sh x {port}" \
   --no-kv-connector
 # 期望输出：[preflight] B: OK ... [preflight] C: OK ... [preflight] all configs OK
@@ -60,7 +60,7 @@ python tools/cp_balance_compare/ab_cp_compare.py \
 #    --zigzag-check strict：C 没进 zigzag 直接判失败（默认跳过剩下的配置，避免白加载）
 python tools/cp_balance_compare/ab_cp_compare.py \
   --out /dev/shm/cp_ab \
-  --repo-root /home/z30055003/vllm-ascend \
+  --repo-root /opt/its/z30055003/vllm-ascend \
   --launcher "bash tools/cp_balance_compare/launcher_glm52_w4a4c8_mxfp4.sh x {port}" \
   --config-check strict \
   --zigzag-check strict \
@@ -76,7 +76,7 @@ ls /dev/shm/cp_ab
 # 3) 复现线上 MTP + Mooncake 组合（可选，第二轮再做）
 python tools/cp_balance_compare/ab_cp_compare.py \
   --out /dev/shm/cp_ab_mtp \
-  --repo-root /home/z30055003/vllm-ascend \
+  --repo-root /opt/its/z30055003/vllm-ascend \
   --launcher "bash tools/cp_balance_compare/launcher_glm52_w4a4c8_mxfp4.sh x {port}" \
   --config-check strict \
   --prompt-lens 2048,2049 \
@@ -103,7 +103,7 @@ python tools/cp_balance_compare/ab_cp_compare.py ... --restart-wait 90
 
 ### 2.2 复用自己的启动脚本
 
-如果不想用仓库里的 launcher，只要把 `/home/z30055003/script/start_server_prefill-w4a4c8-mxfp4.sh`
+如果不想用仓库里的 launcher，只要把 `/opt/its/z30055003/script/start_server_prefill-w4a4c8-mxfp4.sh`
 改成满足两个约定：
 
 1. **所有 cp_balance 开关用 `${VAR-default}`（不要硬编码）**：
@@ -134,8 +134,8 @@ python tools/cp_balance_compare/ab_cp_compare.py ... --restart-wait 90
 
 ```bash
 python tools/cp_balance_compare/ab_cp_compare.py \
-  --repo-root /home/z30055003 \
-  --launcher "bash /home/z30055003/script/start_server_prefill-w4a4c8-mxfp4.sh x {port}" \
+  --repo-root /opt/its/z30055003/vllm-ascend \
+  --launcher "bash /opt/its/z30055003/script/start_server_prefill-w4a4c8-mxfp4.sh x {port}" \
   --config-check strict \
   --out /dev/shm/cp_ab
 ```
@@ -462,3 +462,35 @@ C 和 B 输出逐位完全一致时，第一件事是确认 C 真的走了 zigza
 - `vllm_ascend/attention/sfa_v1.py`：`DSACPContext`、merged metadata、KV/indexer 写回
 - `vllm_ascend/patch/worker/patch_deepseek_v2.py`：模型入口 shard / 出口 gather
 - `vllm_ascend/ops/vocab_parallel_embedding.py`：embedding 入口
+
+## 9. 精度追查用的脚本（本目录）
+
+driver 只回答"cp_balance 开关有没有影响"，定位"影响在哪一环"用下面这套。
+设计背景与判据见仓库根目录 `CP_BALANCE_精度问题_下一步行动计划.md`。
+
+| 脚本 | 用途 |
+| --- | --- |
+| `run_cp_diag.sh baseline` | T0+T2+T3：基线 B/C/B2 + topk/KV dump（2~3 次模型加载） |
+| `run_cp_diag.sh 2call` | T1：回退 prev/next 两次调用（`VLLM_ASCEND_CP_BALANCE_MERGED_CALL=0`） |
+| `run_cp_diag.sh l1024` | T4：`--prompt-lens 1024 --cp-balance-min-tokens 1024` |
+| `run_cp_diag.sh check` | CPU 侧判读已有 dump（不需要 NPU） |
+| `run_cp_diag.sh <mode> -n` | 只打印将要执行的命令（`--dry-run` 同效），防止误触发真实运行 |
+| `check_zigzag_dumps.py` | dump 判读：`--kind topk` 判"top-k 是否等于因果集"，`--kind kv` 判"逐 token KV 是否一致" |
+| `compare_cp_rounds.py` | 并排比较多轮 `summary.json`，直接输出"是否回到噪声级"的结论 |
+
+可覆盖的变量：`LAUNCHER` / `PROMPT_LENS` / `MIN_TOKENS` / `OUT_ROOT` / `BASE_PORT` /
+`DUMP_SPEC` / `DUMP_DIR`。典型用法：
+
+```bash
+bash tools/cp_balance_compare/run_cp_diag.sh baseline -n     # 先核对命令
+bash tools/cp_balance_compare/run_cp_diag.sh baseline        # 跑第一轮
+bash tools/cp_balance_compare/run_cp_diag.sh check           # 判 P1/P2
+bash tools/cp_balance_compare/run_cp_diag.sh 2call           # 跑 T1
+python tools/cp_balance_compare/compare_cp_rounds.py \
+    baseline=/dev/shm/cp_ab/r1_baseline 2call=/dev/shm/cp_ab/r2_2call
+```
+
+引擎侧只有一个新开关控制 dump：`VLLM_ASCEND_CP_BALANCE_DUMP`（`kind:layers[,...]`，
+如 `topk:6,kv:0,6`；空=关）。dump 落到 `/dev/shm/cp_balance_dump/`，文件名带
+`cpbal{0|1}`，所以一轮 A/B 的 B/C 两份数据可以同时拿到、互不覆盖。
+
