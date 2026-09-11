@@ -164,7 +164,7 @@ $OUT_ROOT/<round>/
 - **dump 目录会跨轮累积**：判读只取每个 `(layer, rank, cpbal)` 的最新一份，旧文件被忽略（会打印提示），不要求手动清理。
 - **`--kind topk` 对短 prompt 才最有信息量**：长 prompt 下 indexer 不做 `validS2Len < topkCount_` 快捷路径，identity 断言不再适用。
 - driver 需要 `requests` + `numpy`；`check_zigzag_dumps.py` 需要 `torch`（跑在 vLLM 宿主机上）；画图需要 `matplotlib`（缺了只警告跳过）。
-- 非 Linux 主机上 `selftest_mock.py` 会跳过依赖 bash 的 launcher 用例，属预期行为。
+- 非 Linux 主机上，`selftest_mock.py` 里依赖 bash 的 launcher 用例会被跳过（`[skip] bash not usable`）或失败（Windows 上给假 `vllm` 置可执行位无效，`test_shipped_launchers_print_complete_fingerprint` 报 `vllm not found in PATH`），都属宿主差异，不是 driver 的问题。
 
 ## 八、工具与脚本的三条硬要求
 

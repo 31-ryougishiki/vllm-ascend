@@ -260,10 +260,18 @@ def check_host(report: Report, base_port: int, dump_dir: str, out_root: str) -> 
     if shutil.which("npu-smi"):
         info = _run(["npu-smi", "info"], timeout=60.0)
         if info is not None and info.returncode == 0:
-            report.say("[INFO] npu-smi info (前 12 行):")
-            for line in info.stdout.splitlines()[:12]:
+            lines = info.stdout.splitlines()
+            # Each *physical* chip has exactly one "<id> Ascend910..." Name row.
+            chips = sum(1 for line in lines if "Ascend910" in line)
+            report.say("[INFO] npu-smi info (前 16 行):")
+            for line in lines[:16]:
                 report.say(f"         {line}")
-            report.item(PASS, "NPU 可见性", "npu-smi info 正常返回", "8 张卡空闲，无残留进程占卡")
+            report.item(
+                PASS if chips >= 8 else WARN,
+                "NPU 可见性",
+                f"npu-smi 报告 {chips} 个 Ascend910",
+                ">= 8 个 Ascend910 可见（launcher 默认 TP=8、ASCEND_RT_VISIBLE_DEVICES=0..7）",
+            )
         else:
             report.item(WARN, "NPU 可见性", "npu-smi info 执行失败", "8 张卡空闲")
     else:
@@ -422,7 +430,7 @@ def _evaluate_launcher(
         report.item(FAIL, f"配置 {name}", f"launcher 调用异常: {exc}", "见下方期望指纹")
         return
     lines = out.splitlines()
-    fp_line = next((line for line in lines if driver.FINGERPRINT_PREFIX in line), None)
+    fp_line = driver.find_fingerprint(out)
     cfg_line = next((line for line in lines if driver.CFG_JSON_PREFIX in line), None)
     dry_line = next((line for line in lines if "dry-run" in line), "")
     err_lines = [line for line in err.splitlines() if line.strip()]

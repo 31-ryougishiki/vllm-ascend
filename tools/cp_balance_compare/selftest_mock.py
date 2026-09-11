@@ -172,7 +172,16 @@ def test_fingerprint_verification() -> None:
         log = out / "server_C.log"
 
         expected = driver.expected_fingerprint("C", strict)
-        log.write_text("[cp-ab] " + " ".join(f"{key}={value}" for key, value in expected.items()) + "\n")
+        fingerprint = "[cp-ab] " + " ".join(f"{key}={value}" for key, value in expected.items())
+        # Realistic ordering: the shipped launchers print the vendored set_env
+        # note (same "[cp-ab]" prefix) before the fingerprint, and the effective
+        # additional_config after it.
+        log.write_text(
+            "[cp-ab] vendor env: /tmp/fake_vendor/set_env.bash\n"
+            f"{fingerprint}\n"
+            f"[cp-ab-cfg] {json.dumps(driver.expected_additional_config('C', strict))}\n",
+            encoding="utf-8",
+        )
         assert driver.verify_config("C", strict, log)
 
         log.write_text("[cp-ab] CP_BALANCE=0 DSA_CP=1 EMBED_LOCAL=0 SPEC=0 KV=0\n")
@@ -182,6 +191,49 @@ def test_fingerprint_verification() -> None:
         log.write_text("no fingerprint in this log\n")
         _expect_runtime_error(lambda: driver.verify_config("C", strict, log))
         assert driver.verify_config("C", warn, log) is False
+    finally:
+        shutil.rmtree(out, ignore_errors=True)
+
+
+def test_fingerprint_line_ignores_other_cp_ab_lines() -> None:
+    """``[cp-ab]`` is reused for notes; only the CP_BALANCE line is the fingerprint.
+
+    The shipped launchers echo ``[cp-ab] vendor env: ...`` before the
+    fingerprint, and the lookup used to take the first ``[cp-ab]`` match, so
+    ``preflight`` reported every config as unverified (``actual={}``) even when
+    the launcher had in fact applied the env overrides.
+    """
+    text = "\n".join(
+        [
+            "[cp-ab] vendor env: /vllm-workspace/vllm-ascend/.../set_env.bash",
+            "[cp-ab] CP_BALANCE=1 DSA_CP=1 MIN_TOKENS=2048 EMBED_LOCAL=0 SPEC=0 KV=0",
+            '[cp-ab-cfg] {"enable_dsa_cp": true}',
+        ]
+    )
+    assert driver.is_fingerprint_line("[cp-ab] CP_BALANCE=1 DSA_CP=1")
+    assert not driver.is_fingerprint_line("[cp-ab] vendor env: /x/set_env.bash")
+    assert not driver.is_fingerprint_line("[cp-ab-cfg] {}")
+    assert driver.find_fingerprint("no fingerprint here") is None
+
+    line = driver.find_fingerprint(text)
+    assert line is not None and "CP_BALANCE=1" in line
+    assert driver.parse_fingerprint(line) == {
+        "CP_BALANCE": 1,
+        "DSA_CP": 1,
+        "MIN_TOKENS": 2048,
+        "EMBED_LOCAL": 0,
+        "SPEC": 0,
+        "KV": 0,
+    }
+
+    # The log-side lookup used by verify_config must survive the same ordering.
+    out = _temp_dir("cp_ab_fpline_")
+    try:
+        log = out / "server_C.log"
+        log.write_text(text + "\n", encoding="utf-8")
+        from_log = driver.last_fingerprint(log)
+        assert from_log is not None
+        assert driver.parse_fingerprint(from_log) == driver.parse_fingerprint(line)
     finally:
         shutil.rmtree(out, ignore_errors=True)
 
@@ -416,6 +468,9 @@ def test_preflight_with_fake_launcher() -> None:
                     "if [ -n \"$VLLM_ASCEND_SPEC_CONFIG\" ]; then spec=1; fi",
                     "kv=0",
                     "if [ -n \"$VLLM_ASCEND_KV_TRANSFER_CONFIG\" ]; then kv=1; fi",
+                    # Same "[cp-ab]" prefix as the fingerprint, printed first:
+                    # the regression that made preflight report actual={}.
+                    "echo \"[cp-ab] vendor env: /tmp/fake_vendor/set_env.bash\"",
                     "echo \"[cp-ab] CP_BALANCE=${VLLM_ASCEND_CP_BALANCE} DSA_CP=${dsa} "
                     "MIN_TOKENS=${VLLM_ASCEND_CP_BALANCE_MIN_TOKENS} "
                     "EMBED_LOCAL=${VLLM_ASCEND_CP_BALANCE_EMBED_LOCAL} SPEC=${spec} KV=${kv}\"",
@@ -523,7 +578,7 @@ def test_shipped_launchers_print_complete_fingerprint() -> None:
                     return
                 text = proc.stdout + proc.stderr
                 assert proc.returncode == 0, f"{launcher} {config}: rc={proc.returncode}\n{text}"
-                line = next((item for item in text.splitlines() if driver.FINGERPRINT_PREFIX in item), None)
+                line = driver.find_fingerprint(text)
                 assert line is not None, f"{launcher} {config}: no fingerprint line\n{text}"
                 assert driver.parse_fingerprint(line) == driver.expected_fingerprint(config, args), (
                     f"{launcher} {config}: fingerprint mismatch\n  got      {driver.parse_fingerprint(line)}\n"

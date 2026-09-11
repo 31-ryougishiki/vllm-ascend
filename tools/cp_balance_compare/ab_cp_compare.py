@@ -228,6 +228,25 @@ def parse_fingerprint(line: str) -> dict[str, int]:
     return result
 
 
+def is_fingerprint_line(line: str) -> bool:
+    """True only for the launcher's ``[cp-ab] CP_BALANCE=...`` line.
+
+    The same prefix is reused for other notes -- the launcher prints
+    ``[cp-ab] vendor env: ...`` *before* the fingerprint -- so matching the bare
+    prefix picks the wrong line and makes every config look unverified.
+    Requiring the first compared field keeps the match unambiguous.
+    """
+    return FINGERPRINT_PREFIX in line and "CP_BALANCE=" in line
+
+
+def find_fingerprint(text: str) -> str | None:
+    """First fingerprint line of ``text`` (launcher stdout or a server log)."""
+    for line in text.splitlines():
+        if is_fingerprint_line(line):
+            return line
+    return None
+
+
 def last_fingerprint(log_path: Path) -> str | None:
     if not log_path.exists():
         return None
@@ -236,7 +255,7 @@ def last_fingerprint(log_path: Path) -> str | None:
     except OSError:
         return None
     for line in reversed(lines):
-        if FINGERPRINT_PREFIX in line:
+        if is_fingerprint_line(line):
             return line
     return None
 
@@ -1151,7 +1170,7 @@ def preflight(args: argparse.Namespace, names: list[str]) -> int:
     failed = []
     for name in names:
         rc, out, err = _launcher_dry_run(args, name)
-        line = next((item for item in out.splitlines() if FINGERPRINT_PREFIX in item), None)
+        line = find_fingerprint(out)
         actual = parse_fingerprint(line) if line else {}
         expected = expected_fingerprint(name, args)
         cfg_line = next((item for item in out.splitlines() if CFG_JSON_PREFIX in item), None)
