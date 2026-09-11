@@ -69,12 +69,16 @@ dump_dir="${DUMP_DIR:-/dev/shm/cp_balance_dump}"
 
 round_name=""
 extra_env=()
+# True only when this round actually injects the DUMP env (2call deliberately
+# does not), so the "no dump was produced" guard cannot fire a false alarm.
+dump_active=false
 
 case "${mode}" in
   baseline)
     round_name="r1_baseline"
     if [[ -n "${dump_spec}" ]]; then
       extra_env+=(--env "VLLM_ASCEND_CP_BALANCE_DUMP=${dump_spec}")
+      dump_active=true
     fi
     ;;
   2call)
@@ -87,6 +91,7 @@ case "${mode}" in
     min_tokens="1024"
     if [[ -n "${dump_spec}" ]]; then
       extra_env+=(--env "VLLM_ASCEND_CP_BALANCE_DUMP=${dump_spec}")
+      dump_active=true
     fi
     ;;
   sweep)
@@ -102,6 +107,7 @@ case "${mode}" in
     out_root="${OUT_ROOT:-/dev/shm/cp_ab_sweep}"
     if [[ -n "${dump_spec}" ]]; then
       extra_env+=(--env "VLLM_ASCEND_CP_BALANCE_DUMP=${dump_spec}")
+      dump_active=true
     fi
     ;;
   check)
@@ -148,16 +154,36 @@ if [[ "${dry_run}" == true ]]; then
 fi
 
 # 一轮 = 2~3 次模型加载，先把已有 dump 归档，避免和上一轮混淆
-if [[ -n "${dump_spec}" && "${mode}" == "baseline" && -d "${dump_dir}" ]]; then
-  kept=$(find "${dump_dir}" -maxdepth 1 -name '*.pt' | wc -l)
-  if (( kept > 0 )); then
-    echo "[run_cp_diag] note: ${dump_dir} already holds ${kept} dump(s);"
+dump_before=0
+if [[ "${dump_active}" == true && -d "${dump_dir}" ]]; then
+  dump_before=$(find "${dump_dir}" -maxdepth 1 -name '*.pt' | wc -l)
+  if (( dump_before > 0 )); then
+    echo "[run_cp_diag] note: ${dump_dir} already holds ${dump_before} dump(s);"
     echo "[run_cp_diag]       the newest one per (layer, rank, cp_balance) wins, older ones are ignored."
   fi
 fi
 
 "${cmd[@]}"
 rc=$?
+
+# 一轮 20+ 分钟，最不该发生的失败是"跑完了但没有 dump"：判读没有数据，而日志里
+# 可能只有一条容易被刷掉的 warning。这里明确报出来并把退出码标成 3。
+if [[ "${dump_active}" == true ]]; then
+  dump_after=$(find "${dump_dir}" -maxdepth 1 -name '*.pt' 2>/dev/null | wc -l)
+  if (( dump_after <= dump_before )); then
+    echo "[run_cp_diag] ERROR: DUMP_SPEC=${dump_spec} 但这一轮没有产生任何 dump（dir=${dump_dir}，之前 ${dump_before} 个）" >&2
+    echo "[run_cp_diag]        判读没有数据；去 server 日志里找这几类线索：" >&2
+    echo "[run_cp_diag]          - [CP_BALANCE][dump] ... -> path         （说明真的写了）" >&2
+    echo "[run_cp_diag]          - dump_no_layer_idx / could not be parsed（layer 名解析失败）" >&2
+    echo "[run_cp_diag]          - dump prep failed / natural-order ...    （dump 准备阶段抛错）" >&2
+    echo "[run_cp_diag]          - 一条都没有                                （DUMP 环境变量没到 worker）" >&2
+    if (( rc == 0 )); then
+      rc=3
+    fi
+  else
+    echo "[run_cp_diag] dump: +$((dump_after - dump_before)) file(s) under ${dump_dir}"
+  fi
+fi
 
 echo
 echo "[run_cp_diag] round finished (rc=${rc}); analyse with:"

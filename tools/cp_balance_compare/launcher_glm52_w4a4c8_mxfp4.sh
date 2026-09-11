@@ -210,6 +210,9 @@ if [ -n "${kv_config}" ]; then kv_flag=1; fi
 echo "[cp-ab] CP_BALANCE=${VLLM_ASCEND_CP_BALANCE} DSA_CP=${dsa_cp} MIN_TOKENS=${VLLM_ASCEND_CP_BALANCE_MIN_TOKENS} EMBED_LOCAL=${VLLM_ASCEND_CP_BALANCE_EMBED_LOCAL} SPEC=${spec_flag} KV=${kv_flag}"
 # Effective additional_config, verified verbatim by ab_cp_compare.py --config-check.
 echo "[cp-ab-cfg] ${additional_config}"
+# Diagnostic dump switch: the driver injects it per round; echoing it here makes
+# "round finished but no dump was written" traceable to the env that was applied.
+echo "[cp-ab] DUMP=${VLLM_ASCEND_CP_BALANCE_DUMP:-<unset>}"
 
 port="${2:-${1:-8034}}"
 

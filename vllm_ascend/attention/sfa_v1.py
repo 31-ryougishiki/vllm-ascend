@@ -270,7 +270,10 @@ def _parse_dump_spec(raw: Any) -> dict[str, set[int]]:
             )
             continue
         if token.lower() == "all":
-            spec[current] = set(_ZIGZAG_ALL_LAYERS)
+            # Share the module-level set instead of copying it: the SFA is
+            # constructed once per layer per worker, and a fresh 2**20-element
+            # set per instance costs tens of MB each (78 layers x 16 workers).
+            spec[current] = _ZIGZAG_ALL_LAYERS
             continue
         try:
             spec[current].add(int(token))
