@@ -18,7 +18,7 @@
 # tools/cp_balance_compare/ab_cp_compare.py.
 #
 # It is a drop-in replacement for
-# /opt/its/z30055003/script/start_server_prefill-w4a4c8-mxfp4.sh with two extra
+# /home/z30055003/script/start_server_prefill-w4a4c8-mxfp4.sh with two extra
 # properties required by the B/C driver:
 #   1. every cp_balance knob can be overridden through the environment,
 #   2. it prints one "[cp-ab] ..." fingerprint line (--config-check).
@@ -36,9 +36,9 @@
 # SITE section: adapt these to the machine.
 # ---------------------------------------------------------------------------
 NIC_NAME="${NIC_NAME:-eth2}"
-LOCAL_IP="${LOCAL_IP:-7.246.78.76}"
-VLLM_ASCEND_REPO="${VLLM_ASCEND_REPO:-/opt/its/z30055003/vllm-ascend}"
-MODEL_PATH="${MODEL_PATH:-/opt/its/model/GLM-5.2-W4A8C8}"
+LOCAL_IP="${LOCAL_IP:-141.61.133.104}"
+VLLM_ASCEND_REPO="${VLLM_ASCEND_REPO:-/home/z30055003/vllm-ascend}"
+MODEL_PATH="${MODEL_PATH:-/mnt/share/weights/GLM-5.2-w4a4c8-mxfp4}"
 # Vendor environment that must be sourced before `vllm serve` (CANN custom
 # transformer ops).  It is a build artifact of a vllm-ascend checkout
 # (vllm_ascend/_cann_ops_custom/vendors/... is not in git), so the candidates
@@ -47,6 +47,7 @@ MODEL_PATH="${MODEL_PATH:-/opt/its/model/GLM-5.2-W4A8C8}"
 #   VENDOR_SET_ENV=                      -> skip the vendor env entirely
 #   VENDOR_SET_ENV=/path/to/set_env.bash -> use exactly that file
 VENDOR_SET_ENV_FALLBACKS=(
+  "/mnt/share/l00622059/vendors/custom_transformer/bin/set_env.bash"
   "/vllm-workspace/vllm-ascend/vllm_ascend/_cann_ops_custom/vendors/custom_transformer/bin/set_env.bash"
   "${VLLM_ASCEND_REPO}/vllm_ascend/_cann_ops_custom/vendors/custom_transformer/bin/set_env.bash"
 )
@@ -61,7 +62,7 @@ if [ -z "${VENDOR_SET_ENV+set}" ]; then
     fi
   done
 fi
-PROFILER_DIR="${PROFILER_DIR:-/opt/its/z30055003/profiling_no_pooling}"
+PROFILER_DIR="${PROFILER_DIR:-/home/z30055003/profiling_no_pooling}"
 
 # ---------------------------------------------------------------------------
 # Site environment (same as the original prefill script).
