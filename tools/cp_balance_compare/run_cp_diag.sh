@@ -11,10 +11,12 @@
 # 可覆盖的环境变量：
 #   LAUNCHER     默认 bash tools/cp_balance_compare/launcher_glm52_w4a4c8_mxfp4.sh {port}
 #   PROMPT_LENS  默认 2048,2049,4096        MIN_TOKENS 默认 2048
+#   REPEAT_A     默认 1（=0 跳过 B2 重复跑：少一次模型加载。噪声地板已确认是 0 时可用，
+#                此时 driver 的阈值仍是 max(0.05, 5×0)=0.05，各 case 指标不受影响）
 #   TP_SIZE      默认 16（launcher 的 tensor-parallel-size，同时决定 zigzag 的 cp_size）
 #   CP_SIZE      默认取 TP_SIZE（driver 的 --cp-size，必须等于 TP_SIZE）
 #   OUT_ROOT     默认 /dev/shm/cp_ab        BASE_PORT  默认 8034
-#   DUMP_SPEC    默认 topk:6,kv:0,6（置空=不 dump）
+#   DUMP_SPEC    默认 topk:6,kv:0,6（置空=不 dump；支持 kv:all / topk:all）
 #   DUMP_DIR     默认 /dev/shm/cp_balance_dump
 #
 # 说明：digest 变量在 B/C 两个 server 上取值相同，dump 文件名自带 cpbal{0|1}，
@@ -52,6 +54,7 @@ launcher="${LAUNCHER:-bash tools/cp_balance_compare/launcher_glm52_w4a4c8_mxfp4.
 prompt_lens="${PROMPT_LENS:-2048,2049,4096}"
 min_tokens="${MIN_TOKENS:-2048}"
 cp_size="${CP_SIZE:-${TP_SIZE:-16}}"
+repeat_a="${REPEAT_A:-1}"
 out_root="${OUT_ROOT:-/dev/shm/cp_ab}"
 base_port="${BASE_PORT:-8034}"
 dump_spec="${DUMP_SPEC:-topk:6,kv:0,6}"
@@ -93,19 +96,24 @@ esac
 out="${out_root}/${round_name}"
 cmd=(python "${driver}"
      --launcher "${launcher}"
-     --configs B,C --repeat-a
+     --configs B,C
      --prompt-lens "${prompt_lens}"
      --cp-balance-min-tokens "${min_tokens}"
      --cp-size "${cp_size}"
      --base-port "${base_port}"
      --config-check strict --zigzag-check strict --on-zigzag-miss skip
      --out "${out}")
+# B2 (the noise-floor repeat) is a full extra model load: skip it when the
+# caller already knows the floor (see REPEAT_A in the header).
+if [[ "${repeat_a}" != "0" ]]; then
+  cmd+=(--repeat-a)
+fi
 if (( ${#extra_env[@]} )); then
   cmd+=("${extra_env[@]}")
 fi
 
 echo "[run_cp_diag] mode=${mode} round=${round_name}"
-echo "[run_cp_diag] prompt_lens=${prompt_lens} min_tokens=${min_tokens} cp_size=${cp_size} out=${out}"
+echo "[run_cp_diag] prompt_lens=${prompt_lens} min_tokens=${min_tokens} cp_size=${cp_size} repeat_a=${repeat_a} out=${out}"
 [[ -n "${dump_spec}" ]] && echo "[run_cp_diag] dump=${dump_spec} dir=${dump_dir}"
 
 if [[ "${dry_run}" == true ]]; then

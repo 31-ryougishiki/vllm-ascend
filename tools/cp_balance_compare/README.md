@@ -61,7 +61,7 @@ prompt 默认是确定性随机 token-id（`--seed 1234`，词表 10 万），�
 ### L3 — CPU 侧判读（不需要 NPU）
 
 - `check_zigzag_dumps.py --kind topk` → **P1**：对短于 `sparse_count` 的 prompt，LightningIndexer 每行有效前缀应当恰好是因果窗口 `{0..valid-1}`（identity 或仅顺序不同的同一集合）。有效集合缺项 ⇒ indexer 让 SFA 关注的位置少于因果窗口要求。
-- `check_zigzag_dumps.py --kind kv` → **P2**：dump 按自然 token 顺序存 packed KV，所以 cpbal0 的第 p 行与 cpbal1 的第 p 行是同一个 token，可逐字节比较。首个不同的 layer/token 就是两种排布第一次分歧的地方。
+- `check_zigzag_dumps.py --kind kv` → **P2**：dump 按自然 token 顺序存 packed KV，所以 cpbal0 的第 p 行与 cpbal1 的第 p 行是同一个 token，可逐字节比较。首个不同的 layer/token 就是两种排布第一次分歧的地方。做**多层扫描**（`DUMP_SPEC=kv:all`）时加 `--summary-only`：只打印每层一行的紧凑表（`ranks_diff / rows_differ / first_token / max|int8|`）并直接给出 `FIRST DIVERGENCE: layer L`——因为第 L 层的 KV 是"第 L 层输入隐状态"的投影，分歧实际是在 **L−1 层的输出**里进入的。
 - `compare_cp_rounds.py baseline=... 2call=...` → 各轮指标并排 + 结论：最后一轮的 `C-B` 是否全部回到噪声级。
 
 dump 由 `vllm_ascend/attention/sfa_v1.py` 写，开关是 `VLLM_ASCEND_CP_BALANCE_DUMP`（语法 `kind:layers[,...]`，如 `topk:6,kv:0,6`、`topk:all`；空值=关），落在 `/dev/shm/cp_balance_dump`，文件名 `<kind>_cpbal<N>_layer<L>_rank<R>_pid<P>_<ts>.pt`——自带 cp_balance 标记，所以**一轮 A/B 的 B 与 C 数据可以同时收**，且多轮共用一个目录不会互相覆盖（判读时按 `(layer, rank, cpbal)` 取最新一份）。
@@ -138,7 +138,9 @@ python tools/cp_balance_compare/compare_cp_rounds.py \
 python tools/cp_balance_compare/selfcheck.py --collect
 ```
 
-常用覆盖（`run_cp_diag.sh` 的环境变量）：`PROMPT_LENS`、`MIN_TOKENS`、`TP_SIZE`（launcher 的 TP，默认 16）、`CP_SIZE`（driver 的 `--cp-size`，默认取 `TP_SIZE`）、`OUT_ROOT`、`BASE_PORT`、`DUMP_SPEC`（置空=不 dump）、`DUMP_DIR`、`LAUNCHER`。
+常用覆盖（`run_cp_diag.sh` 的环境变量）：`PROMPT_LENS`、`MIN_TOKENS`、`TP_SIZE`（launcher 的 TP，默认 16）、`CP_SIZE`（driver 的 `--cp-size`，默认取 `TP_SIZE`）、`REPEAT_A`（默认 1；`REPEAT_A=0` 跳过 B2 重复跑，**省一次模型加载**，噪声地板已知为 0 时用）、`OUT_ROOT`、`BASE_PORT`、`DUMP_SPEC`（置空=不 dump；支持 `kv:all` / `topk:all`）、`DUMP_DIR`、`LAUNCHER`。
+
+> **一轮的成本结构**：几乎全在模型加载（本机 TP=16 约 10 分钟/次），推理只要 ~2 秒/条。所以"加长度/加 dump 层数"几乎免费，而"多跑一个配置"（B2、2call）就是 +10 分钟。诊断轮按这个取舍：`REPEAT_A=0 DUMP_SPEC=kv:all` 是 2 次加载 + 全层数据。
 
 已经有 server 在跑时，可以跳过拉起，直接驱动两个/三个地址（注意此模式无法读 server 日志，指纹与 zigzag 检查会被跳过）：
 

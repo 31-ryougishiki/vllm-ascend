@@ -20,6 +20,11 @@ causal window requires.
 order, so row ``p`` of a cpbal0 dump and row ``p`` of a cpbal1 dump are the same
 token and can be compared byte for byte.  The first differing layer/token is the
 first place where the two layouts disagree.
+
+For a **multi-layer sweep** (``VLLM_ASCEND_CP_BALANCE_DUMP=kv:all``) use
+``--summary-only``: it prints one compact table row per layer
+(``ranks_diff / rows_differ / first_token / max|int8|``), names the first layer
+whose KV already differs, and skips the per-pair detail.
 """
 
 from __future__ import annotations
@@ -135,11 +140,14 @@ def check_topk(args) -> int:
         return 2
     latest, counts = _latest_per_server(files)
     failures = 0
+    ignored = 0
     for key in sorted(latest):
         path, meta = latest[key]
         if counts[key] > 1:
-            print(f"[topk] {counts[key] - 1} older dump(s) for layer={key[0]} rank={key[1]} "
-                  f"cpbal{key[2]} ignored (keeping the newest)")
+            ignored += counts[key] - 1
+            if not args.summary_only:
+                print(f"[topk] {counts[key] - 1} older dump(s) for layer={key[0]} rank={key[1]} "
+                      f"cpbal{key[2]} ignored (keeping the newest)")
         payload = _load(path)
         topk = payload.get("topk_indices")
         if not isinstance(topk, torch.Tensor):
@@ -148,15 +156,17 @@ def check_topk(args) -> int:
         flat = topk.reshape(topk.shape[0], -1)
         rows, width = flat.shape
         positions, kv_lens, shape = _row_windows(payload)
-        print(
-            f"\n[topk] {os.path.basename(path)}\n"
-            f"       cp_balance={meta['cpbal']} layer={meta['layer']} rank={meta['rank']} "
-            f"call={shape} rows={rows} width={width} windows={len(positions)}"
-        )
+        if not args.summary_only:
+            print(
+                f"\n[topk] {os.path.basename(path)}\n"
+                f"       cp_balance={meta['cpbal']} layer={meta['layer']} rank={meta['rank']} "
+                f"call={shape} rows={rows} width={width} windows={len(positions)}"
+            )
         if not positions:
-            print("       no query metadata in dump; cannot verify rows")
+            if not args.summary_only:
+                print("       no query metadata in dump; cannot verify rows")
             continue
-        if len(positions) != rows:
+        if len(positions) != rows and not args.summary_only:
             print(f"       WARNING: {len(positions)} expected rows vs {rows} dumped rows")
         checked = identity = set_only = bad = 0
         first_bad = None
@@ -177,7 +187,14 @@ def check_topk(args) -> int:
                 missing = sorted(set(expected) - set(entries))
                 extra = sorted(set(entries) - set(expected))
                 first_bad = (row, valid, missing[:8], extra[:8], tail[:4])
-        print(f"       rows checked={checked} identity={identity} set-only={set_only} mismatched={bad}")
+        if args.summary_only:
+            print(
+                f"[topk] layer={meta['layer']} rank={meta['rank']} cpbal={meta['cpbal']} "
+                f"call={shape} rows={rows} width={width} identity={identity} "
+                f"set-only={set_only} mismatched={bad}"
+            )
+        else:
+            print(f"       rows checked={checked} identity={identity} set-only={set_only} mismatched={bad}")
         if bad:
             failures += 1
             row, valid, missing, extra, tail = first_bad
@@ -185,8 +202,10 @@ def check_topk(args) -> int:
                 f"       first mismatch: row={row} valid={valid} "
                 f"missing={missing} extra={extra} tail_after_valid={tail}"
             )
-        else:
+        elif not args.summary_only:
             print("       OK: every row's valid prefix is exactly the causal window")
+    if ignored and args.summary_only:
+        print(f"[topk] {ignored} older dump(s) ignored (newest per (layer, rank, cp_bal) wins)")
     print()
     if failures:
         print(f"[topk] RESULT: {failures} dump(s) with mismatched rows -> P1 violated (indexer/plumbing)")
@@ -203,6 +222,56 @@ def _kv_rows(payload: dict) -> list[bytes]:
     return [bytes(raw[i].tolist()) for i in range(raw.shape[0])]
 
 
+def _max_nope_diff(left_rows: list[bytes], right_rows: list[bytes], diff_rows: list[int]) -> int:
+    """Max ``|int8|`` difference over the packed nope part of the differing rows.
+
+    The first 512 bytes of a packed row are the quantized nope part, so the
+    magnitude is readable directly in quantization steps.
+    """
+    left = torch.frombuffer(
+        bytearray(b"".join(left_rows[i][:512] for i in diff_rows)), dtype=torch.int8
+    ).to(torch.int16)
+    right = torch.frombuffer(
+        bytearray(b"".join(right_rows[i][:512] for i in diff_rows)), dtype=torch.int8
+    ).to(torch.int16)
+    return int((left - right).abs().max().item())
+
+
+def _print_kv_summary(per_layer: dict[int, dict], ignored: int) -> None:
+    """One compact table for a whole sweep, plus the decisive judgement line."""
+    print()
+    if ignored:
+        print(f"[kv] {ignored} older dump(s) ignored (newest per (layer, rank, cp_bal) wins)")
+    print(f"[kv] {'layer':>5}  {'ranks_diff':>10}  {'rows_differ':>13}  {'first_token':>11}  {'max|int8|':>9}")
+    first_layer = None
+    for layer in sorted(per_layer):
+        stats = per_layer[layer]
+        if not stats["compared"]:
+            continue
+        rows = stats["rows"]
+        span = f"{min(rows)}-{max(rows)}" if rows else "-"
+        first = "-" if stats["first"] is None else str(stats["first"])
+        print(
+            f"[kv] {layer:>5}  {stats['differ']:>4}/{stats['compared']:<5}  {span:>13}  "
+            f"{first:>11}  {stats['max']:>9}"
+        )
+        if stats["differ"] and first_layer is None:
+            first_layer = layer
+    if first_layer is None:
+        print("[kv] FIRST DIVERGENCE: none -- every compared (layer, rank) is bit-identical")
+        return
+    stats = per_layer[first_layer]
+    print(
+        f"[kv] FIRST DIVERGENCE: layer {first_layer} is the first layer whose KV already differs "
+        f"({stats['differ']}/{stats['compared']} ranks, first token {stats['first']}, "
+        f"max|int8| {stats['max']})"
+    )
+    print(
+        f"[kv] -> 该层 KV 是「该层输入隐状态」的投影，所以分歧是在上一层（layer {first_layer - 1}）"
+        "的输出里进入的；下一步按这一层去定位是哪一步先不等"
+    )
+
+
 def check_kv(args) -> int:
     files = list(_iter_dumps(args.dir, "kv"))
     if not files:
@@ -210,20 +279,27 @@ def check_kv(args) -> int:
         return 2
     latest, counts = _latest_per_server(files)
     by_layer: dict[tuple[int, int], dict[str, tuple[str, dict]]] = defaultdict(dict)
+    ignored = 0
     for key in sorted(latest):
         layer, rank, cpbal = key
         path, meta = latest[key]
         if counts[key] > 1:
-            print(f"[kv] {counts[key] - 1} older dump(s) for layer={layer} rank={rank} "
-                  f"cpbal{cpbal} ignored (keeping the newest)")
+            ignored += counts[key] - 1
+            if not args.summary_only:
+                print(f"[kv] {counts[key] - 1} older dump(s) for layer={layer} rank={rank} "
+                      f"cpbal{cpbal} ignored (keeping the newest)")
         by_layer[(layer, rank)][cpbal] = (path, _load(path))
+    per_layer: dict[int, dict] = defaultdict(
+        lambda: {"compared": 0, "differ": 0, "rows": [], "first": None, "max": 0}
+    )
     failures = 0
     for (layer, rank), variants in sorted(by_layer.items()):
         if len(variants) < 2:
-            print(
-                f"[kv] layer={layer} rank={rank}: only cp_balance="
-                f"{sorted(variants)} dumped, need both 0 (B) and 1 (C) to compare"
-            )
+            if not args.summary_only:
+                print(
+                    f"[kv] layer={layer} rank={rank}: only cp_balance="
+                    f"{sorted(variants)} dumped, need both 0 (B) and 1 (C) to compare"
+                )
             continue
         keys = sorted(variants)
         left_key, right_key = keys[0], keys[-1]
@@ -233,33 +309,41 @@ def check_kv(args) -> int:
         right_rows = _kv_rows(right)
         n = min(len(left_rows), len(right_rows))
         diff_rows = [idx for idx in range(n) if left_rows[idx] != right_rows[idx]]
-        print(
-            f"\n[kv] layer={layer} rank={rank} cpbal{left_key} vs cpbal{right_key}: "
-            f"rows {len(left_rows)} vs {len(right_rows)}, differing rows={len(diff_rows)}"
-        )
-        if len(left_rows) != len(right_rows):
+        stats = per_layer[layer]
+        stats["compared"] += 1
+        stats["rows"].append(len(diff_rows))
+        if not args.summary_only:
+            print(
+                f"\n[kv] layer={layer} rank={rank} cpbal{left_key} vs cpbal{right_key}: "
+                f"rows {len(left_rows)} vs {len(right_rows)}, differing rows={len(diff_rows)}"
+            )
+        if len(left_rows) != len(right_rows) and not args.summary_only:
             print("     WARNING: row counts differ (num_actual_tokens/shape mismatch)")
         if diff_rows:
             failures += 1
+            stats["differ"] += 1
             first = diff_rows[0]
-            lb = left_rows[first]
-            rb = right_rows[first]
-            byte_diff = sum(1 for a, b in zip(lb, rb) if a != b)
-            # The first 512 bytes of the packed row are the quantized nope part:
-            # compare them as signed int8 for a magnitude estimate.
-            li = torch.frombuffer(bytearray(lb[:512]), dtype=torch.int8).float()
-            ri = torch.frombuffer(bytearray(rb[:512]), dtype=torch.int8).float()
-            print(
-                f"     first differing token={first} bytes_differing={byte_diff}/{len(lb)} "
-                f"max|int8(nope) diff|={float((li - ri).abs().max()):.1f}"
-            )
-            print(f"     B file: {os.path.basename(left_path)}")
-            print(f"     C file: {os.path.basename(right_path)}")
-        else:
+            stats["first"] = first if stats["first"] is None else min(stats["first"], first)
+            max_diff = _max_nope_diff(left_rows, right_rows, diff_rows)
+            stats["max"] = max(stats["max"], max_diff)
+            if not args.summary_only:
+                lb = left_rows[first]
+                rb = right_rows[first]
+                byte_diff = sum(1 for a, b in zip(lb, rb) if a != b)
+                print(
+                    f"     first differing token={first} bytes_differing={byte_diff}/{len(lb)} "
+                    f"max|int8(nope) diff|={float(_max_nope_diff(left_rows, right_rows, [first])):.1f}"
+                    f"  all-differing-rows max|int8|={max_diff}"
+                )
+                print(f"     B file: {os.path.basename(left_path)}")
+                print(f"     C file: {os.path.basename(right_path)}")
+        elif not args.summary_only:
             print("     OK: identical packed KV for every token")
+    _print_kv_summary(per_layer, ignored)
     print()
     if failures:
-        print(f"[kv] RESULT: {failures} layer(s) differ -> P2 violated (a token's KV content is not layout invariant)")
+        print(f"[kv] RESULT: {failures} (layer, rank) pair(s) differ -> P2 violated "
+              "(a token's KV content is not layout invariant)")
         return 1
     print("[kv] RESULT: P2 holds on the dumped layers (per-token KV identical across layouts)")
     return 0
@@ -277,6 +361,12 @@ def main(argv=None) -> int:
     parser.add_argument("--dir", default="/dev/shm/cp_balance_dump", help="dump directory")
     parser.add_argument("--kind", choices=("topk", "kv", "both"), default="both")
     parser.add_argument("--list", action="store_true", help="only list the dumps found")
+    parser.add_argument(
+        "--summary-only",
+        action="store_true",
+        help="print only the compact tables (kv: per-layer rows/ranks/first token/max|int8|; "
+        "topk: one line per dump) plus the RESULT lines -- use this for a multi-layer sweep",
+    )
     args = parser.parse_args(argv)
 
     if args.list or not os.path.isdir(args.dir):

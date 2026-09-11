@@ -48,6 +48,10 @@ def _load(name: str, filename: str):
 driver = _load("cp_balance_ab_cp_compare", "ab_cp_compare.py")
 mock = _load("cp_balance_mock_vllm_server", "mock_vllm_server.py")
 single = _load("cp_balance_run_single", "run_single.py")
+try:
+    checker = _load("cp_balance_check_zigzag_dumps", "check_zigzag_dumps.py")
+except ImportError:  # pragma: no cover - only the dump checker needs torch
+    checker = None
 
 
 def _temp_dir(prefix: str) -> Path:
@@ -360,6 +364,61 @@ def test_run_single_rejects_unknown_config() -> None:
         rc = single.main(["--config", "A", "--url", "http://127.0.0.1:1"])
     assert rc == 2
     assert "不支持" in buffer.getvalue()
+
+
+def test_check_zigzag_kv_summary_names_first_diverging_layer() -> None:
+    """A multi-layer sweep must print one table row per layer and name the first one.
+
+    The sweep is the expensive round's payload (``DUMP_SPEC=kv:all``), so the
+    summary has to be readable: per-layer ranks/rows/first-token/magnitude plus a
+    single decisive "FIRST DIVERGENCE" line.
+    """
+    if checker is None:
+        print("[skip] torch not available (check_zigzag_dumps needs it)")
+        return
+    import argparse
+
+    import torch
+
+    out = _temp_dir("cp_ab_kvsummary_")
+    try:
+        base = torch.randint(-120, 120, (256, 64), dtype=torch.int8)
+
+        def dump(layer: int, rank: int, cpbal: int, tensor, ts: int) -> None:
+            torch.save(
+                {"kv_nat": tensor.clone().view(torch.uint8)},
+                out / f"kv_cpbal{cpbal}_layer{layer}_rank{rank}_pid{100 + rank}_{ts}.pt",
+            )
+
+        for rank in range(2):
+            for layer in (0, 1):
+                dump(layer, rank, 0, base, 1000)
+            dump(0, rank, 1, base, 1001)
+            shifted = base.clone()
+            shifted[64:, :32] = (shifted[64:, :32].to(torch.int16) + 2).to(torch.int8)
+            dump(1, rank, 1, shifted, 1001)
+
+        args = argparse.Namespace(dir=str(out), summary_only=True)
+        buffer = io.StringIO()
+        with redirect_stdout(buffer):
+            rc = checker.check_kv(args)
+        text = buffer.getvalue()
+        assert rc == 1, text
+        assert "FIRST DIVERGENCE: layer 1" in text, text
+        assert "first token 64" in text, text
+        assert "max|int8| 2" in text, text
+
+        # Identical layouts must report no divergence at all.
+        for rank in range(2):
+            dump(1, rank, 1, base, 1002)
+        buffer = io.StringIO()
+        with redirect_stdout(buffer):
+            rc = checker.check_kv(args)
+        text = buffer.getvalue()
+        assert rc == 0, text
+        assert "FIRST DIVERGENCE: none" in text, text
+    finally:
+        shutil.rmtree(out, ignore_errors=True)
 
 
 def test_load_prompts_file() -> None:
