@@ -101,7 +101,12 @@ plog_dir="${PWD}/$(date +%Y%m%d_%H%M%S)/plog"
 mkdir -p "${plog_dir}"
 export ASCEND_PROCESS_LOG_PATH="${plog_dir}"
 
-export VLLM_USE_FASTOKENS="${VLLM_USE_FASTOKENS:-1}"
+# NOTE: fastokens (VLLM_USE_FASTOKENS) is deliberately NOT used by this
+# launcher: the B/C comparison is tokenizer-sensitive and must run on the stock
+# HF tokenizer.  /root/.bashrc is sourced above and may still export it, so it is
+# dropped explicitly instead of relying on the vllm default (which is off).
+unset VLLM_USE_FASTOKENS
+
 if [ -n "${VENDOR_SET_ENV}" ] && [ -f "${VENDOR_SET_ENV}" ]; then
   # shellcheck disable=SC1090
   # Vendor setup scripts may also reference unset variables.
