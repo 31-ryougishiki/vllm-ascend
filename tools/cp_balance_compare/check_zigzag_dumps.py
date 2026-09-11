@@ -1136,6 +1136,14 @@ def check_act(args) -> int:
     quant_clean = _clean("gu_q")
     gu_out_clean = _clean("gu_out")
     dn_q_clean = _clean("dn_q")
+    if op in ("gu_q", "gu_out", "dn_in", "dn_q", "mlp_out"):
+        # The whole point of the MLP trace is the (qin, GEMM-out) pairing; if the
+        # spec did not trace one of them, say so instead of leaving the reader to
+        # notice a missing row on their own.
+        absent = [name for name in ("mlp_in", "gu_q", "gu_out", "dn_q", "mlp_out") if name not in same_layer]
+        if absent:
+            print(f"[act] 注意: layer {layer} 缺 {', '.join(absent)} 行（spec 未打点对应 kind）"
+                  f"⇒ 「量化 vs GEMM」的区分不完整；要完整对照请用 probe 的默认 spec")
     if op == "in":
         if layer == 0:
             print("[act] -> layer 0 的输入是 embedding（与排布无关）却在两种排布下不同："

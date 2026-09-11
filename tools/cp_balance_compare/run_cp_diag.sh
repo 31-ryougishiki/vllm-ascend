@@ -184,7 +184,9 @@ check_kind="both"
 check_extra=""
 if [[ "${mode}" == "probe" ]]; then
   check_kind="act"
-  check_extra=" --summary-only"
+  # Keep the preview identical to the judged command in README/HANDOVER:
+  # --block-size 128 is what turns "first differing token" into "which zigzag block".
+  check_extra=" --summary-only --block-size 128"
 fi
 
 if [[ "${dry_run}" == true ]]; then

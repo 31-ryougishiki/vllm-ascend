@@ -529,7 +529,13 @@ def test_cp_balance_modules_import_locally_used_stdlib() -> None:
     stdlib = {"os", "sys", "time", "math", "json", "shutil", "glob", "re", "threading"}
     repo = HERE.parent.parent
     problems: list[str] = []
-    for relative in ("vllm_ascend/attention/sfa_v1.py", "vllm_ascend/envs.py"):
+    # ``model_runner_v1.py`` hosts the MLP/quant dump installers, i.e. the code
+    # most likely to grow a function-local import we forget to declare.
+    for relative in (
+        "vllm_ascend/attention/sfa_v1.py",
+        "vllm_ascend/envs.py",
+        "vllm_ascend/worker/model_runner_v1.py",
+    ):
         path = repo / relative
         if not path.is_file():
             continue
@@ -1087,6 +1093,9 @@ def test_check_zigzag_act_qin_separates_quant_from_gemm() -> None:
         text = run()
         assert "[act] FIRST DIVERGENCE (act): layer 0 op=gu_out at token 4" in text, text
         assert "GEMM 内核本身" in text, text
+        # Only mlpin/guq/guout were written: the verdict must say the pairing is
+        # incomplete instead of letting a missing row pass as "compared".
+        assert "区分不完整" in text, text
 
         # 2) the quantization itself differs from token 4 on -> that row wins.
         for cpbal, (q, s) in ((0, (q_same, s_same)), (1, (q_other, s_other))):
@@ -1123,6 +1132,63 @@ def test_check_zigzag_act_qin_separates_quant_from_gemm() -> None:
         assert rc == 2, f"rc={rc}\n{text}{errs}"
     finally:
         shutil.rmtree(out, ignore_errors=True)
+
+
+def test_parse_dump_spec_accepts_the_round_spec() -> None:
+    """The shipped DUMP spec parser must accept exactly the probe round's spec.
+
+    ``_parse_dump_spec`` lives in ``vllm_ascend``, which cannot be imported without
+    vLLM/DSA, so the function is extracted from the source and executed here with a
+    stub logger.  A typo or an unregistered kind in ``DUMP_SPEC`` costs a full round
+    (no dump files appear, and the round only fails at the very end), and nothing
+    else on the CPU side would notice.
+    """
+    import ast
+    from typing import Any as _Any
+
+    path = HERE.parent.parent / "vllm_ascend/attention/sfa_v1.py"
+    tree = ast.parse(path.read_text(encoding="utf-8"))
+    func = next(
+        (node for node in tree.body if isinstance(node, ast.FunctionDef) and node.name == "_parse_dump_spec"),
+        None,
+    )
+    assert func is not None, "sfa_v1._parse_dump_spec is gone; the dump spec story changed"
+    kinds = next(
+        (
+            ast.literal_eval(node.value)
+            for node in tree.body
+            if isinstance(node, ast.Assign)
+            and getattr(node.targets[0], "id", None) == "_ZIGZAG_DUMP_KINDS"
+        ),
+        None,
+    )
+    assert kinds, "sfa_v1._ZIGZAG_DUMP_KINDS is gone"
+
+    class _StubLogger:
+        def warning(self, *args, **kwargs):  # noqa: ANN002, ANN003 - stub
+            pass
+
+    namespace: dict = {
+        "Any": _Any,
+        "logger": _StubLogger(),
+        "_ZIGZAG_DUMP_KINDS": kinds,
+        "_ZIGZAG_ALL_LAYERS": set(range(1 << 20)),
+    }
+    exec(compile(ast.Module(body=[func], type_ignores=[]), str(path), "exec"), namespace)  # noqa: S102
+    parse = namespace["_parse_dump_spec"]
+
+    assert parse("act:0,1,mlp:0,1,qin:0,topk:0,kv:0,1") == {
+        "act": {0, 1},
+        "mlp": {0, 1},
+        "qin": {0},
+        "topk": {0},
+        "kv": {0, 1},
+    }
+    # Bare numbers continue the previous kind; an unknown kind is dropped (not crash).
+    assert parse("kv:0,6") == {"kv": {0, 6}}
+    assert parse("nope:0") == {}
+    assert parse("") == {}
+    assert parse("qin:all") == {"qin": set(range(1 << 20))}
 
 
 def test_load_prompts_file() -> None:
