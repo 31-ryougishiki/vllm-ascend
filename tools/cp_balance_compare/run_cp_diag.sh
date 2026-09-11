@@ -130,6 +130,13 @@ case "${mode}" in
     out_root="${OUT_ROOT:-/dev/shm/cp_ab_probe}"
     if [[ -z "${DUMP_DIR:-}" ]]; then
       dump_dir="/root/cp_probe"
+    elif [[ "${DUMP_DIR}" != "/root/cp_probe" ]]; then
+      # A stale `export DUMP_DIR=/root/cp_dump` from a sweep round silently
+      # redirects this round's dumps into the sweep's directory -- then
+      # /root/cp_probe never appears and the data mixes with another round.
+      echo "[run_cp_diag] WARN: DUMP_DIR=${DUMP_DIR} 已设置，本轮 dump 会写进它（probe 默认 /root/cp_probe）" >&2
+      echo "[run_cp_diag]       若该目录里已有别的轮次，判读按 (layer, rank, cpbal) 取最新一份 → 会串味；" >&2
+      echo "[run_cp_diag]       要用默认值就先 unset DUMP_DIR" >&2
     fi
     if [[ -n "${dump_spec}" ]]; then
       extra_env+=(--env "VLLM_ASCEND_CP_BALANCE_DUMP=${dump_spec}")
@@ -219,6 +226,8 @@ if [[ "${dump_active}" == true ]]; then
   dump_after=$(find "${dump_dir}" -maxdepth 1 -name '*.pt' 2>/dev/null | wc -l)
   if (( dump_after <= dump_before )); then
     echo "[run_cp_diag] ERROR: DUMP_SPEC=${dump_spec} 但这一轮没有产生任何 dump（dir=${dump_dir}，之前 ${dump_before} 个）" >&2
+    echo "[run_cp_diag]        先确认 dir 是不是你要的那个：上面那行 '[run_cp_diag] dump=... dir=...' 就是实际写入目录；" >&2
+    echo "[run_cp_diag]        若 shell 里继承了一个旧 DUMP_DIR（例如 sweep 用的 /root/cp_dump），数据就写到那儿去了 → unset DUMP_DIR 再跑。" >&2
     echo "[run_cp_diag]        判读没有数据；去 server 日志里找这几类线索：" >&2
     echo "[run_cp_diag]          - [CP_BALANCE][dump] ... -> path         （说明真的写了）" >&2
     echo "[run_cp_diag]          - dump_no_layer_idx / could not be parsed（layer 名解析失败）" >&2
