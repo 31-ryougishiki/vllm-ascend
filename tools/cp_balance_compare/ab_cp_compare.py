@@ -739,6 +739,13 @@ def query_batch(url: str, args: argparse.Namespace, prompts: list[Prompt]) -> li
         "echo": True,
         "logprobs": args.topk,
         "prompt_logprobs": args.topk,
+        # vLLM >=0.26 no longer echoes ``prompt_token_ids`` from ``echo=True``
+        # alone: the server gates the field on ``return_token_ids`` (see
+        # ``completion/serving.py``: ``prompt_token_ids if request.return_token_ids
+        # else None``).  Without it every choice comes back with
+        # ``prompt_token_ids=None`` and the per-position alignment fails, so this
+        # flag is mandatory for the comparison to work at all.
+        "return_token_ids": True,
         # Keep the server from prepending BOS/EOS: the per-position comparison
         # is only valid when the echoed tokens are exactly the tokens we sent.
         "add_special_tokens": False,
