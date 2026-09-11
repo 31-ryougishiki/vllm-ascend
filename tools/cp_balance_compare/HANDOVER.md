@@ -5,7 +5,7 @@
 
 ## 0. 一句话现状
 
-`cp_balance`（zigzag 切分）与连续切片（`VLLM_ASCEND_CP_BALANCE=0`）在 prefill 上**确实不等**，差异远超噪声地板（p99 ≈ 0.39~0.58 nats，top-1 翻转 17%~30%），且**差异幅度随 rank 数减少而变大**。TP=8 全层 KV 剖面 + 分段比较（§2.5、§4.1）已确认：**layer 0 逐字节相同**（写 KV / rope / 布局 / 量化没写错），**layer 1 起三段（nope/rope/scale）都真的不同且从 token 256 开始**，幅度逐层放大（block-max 代理 6.8e-7 → 1.7e-3，未量化的 rope 9.4e-2 → 0.70）⇒ 分歧在 **layer 0 的输出**里进入并被逐层放大，是**真实的数值分歧**（不是只翻量化零点）。**不是** indexer 选点错、**不是** KV 重排写错、**不是**元数据契约错。下一步：`probe` 轮（§4.2）——`act` 定位 attention vs MoE/MLP，`topk/cross` 判定索引表是否只是顺序不同。
+`cp_balance`（zigzag 切分）与连续切片（`VLLM_ASCEND_CP_BALANCE=0`）在 prefill 上**确实不等**，差异远超噪声地板（p99 ≈ 0.39~0.58 nats，top-1 翻转 17%~30%），且**差异幅度随 rank 数减少而变大**。已排除：**indexer 选点错**（`[topk/cross]` 集合与顺序都相同）、**KV 重排/写错**（layer 0 KV 逐字节相同）、**attention 数值**（layer 0 attention 输出逐字节相同，连 1 ULP 都不差）、**元数据契约错**。已定位：分歧**诞生在 layer 0 的 MoE/MLP**（layer 1 的 attention 输入 = layer 0 的总输出，从 position 384 起有 ~1e-2 的相对差异），此后逐层传递并被放大（全层 KV 剖面的 rope 幅度 9e-2 → 7e-1）。下一步：**用内置的 routed-experts 抓取**判断 MoE 是"路由跳变（离散）"还是"专家计算与分组有关（量化/归约）"——见 §4.2。
 
 ## 1. 环境与版本（接手时先对齐）
 
@@ -88,7 +88,37 @@
    按 fp8 解码只会得到垃圾值和 NaN（0x7F/0xFF）。因此现在这个 `rows_value` **不能**直接当作
    "KV 内容不同"的证据 —— 必须**分段比较**（nope 按 fp8、rope 按 bf16、scale 按 fp32），这是 §4.1 的当前这一步。
 
-### 2.6 其他已确认
+### 2.6 TP=8 op 级剖面（`probe` 轮）已判读 —— **定位到 MoE**
+
+命令：`check_zigzag_dumps.py --dir /root/cp_dump --kind act --summary-only`（act 落 `/root/cp_dump`，见 §6.11）
+
+| layer | op | compared | differ | first_pos | max\|d\| | rel |
+| --- | --- | --- | --- | --- | --- | --- |
+| **0** | in | 1920 | **0** | - | - | - |
+| **0** | out | 1920 | **0** | - | - | - |
+| 1 | in | 1920 | 1536 | 384 | 1.562e-02 | 9.62e-03 |
+| 1 | out | 1920 | 1664 | 384 | 3.052e-04 | 1.09e-02 |
+| 2 | in | 1920 | 1664 | 384 | 1.953e-02 | 2.19e-02 |
+| 2 | out | 1920 | 1664 | 384 | 2.563e-03 | 6.73e-02 |
+| 3 | in | 1920 | 1664 | 384 | 2.734e-02 | 1.68e-02 |
+| 3 | out | 1920 | 1664 | 384 | 2.930e-03 | 1.69e-02 |
+
+**结论（这是目前最硬的一条）**：
+
+- **layer 0 的 attention 输出逐字节相同**（`op=out` 0/1920）⇒ SFA / indexer / o_proj 在两种排布下**数值完全一致**，
+  连 1 ULP 都不差。**attention 无罪**（至少 layer 0）。
+- **layer 1 的 attention 输入**（= layer 0 的总输出：attention + 残差 + MoE）**不同**，1536/1920 个 token、从 position 384 起、
+  相对幅度 ~1e-2。⇒ 分歧**诞生在 layer 0 的 MoE/MLP（或其间的 norm/残差）**，不是上一层传进来的。
+- 之后每层 `in`/`out` 都在同一批 token 上不同，rel 稳定在 1e-2 量级 ⇒ 分歧在层间传递（不是重新产生）。
+- 形态是**普遍而平滑**（80% 的 token 都差、幅度同量级），不像"少数 token 跳到别的专家"那种离散翻转。
+
+同轮 `[topk/cross]`：`compared=1920`、`set_diff=0`、`order_diff=0` ⇒ **同一个 token 在 B/C 下选出的索引集合与顺序完全相同**
+（`identity` 也几乎全是 256/256）⇒ indexer 输出**与排布无关**，索引顺序这条线**排除**。
+
+⇒ 连带结论：**T1（`2call`，合并 2B 调用）不再有意义**——它只改 attention/indexer 的调用形状，而 layer 0 的 attention
+输出已经逐位相同，跑它不会带来新信息（省一轮 20 分钟）。
+
+### 2.7 其他已确认
 
 - 日志侧元数据不变量 `[CP_BALANCE][check][*]`（prefix sum / block_table 行数 / `kv_len>=q_len` / 请求对齐）**从未触发**。
 - `[CP_BALANCE] metadata zigzag=1 … cp_size=8 … local_tokens=256`、`forward zigzag_active=1` 每轮都出现 → C 确实走 zigzag，分片算术自洽（2048/8=256，2049→pad 2064→258）。
@@ -98,18 +128,54 @@
 
 | 假设 | 状态 |
 | --- | --- |
-| indexer 选点错（P1） | **已排除**（rank 局部 `mismatched=0`；全局合并仍未被工具覆盖） |
-| KV 重排 slot 写错 | **已排除**（layer 0 逐位相同） |
+| indexer 选点错（P1） | **已排除**（§2.3 rank 局部 `mismatched=0`；§2.6 跨排布 `set_diff=0` **且 `order_diff=0`**） |
+| KV 重排 slot 写错 | **已排除**（layer 0 KV 逐字节相同） |
 | 元数据契约错（prefix/block_table/kv_len） | **已排除**（`[check]` 告警从未触发） |
-| 量化掩盖导致的假"相同" | **已澄清**：分段比较显示三段都真的不同，但幅度谱极不均匀——`scale_fp32`（block-max 代理）1e-6→1.7e-3、`rope_bf16`（未量化）9e-2→0.70、`nope_fp8` 只差 1 步（极值段）。分歧真实存在且逐层放大，不是亚量化噪声 |
-| 合并 2B 单次调用（T1，`MERGED_CALL=0`） | **未测**（`run_cp_diag.sh 2call`，2 次加载） |
-| `MIN_TOKENS` 边界（T4） | **未测**（`l1024`） |
-| **主假设 A**：跨 block/rank 的归约顺序类差异，被 78 层 MoE 路由（离散选择）放大 | 未证实；"平滑、普遍、起点在块边界"与之一致 |
-| **主假设 B**：按 rank 局部的候选/聚合粒度效应（块越大偏得越多） | 未证实；**"p99 随块变大而变大"支持它**，是最值得追的一条 |
+| 量化掩盖导致的假"相同" | **已澄清**：分段比较显示三段都真的不同，但幅度谱极不均匀——`scale_fp32`（block-max 代理）1e-6→1.7e-3、`rope_bf16`（未量化）9e-2→0.70、`nope_fp8` 只差 1 步（极值段）。分歧真实存在且逐层放大 |
+| **attention（SFA/indexer/o_proj）数值差异** | **已排除**（§2.6：layer 0 的 attention 输出在 B/C 下逐字节相同） |
+| 合并 2B 单次调用（T1，`MERGED_CALL=0`） | **已排除**（只改 attention 的调用形状，而 layer 0 attention 输出已逐位相同 → 无信息量，别跑） |
+| `MIN_TOKENS` 边界（T4） | **未测**（`l1024`）；与本问题无关，优先级最低 |
+| **MoE 路由跳变（离散）** | **未测 —— 下一刀**（用内置 routed-experts 抓取，§4.2） |
+| **MoE 专家计算与分组有关**（量化 scale / 归约粒度） | **未测 —— 主假设**（幅度 ~1e-2 太像量化粒度效应，不像 fp 舍入） |
 
 ## 4. 下一步（按优先级；每步一条命令 + 判据）
 
-### 4.1 分段比较 packed KV 行（数据已在盘上，几秒，不需要 NPU）——**当前这一步**
+### 4.1 先做 2 分钟预检：内置 routed-experts 抓取能不能用 —— **当前这一步**
+
+§2.6 把分歧钉在 **layer 0 的 MoE**，下一步要问的是"路由（专家选择）变了吗"。vLLM 自带
+`--enable-return-routed-experts`：打开后 `/v1/completions` 的响应里会多一个 `routed_experts`
+字段（base64 的 `.npy`，形状 `(num_tokens-1, num_layers, num_experts_per_tok)`）——**一次请求就能拿到
+全部 78 层、逐 token 的路由决策**，不用改任何模型代码。它有两个硬约束（`vllm/config/vllm.py`）：
+**PP=1**（本站满足）与**不能用 KV connector**（本站 launcher 默认是 `kv_producer`，所以必须显式
+`VLLM_ASCEND_KV_TRANSFER_CONFIG=""`）。
+
+launcher 现在支持透传额外 flag（`EXTRA_SERVE_ARGS`），所以先花 2 分钟验证这条路通不通：
+
+```bash
+cd /home/z30055003/vllm-ascend
+VLLM_ASCEND_KV_TRANSFER_CONFIG="" EXTRA_SERVE_ARGS="--enable-return-routed-experts" \
+  python tools/cp_balance_compare/run_single.py --config C --no-keep --prompt-lens 2048
+grep -o '"routed_experts": *"[^"]\{0,40\}' /dev/shm/cp_single/response_*.txt | head -3
+```
+
+**判据**：
+- 响应里出现 `"routed_experts": "k05VTVBZA..."`（base64 的 npy 头）⇒ 路通了，下一步把它接进 driver：
+  B/C 各一次请求 → 落盘 → 逐 token/逐层比较"专家集合是否相同、顺序是否相同、权重差多少"。
+- 打印出 `"routed_experts": null` ⇒ 服务端没打开（flag 没生效：看 `[cp-ab] EXTRA_SERVE_ARGS=` 那行）。
+- server 起不来并报 `--enable-return-routed-experts is incompatible with ...` ⇒ 把报错原文贴回来
+  （PP/KV connector/context parallel 的哪一条）；KV connector 那条用上面的 `VLLM_ASCEND_KV_TRANSFER_CONFIG=""` 解决。
+
+### 4.2 （预检通过后）路由对比轮：MoE 是"离散跳变"还是"分组相关"
+
+一轮 B/C（无 B2，2 次加载），两个配置都带上 `--enable-return-routed-experts`，把响应里的
+`routed_experts` 落盘后逐 token 比较。判据（届时实现成 `compare_routing.py`，一条命令 + 一行结论）：
+
+| 读数 | 含义 | 下一步 |
+| --- | --- | --- |
+| 路由**逐层逐 token 完全相同** | MoE 的专家选择与排布无关 ⇒ 1e-2 的差异来自**专家计算**（激活量化粒度 / 分组归约顺序 / all-to-all 归约） | 去查 `ops/fused_moe` 的 w4a4 量化与 combine 顺序，或用 `act` 的思路在 MoE 前后各打一次点 |
+| 某些层/某些 token 路由不同（离散） | 路由 op 的 tie-break 或 hash 表的对齐与排布有关 | 看是 hash 层（`tid2eid`）还是打分层（`moe_gating_top_k`），并检查 `input_ids` 的 zigzag 重排 |
+
+### 4.3 （已完成，留档）分段比较 packed KV 行
 
 §2.5 已经知道"整行按 fp8 解码后 layer 1 起有 ~1000 行不同、从 token 256 开始"，但**整行按 fp8 解码是错的**：
 一行 656 字节里只有前 512 字节是真 fp8，后 144 字节是 bf16 rope + fp32 scale 借道运输。
@@ -210,15 +276,15 @@ python tools/cp_balance_compare/check_zigzag_dumps.py --dir /root/cp_probe --kin
 one-shot，所以只有第一个请求（2048）的数据。`topk` 的跨排布对比需要 dump 里的 `positions`
 （老 dump 没有 → 会打印 "cross-layout order comparison skipped"）。
 
-### 4.3 两个未做的判别实验（各 2 次模型加载，约 20 分钟）
+### 4.4 其他未做的判别实验（各 2 次模型加载，约 20 分钟）
 
-- `bash tools/cp_balance_compare/run_cp_diag.sh 2call` → 若 `C−B` 回到噪声级，根因锁定"合并 2B 单次调用"；否则排除它。
-- `bash tools/cp_balance_compare/run_cp_diag.sh l1024` → `MIN_TOKENS` 边界是否被正确遵守。
+- `bash tools/cp_balance_compare/run_cp_diag.sh 2call` → **已被 §2.6 判为无信息量**（attention 无罪），除非怀疑对象重新变回 attention。
+- `bash tools/cp_balance_compare/run_cp_diag.sh l1024` → `MIN_TOKENS` 边界是否被正确遵守；与本问题关系不大，最后做。
 
-### 4.4 环境类（**可能直接影响数值，别跳过**）
+### 4.5 环境类（**可能直接影响数值，别跳过**）
 
 1. `df -h /dev/shm` —— 确认它有多小；全层 dump 必须落在真实磁盘（`export DUMP_DIR=/root/cp_dump`）。
-2. **mxfp4 的 Triton 内核导入失败**：`ERROR [mxfp4.py:56] Failed to import Triton kernels … cannot import name 'constexpr_function' from 'triton.runtime.jit'`（每次请求都在刷）。这台机器跑的是 **w4a4c8-mxfp4**，量化矩阵乘可能整条走回退实现 → **会改变数值**。要 `pip show triton` 对齐版本，并确认回退路径与正式路径数值等价；否则我们测的可能不是目标路径。
+2. **mxfp4 的 Triton 内核导入失败**：`ERROR [mxfp4.py:56] Failed to import Triton kernels … cannot import name 'constexpr_function' from 'triton.runtime.jit'`。已查明这是**上游 vllm 的 MXFP4 MoE oracle**（`vllm/model_executor/layers/fused_moe/oracle/mxfp4.py`，CUDA 后端的探测代码）在 import 期打的噪音，与 Ascend 的 MoE 路径无关——**不必再追**（这条曾被评为"可能改变数值"，现已降级）。
 3. `ulimit -n 1024`（日志里有警告）→ 全层 dump 场景建议提高。
 4. `torch_npu` 的 `index_select` 在这台机器上不可用（`aclnnIndexSelect 161002`）→ dump 已改为不依赖它（用写 cache 之前的同源副本）。
 
@@ -232,10 +298,12 @@ one-shot，所以只有第一个请求（2048）的数据。`topk` 的跨排布�
 | 诊断轮（2 次加载 + 全层 KV dump） | `export DUMP_DIR=/root/cp_dump; bash tools/cp_balance_compare/run_cp_diag.sh sweep` | `dump: +N file(s)`、`[runtime] C:{T,T}`、`[case.*] p99≈0.575` |
 | 判读 KV dump | `python tools/cp_balance_compare/check_zigzag_dumps.py --dir $DUMP_DIR --kind kv --summary-only` | `FIRST DIVERGENCE (fp): layer L` |
 | op 级剖面轮（2 次加载 + 全精度 in/out） | `bash tools/cp_balance_compare/run_cp_diag.sh probe` | `dump: +N file(s)`、`[runtime] C:{T,T}` |
-| 判读激活剖面 | `python tools/cp_balance_compare/check_zigzag_dumps.py --dir /root/cp_probe --kind act --summary-only` | `FIRST DIVERGENCE (act): layer L op=in|out at token P` |
+| 判读激活剖面 | `python tools/cp_balance_compare/check_zigzag_dumps.py --dir $DUMP_DIR --kind act --summary-only` | `FIRST DIVERGENCE (act): layer L op=in\|out at token P` |
+| 判读索引表（跨排布） | `... --kind topk --summary-only` | `[topk/cross] RESULT: ... ORDER / DIFFERENT SET / layout invariant` |
+| 路由预检（2 分钟） | `VLLM_ASCEND_KV_TRANSFER_CONFIG="" EXTRA_SERVE_ARGS="--enable-return-routed-experts" python tools/cp_balance_compare/run_single.py --config C --no-keep` | 响应里有 `"routed_experts": "k05VTVBZA…"` |
 | 单配置手工调试 | `python tools/cp_balance_compare/run_single.py [--config C]` | `[http] <- 200` + `[result]` 行；server 默认保留 |
 | 收证据 | `python tools/cp_balance_compare/selfcheck.py --collect --out-root /dev/shm/cp_ab_sweep` | 一个文件里含 HEAD/dump 清单/指标/日志关键行 |
-| CPU 自测（改了代码就跑） | `python tools/cp_balance_compare/selftest_mock.py` | 末行 `SELFTEST OK`（40 项） |
+| CPU 自测（改了代码就跑） | `python tools/cp_balance_compare/selftest_mock.py` | 末行 `SELFTEST OK`（43 项） |
 
 ## 6. 踩过的坑（血泪清单，改代码前先看）
 
@@ -248,12 +316,18 @@ one-shot，所以只有第一个请求（2048）的数据。`topk` 的跨排布�
 7. **跨排布只能按 token 位置比，不能按行号比**（zigzag 下 rank 持有 `[prev,next]` 两块，连续切片下持有 `[local_start,local_end)`，同一个行号是不同 token）。`topk` dump 因此只能做"局部选点 == 因果窗口"的断言；`act` 剖面用写 KV 的同一个 `slot_mapping_cp` 做位置键，才跨布局可比。
 8. **截断的 dump** 会让判读崩（已改为跳过 + 告警）；无 dump 的轮次 `run_cp_diag.sh` 会以 rc=3 明确失败。
 9. **`act` 是 one-shot**：每层每进程只写一次、跳过 profile/warmup，所以只有第一个 prefill 请求（driver 发的 2048）有数据；想换层要改 `DUMP_SPEC` 再跑一轮，不是改判读。
-10. **`probe` 轮默认落 `/root/cp_probe`**（百 MB 级），别指回 `/root/cp_dump`：同一个目录混两轮会互相干扰（判读只按"最新一份"取）。
+10. **`probe` 轮默认落 `/root/cp_probe`，但它尊重已导出的 `DUMP_DIR`**：如果 shell 里还留着 sweep 的 `export DUMP_DIR=/root/cp_dump`，probe 的数据会被"吸"到那里（`/root/cp_probe` 根本不出现）。跑之前先 `unset DUMP_DIR` 或看 `run_cp_diag.sh probe --dry-run` 打印的 `dir=`（脚本现在会对继承来的 DUMP_DIR 打 WARN）。
+11. **`act`/`topk` 的 `positions` 是 KV cache slot，不一定是 token 序号**（单请求、无 prefix cache、块表连续时二者相等）。**跨轮次比 `first_pos` 要小心**：不同 server 启动的块分配不同，同一个 slot 号可能对应不同 token；只有**同轮内 B vs C** 的比较是严格对齐的。
+12. **MoE 的 Triton 报错是噪音**（见 §4.5.2），别被它带偏到 CUDA 后端那条线。
 
 ## 7. 相关提交（最近，按时间倒序）
 
 | commit | 内容 |
 | --- | --- |
+| `ec1f81c88` | probe 轮对继承来的 `DUMP_DIR` 打 WARN（数据曾被 sweep 的目录吸走） |
+| `c7244089e` | `topk` dump 带 token 位置 + 跨排布索引表对比（`[topk/cross]`）+ probe 默认带 `topk:0` |
+| `298bbff36` | 修 `max\|d\|` 的 NaN 陷阱并纠正"数值全同/亚量化"的错误结论 |
+| `28d9b40f3` | `[kv/fp]` 把字节/数值拆开报（`rows_val`/`rows_byte`/`byte_only`） |
 | `7b838e5ea` | op 级激活剖面：`act` dump（attention in/out，按 `slot_mapping_cp` 定位）+ `--kind act` 判读 + `probe` 模式 |
 | `cfb196b55` | 新增本交接说明 HANDOVER.md，并修正 README 中已过期的描述 |
 | `2091b4a8d` | 判读支持 fp8 dump；纠正"FP 副本"定性（同源副本，非量化前） |

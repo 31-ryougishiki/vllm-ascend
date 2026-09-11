@@ -180,6 +180,8 @@ python tools/cp_balance_compare/selfcheck.py --collect --out-root /dev/shm/cp_ab
 
 常用覆盖（`run_cp_diag.sh` 的环境变量）：`PROMPT_LENS`、`MIN_TOKENS`、`TP_SIZE`（launcher 的 TP，默认 8）、`CP_SIZE`（driver 的 `--cp-size`，默认取 `TP_SIZE`）、`REPEAT_A`（默认 1；`REPEAT_A=0` 或命令加 `--no-repeat` 跳过 B2 重复跑，**省一次模型加载**，噪声地板已知为 0 时用）、`OUT_ROOT`、`BASE_PORT`、`DUMP_SPEC`（置空=不 dump；支持 `kv:all` / `topk:all` / `act:0,1,2`）、`DUMP_DIR`（**writer 与 checker 共用**，默认 `/dev/shm/cp_balance_dump`，`probe` 模式默认 `/root/cp_probe`）、`KIND`（`check` 模式的判读类型，默认 `both`）、`LAUNCHER`。
 
+launcher 还支持透传额外的 `vllm serve` 参数：`EXTRA_SERVE_ARGS="--enable-return-routed-experts"`（空格分隔；launcher 会 echo 一行 `[cp-ab] EXTRA_SERVE_ARGS=` 便于追溯）。这是给"路由抓取"预检用的——vLLM 自带的 `--enable-return-routed-experts` 会在 `/v1/completions` 响应里多返回 `routed_experts`（base64 的 `.npy`，形状 `(num_tokens-1, num_layers, num_experts_per_tok)`，**一次请求拿到全部层逐 token 的专家选择**），代价是**必须关掉 KV connector**（`VLLM_ASCEND_KV_TRANSFER_CONFIG=""`）且 PP=1。
+
 > 诊断轮优先用 **`sweep` 模式**而不是一堆 env 前缀：脚本模式写在同一行命令里，粘贴时不会像 `VAR=... cmd` 那样被折断后**静默退回默认值**（那样会白跑一轮 B2）。
 
 > **一轮的成本结构**：几乎全在模型加载（约 10 分钟/次；TP=8/16 量级相当），推理只要 ~2 秒/条。所以"加长度/加 dump 层数"几乎免费，而"多跑一个配置"（B2、2call）就是 +10 分钟。诊断轮按这个取舍：`sweep` 模式（= `--no-repeat` + `DUMP_SPEC=kv:all`）是 2 次加载 + 全层数据；`probe` 模式（= `--no-repeat` + `act:0,1,2,3`）也是 2 次加载，多花的是磁盘（几百 MB）而不是时间——所以**一次打点尽量多带几层**。

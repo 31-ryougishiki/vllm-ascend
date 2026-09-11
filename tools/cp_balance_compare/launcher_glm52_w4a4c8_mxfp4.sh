@@ -146,6 +146,18 @@ fi
 export VLLM_DISABLE_COMPILE_CACHE=1
 export PYTHONPATH="${VLLM_ASCEND_REPO}:${PYTHONPATH:-}"
 
+# Extra `vllm serve` flags, space separated, e.g.
+#   EXTRA_SERVE_ARGS="--enable-return-routed-experts"
+# The routed-experts probe needs one of these, and other site knobs can be
+# injected the same way without editing this file.  Echoed below so every
+# round's log says exactly what was requested.
+extra_serve_args=()
+if [ -n "${EXTRA_SERVE_ARGS:-}" ]; then
+  # shellcheck disable=SC2206  # word splitting is the point here
+  extra_serve_args=(${EXTRA_SERVE_ARGS})
+fi
+echo "[cp-ab] EXTRA_SERVE_ARGS=${EXTRA_SERVE_ARGS:-<unset>}"
+
 # ---------------------------------------------------------------------------
 # cp_balance knobs (overridable; defaults match the original script).
 # MIN_TOKENS is pinned by the driver and checked in the fingerprint; here it is
@@ -273,4 +285,5 @@ vllm serve "${MODEL_PATH}" \
   ${spec_args[@]+"${spec_args[@]}"} \
   --profiler-config "{\"profiler\": \"torch\", \"torch_profiler_dir\": \"${PROFILER_DIR}\", \"torch_profiler_with_stack\": false}" \
   ${kv_args[@]+"${kv_args[@]}"} \
+  ${extra_serve_args[@]+"${extra_serve_args[@]}"} \
   --additional_config "${additional_config}"
