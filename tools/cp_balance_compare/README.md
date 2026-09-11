@@ -61,7 +61,8 @@ prompt 默认是确定性随机 token-id（`--seed 1234`，词表 10 万），�
 ### L3 — CPU 侧判读（不需要 NPU）
 
 - `check_zigzag_dumps.py --kind topk` → **P1**：对短于 `sparse_count` 的 prompt，LightningIndexer 每行有效前缀应当恰好是因果窗口 `{0..valid-1}`（identity 或仅顺序不同的同一集合）。有效集合缺项 ⇒ indexer 让 SFA 关注的位置少于因果窗口要求。
-- `check_zigzag_dumps.py --kind kv` → **P2**：dump 按自然 token 顺序存 packed KV，所以 cpbal0 的第 p 行与 cpbal1 的第 p 行是同一个 token，可逐字节比较。首个不同的 layer/token 就是两种排布第一次分歧的地方。做**多层扫描**（`DUMP_SPEC=kv:all`）时加 `--summary-only`：只打印每层一行的紧凑表（`ranks_diff / rows_differ / first_token / max|int8|`）并直接给出 `FIRST DIVERGENCE: layer L`——因为第 L 层的 KV 是"第 L 层输入隐状态"的投影，分歧实际是在 **L−1 层的输出**里进入的。
+- `check_zigzag_dumps.py --kind kv` → **P2**：dump 按自然 token 顺序存 packed KV，所以 cpbal0 的第 p 行与 cpbal1 的第 p 行是同一个 token，可逐字节比较。首个不同的 layer/token 就是两种排布第一次分歧的地方。
+  dump 里同时带一份**量化前**的 FP 副本（`kv_fp_nat`，同样自然序），因为 packed cache 是 int8/fp8 量化的——两个不同的 FP 值可能量化成同一个字节，真实分歧会被量化吃掉（"上一层相同"可能是假的）。判读因此打印两张表（`[kv/int8]` 与 `[kv/fp]`），`FIRST DIVERGENCE` 以 **FP 表**为准，并给出真实量级的 `max|d|` 与相对值 `rel`（1e-6 级 = 浮点归约顺序；1e-2 级 = 真逻辑差异）。做**多层扫描**（`DUMP_SPEC=kv:all`）时加 `--summary-only`：每层一行，直接给出 `FIRST DIVERGENCE: layer L`——第 L 层 KV 是"第 L 层输入隐状态"的投影，分歧实际是在 **L−1 层的输出**里进入的。
 - `compare_cp_rounds.py baseline=... 2call=...` → 各轮指标并排 + 结论：最后一轮的 `C-B` 是否全部回到噪声级。
 
 dump 由 `vllm_ascend/attention/sfa_v1.py` 写，开关是 `VLLM_ASCEND_CP_BALANCE_DUMP`（语法 `kind:layers[,...]`，如 `topk:6,kv:0,6`、`topk:all`；空值=关），落在 `/dev/shm/cp_balance_dump`，文件名 `<kind>_cpbal<N>_layer<L>_rank<R>_pid<P>_<ts>.pt`——自带 cp_balance 标记，所以**一轮 A/B 的 B 与 C 数据可以同时收**，且多轮共用一个目录不会互相覆盖（判读时按 `(layer, rank, cpbal)` 取最新一份）。

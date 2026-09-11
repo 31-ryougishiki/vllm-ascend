@@ -237,13 +237,55 @@ def _max_nope_diff(left_rows: list[bytes], right_rows: list[bytes], diff_rows: l
     return int((left - right).abs().max().item())
 
 
+def _fp_diff(left: dict, right: dict) -> tuple[int | None, int | None, float, float]:
+    """Row-wise comparison of the pre-quantization KV (``kv_fp_nat``).
+
+    Returns ``(differing_rows, first_row, max_abs_delta, max_rel_delta)``;
+    ``(None, None, 0.0, 0.0)`` when the dump has no FP copy.  This is the
+    sensitive comparison: the packed cache is int8/fp8 quantized, so two
+    different FP values can share a byte and a real divergence would hide.
+    """
+    left_fp = left.get("kv_fp_nat")
+    right_fp = right.get("kv_fp_nat")
+    if not (isinstance(left_fp, torch.Tensor) and isinstance(right_fp, torch.Tensor)):
+        return None, None, 0.0, 0.0
+    if left_fp.shape != right_fp.shape:
+        return None, None, 0.0, 0.0
+    lf = left_fp.float()
+    rf = right_fp.float()
+    delta = (lf - rf).abs()
+    per_row = delta.reshape(delta.shape[0], -1).amax(dim=1)
+    rows = int((per_row > 0).sum().item())
+    if not rows:
+        return 0, None, 0.0, 0.0
+    first = int(per_row.nonzero()[0].item())
+    max_abs = float(delta.max().item())
+    scale = float(lf.abs().max().item()) or 1.0
+    return rows, first, max_abs, max_abs / scale
+
+
+def _summary_verdict(per_layer: dict[int, dict]) -> tuple[int | None, str]:
+    """First layer that differs, judged on the FP copy when it exists."""
+    use_fp = any(stats["fp_rows"] for stats in per_layer.values())
+    for layer in sorted(per_layer):
+        stats = per_layer[layer]
+        if not stats["compared"]:
+            continue
+        if use_fp:
+            if any(rows for rows in stats["fp_rows"]):
+                return layer, "fp"
+        elif stats["differ"]:
+            return layer, "int8"
+    return None, "fp" if use_fp else "int8"
+
+
 def _print_kv_summary(per_layer: dict[int, dict], ignored: int) -> None:
-    """One compact table for a whole sweep, plus the decisive judgement line."""
+    """One compact table per comparison for a whole sweep, plus the verdict."""
     print()
     if ignored:
         print(f"[kv] {ignored} older dump(s) ignored (newest per (layer, rank, cp_bal) wins)")
-    print(f"[kv] {'layer':>5}  {'ranks_diff':>10}  {'rows_differ':>13}  {'first_token':>11}  {'max|int8|':>9}")
-    first_layer = None
+
+    print(f"[kv/int8] {'layer':>5}  {'ranks_diff':>10}  {'rows_differ':>13}  {'first_token':>11}  {'max|d|':>7}")
     for layer in sorted(per_layer):
         stats = per_layer[layer]
         if not stats["compared"]:
@@ -251,21 +293,39 @@ def _print_kv_summary(per_layer: dict[int, dict], ignored: int) -> None:
         rows = stats["rows"]
         span = f"{min(rows)}-{max(rows)}" if rows else "-"
         first = "-" if stats["first"] is None else str(stats["first"])
-        print(
-            f"[kv] {layer:>5}  {stats['differ']:>4}/{stats['compared']:<5}  {span:>13}  "
-            f"{first:>11}  {stats['max']:>9}"
-        )
-        if stats["differ"] and first_layer is None:
-            first_layer = layer
+        print(f"[kv/int8] {layer:>5}  {stats['differ']:>4}/{stats['compared']:<5}  {span:>13}  "
+              f"{first:>11}  {stats['max']:>7}")
+
+    have_fp = any(stats["fp_rows"] for stats in per_layer.values())
+    if have_fp:
+        print(f"[kv/fp  ] {'layer':>5}  {'ranks_diff':>10}  {'rows_differ':>13}  {'first_token':>11}  "
+              f"{'max|d|':>10}  {'rel':>9}")
+        for layer in sorted(per_layer):
+            stats = per_layer[layer]
+            if not stats["compared"]:
+                continue
+            rows = stats["fp_rows"]
+            span = f"{min(rows)}-{max(rows)}" if rows else "-"
+            first = "-" if stats["fp_first"] is None else str(stats["fp_first"])
+            print(f"[kv/fp  ] {layer:>5}  {stats['fp_differ']:>4}/{stats['compared']:<5}  {span:>13}  "
+                  f"{first:>11}  {stats['fp_max_abs']:>10.3e}  {stats['fp_max_rel']:>9.2e}")
+
+    first_layer, which = _summary_verdict(per_layer)
     if first_layer is None:
-        print("[kv] FIRST DIVERGENCE: none -- every compared (layer, rank) is bit-identical")
+        print(f"[kv] FIRST DIVERGENCE ({which}): none -- every compared (layer, rank) is bit-identical")
         return
     stats = per_layer[first_layer]
-    print(
-        f"[kv] FIRST DIVERGENCE: layer {first_layer} is the first layer whose KV already differs "
-        f"({stats['differ']}/{stats['compared']} ranks, first token {stats['first']}, "
-        f"max|int8| {stats['max']})"
-    )
+    if which == "fp":
+        detail = (
+            f"{stats['fp_differ']}/{stats['compared']} ranks, first token {stats['fp_first']}, "
+            f"max|d|={stats['fp_max_abs']:.3e} (rel {stats['fp_max_rel']:.2e})"
+        )
+    else:
+        detail = (
+            f"{stats['differ']}/{stats['compared']} ranks, first token {stats['first']}, "
+            f"max|int8| {stats['max']}"
+        )
+    print(f"[kv] FIRST DIVERGENCE ({which}): layer {first_layer} is the first layer whose KV already differs ({detail})")
     print(
         f"[kv] -> 该层 KV 是「该层输入隐状态」的投影，所以分歧是在上一层（layer {first_layer - 1}）"
         "的输出里进入的；下一步按这一层去定位是哪一步先不等"
@@ -290,7 +350,10 @@ def check_kv(args) -> int:
                       f"cpbal{cpbal} ignored (keeping the newest)")
         by_layer[(layer, rank)][cpbal] = (path, _load(path))
     per_layer: dict[int, dict] = defaultdict(
-        lambda: {"compared": 0, "differ": 0, "rows": [], "first": None, "max": 0}
+        lambda: {
+            "compared": 0, "differ": 0, "rows": [], "first": None, "max": 0,
+            "fp_differ": 0, "fp_rows": [], "fp_first": None, "fp_max_abs": 0.0, "fp_max_rel": 0.0,
+        }
     )
     failures = 0
     for (layer, rank), variants in sorted(by_layer.items()):
@@ -312,10 +375,24 @@ def check_kv(args) -> int:
         stats = per_layer[layer]
         stats["compared"] += 1
         stats["rows"].append(len(diff_rows))
+        fp_rows, fp_first, fp_max_abs, fp_max_rel = _fp_diff(left, right)
+        if fp_rows:
+            stats["fp_differ"] += 1
+            stats["fp_rows"].append(fp_rows)
+            stats["fp_first"] = fp_first if stats["fp_first"] is None else min(stats["fp_first"], fp_first)
+            stats["fp_max_abs"] = max(stats["fp_max_abs"], fp_max_abs)
+            stats["fp_max_rel"] = max(stats["fp_max_rel"], fp_max_rel)
+        elif fp_rows == 0:
+            stats["fp_rows"].append(0)
         if not args.summary_only:
             print(
                 f"\n[kv] layer={layer} rank={rank} cpbal{left_key} vs cpbal{right_key}: "
                 f"rows {len(left_rows)} vs {len(right_rows)}, differing rows={len(diff_rows)}"
+                + (
+                    f" | fp rows={fp_rows} first={fp_first} max|d|={fp_max_abs:.3e} rel={fp_max_rel:.2e}"
+                    if fp_rows is not None
+                    else " | (no kv_fp_nat in dump)"
+                )
             )
         if len(left_rows) != len(right_rows) and not args.summary_only:
             print("     WARNING: row counts differ (num_actual_tokens/shape mismatch)")
@@ -341,8 +418,10 @@ def check_kv(args) -> int:
             print("     OK: identical packed KV for every token")
     _print_kv_summary(per_layer, ignored)
     print()
-    if failures:
-        print(f"[kv] RESULT: {failures} (layer, rank) pair(s) differ -> P2 violated "
+    fp_layers = sorted(layer for layer, stats in per_layer.items() if any(stats["fp_rows"]))
+    if failures or fp_layers:
+        print(f"[kv] RESULT: {failures} (layer, rank) pair(s) differ in the packed int8 copy; "
+              f"the FP copy differs on layer(s) {fp_layers or '-'} -> P2 violated "
               "(a token's KV content is not layout invariant)")
         return 1
     print("[kv] RESULT: P2 holds on the dumped layers (per-token KV identical across layouts)")

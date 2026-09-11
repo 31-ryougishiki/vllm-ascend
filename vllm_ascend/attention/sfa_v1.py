@@ -279,6 +279,37 @@ def _parse_dump_spec(raw: Any) -> dict[str, set[int]]:
     return {kind: layers for kind, layers in spec.items() if layers}
 
 
+def _natural_order_fp(
+    kv_fp: torch.Tensor | None,
+    gather_index: torch.Tensor | None,
+    slots: torch.Tensor,
+    valid: torch.Tensor,
+) -> torch.Tensor | None:
+    """Pre-quantization KV rows in natural token order, aligned with ``kv_nat``.
+
+    Under zigzag the fused KV arrives in all-gather order
+    (``[r0_prev, r0_next, r1_prev, ...]``); ``gather_index`` maps that order to
+    natural order, so its inverse puts the rows back.  The continuous path is
+    already natural.  Rows are then filtered by the same ``valid`` mask as the
+    packed-cache dump, so row p is token p in both layouts.
+    """
+    if not isinstance(kv_fp, torch.Tensor):
+        return None
+    try:
+        rows = kv_fp
+        if isinstance(gather_index, torch.Tensor) and gather_index.numel() >= rows.shape[0]:
+            inverse = torch.empty_like(gather_index)
+            inverse[gather_index] = torch.arange(
+                gather_index.numel(), dtype=gather_index.dtype, device=gather_index.device
+            )
+            rows = rows.index_select(0, inverse)
+        rows = rows[: slots.numel()]
+        return rows[valid].detach().to("cpu")
+    except Exception as exc:  # pragma: no cover - diagnostics only
+        logger.warning("[CP_BALANCE][dump] kv_fp natural-order prep failed: %s", exc)
+        return None
+
+
 def _zigzag_layer_idx(layer_name: str | None) -> int | None:
     try:
         return parse_layer_idx(layer_name or "")
@@ -1461,12 +1492,20 @@ class AscendSFAImpl(MLAAttentionImpl):
         kv_cache_row_view: torch.Tensor,
         slot_mapping_sfa: torch.Tensor,
         num_actual_tokens: int,
+        kv_fp: torch.Tensor | None = None,
+        gather_index: torch.Tensor | None = None,
     ) -> None:
         """Dump the packed KV cache rows in natural token order (task T3).
 
         Reading them back through ``slot_mapping`` makes the dump directly
         comparable across the B (continuous) and C (zigzag) configurations:
         row p of the dump is token p in both.
+
+        ``kv_fp`` (optional) is the *pre-quantization* fused KV of the same
+        tokens, also permuted to natural order.  The packed cache is int8/fp8
+        quantized, so two different FP values can quantize to the same byte and
+        a real divergence would stay invisible; the FP copy removes that blind
+        spot and reports the difference in real units.
         """
         if not self._zigzag_dump_enabled(self._zigzag_dump_kv_layers, self._zigzag_dump_kv_done):
             return
@@ -1486,6 +1525,9 @@ class AscendSFAImpl(MLAAttentionImpl):
                 "num_actual_tokens": int(num_actual_tokens),
                 "num_valid": int(valid.sum().item()),
             }
+            fp_nat = _natural_order_fp(kv_fp, gather_index, slots, valid)
+            if fp_nat is not None:
+                payload["kv_fp_nat"] = fp_nat
         except Exception as exc:  # pragma: no cover - diagnostics only
             logger.warning("[CP_BALANCE][dump] kv dump prep failed: %s", exc)
             return
@@ -2779,10 +2821,18 @@ class AscendSFAImpl(MLAAttentionImpl):
                     # Diagnostics: read the packed cache back in natural token
                     # order so B (continuous) and C (zigzag) dumps are directly
                     # comparable per token.  No-op unless the dump env is set.
+                    # fused_kv_no_split rides along as the pre-quantization copy
+                    # (the packed cache is int8/fp8, which hides small FP deltas).
                     self._maybe_dump_kv(
                         kv_cache[0].view(-1, fused_kv_no_split.shape[-1]),
                         slot_mapping_sfa,
                         attn_metadata.num_actual_tokens,
+                        kv_fp=fused_kv_actual,
+                        gather_index=(
+                            dsa_cp_context.zigzag_gather_index
+                            if dsa_cp_context is not None
+                            else None
+                        ),
                     )
                     k_pe = None
                     k_nope = None

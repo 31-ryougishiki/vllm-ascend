@@ -383,20 +383,29 @@ def test_check_zigzag_kv_summary_names_first_diverging_layer() -> None:
     out = _temp_dir("cp_ab_kvsummary_")
     try:
         base = torch.randint(-120, 120, (256, 64), dtype=torch.int8)
+        base_fp = torch.randn(256, 64, dtype=torch.float16)
 
-        def dump(layer: int, rank: int, cpbal: int, tensor, ts: int) -> None:
+        def dump(layer: int, rank: int, cpbal: int, packed, fp, ts: int) -> None:
             torch.save(
-                {"kv_nat": tensor.clone().view(torch.uint8)},
+                {"kv_nat": packed.clone().view(torch.uint8), "kv_fp_nat": fp.clone()},
                 out / f"kv_cpbal{cpbal}_layer{layer}_rank{rank}_pid{100 + rank}_{ts}.pt",
             )
 
+        # layer 0: the packed (int8) copy is identical but the FP copy is not --
+        # exactly the blind spot that quantized dumps cannot see.
+        fp0 = base_fp.clone()
+        fp0[64:, :8] = (fp0[64:, :8].float() + 0.01).to(torch.float16)
+        # layer 1: both copies differ from token 64 on.
+        packed1 = base.clone()
+        packed1[64:, :32] = (packed1[64:, :32].to(torch.int16) + 2).to(torch.int8)
+        fp1 = base_fp.clone()
+        fp1[64:, :8] = (fp1[64:, :8].float() + 1.0).to(torch.float16)
+
         for rank in range(2):
-            for layer in (0, 1):
-                dump(layer, rank, 0, base, 1000)
-            dump(0, rank, 1, base, 1001)
-            shifted = base.clone()
-            shifted[64:, :32] = (shifted[64:, :32].to(torch.int16) + 2).to(torch.int8)
-            dump(1, rank, 1, shifted, 1001)
+            dump(0, rank, 0, base, base_fp, 1000)
+            dump(1, rank, 0, base, base_fp, 1000)
+            dump(0, rank, 1, base, fp0, 1001)
+            dump(1, rank, 1, packed1, fp1, 1001)
 
         args = argparse.Namespace(dir=str(out), summary_only=True)
         buffer = io.StringIO()
@@ -404,19 +413,23 @@ def test_check_zigzag_kv_summary_names_first_diverging_layer() -> None:
             rc = checker.check_kv(args)
         text = buffer.getvalue()
         assert rc == 1, text
-        assert "FIRST DIVERGENCE: layer 1" in text, text
+        assert "[kv/fp  ]" in text, text
+        # The FP copy must win: it sees layer 0, which the int8 copy reports as clean.
+        assert "FIRST DIVERGENCE (fp): layer 0" in text, text
         assert "first token 64" in text, text
-        assert "max|int8| 2" in text, text
+        assert "1.001e-02" in text, text  # magnitude in real units, not int8 steps
+        assert "[kv/int8]     0     0/2" in text, text  # the blind spot the FP copy closes
 
-        # Identical layouts must report no divergence at all.
+        # Identical layouts (both copies) must report no divergence at all.
         for rank in range(2):
-            dump(1, rank, 1, base, 1002)
+            dump(0, rank, 1, base, base_fp, 1002)
+            dump(1, rank, 1, base, base_fp, 1002)
         buffer = io.StringIO()
         with redirect_stdout(buffer):
             rc = checker.check_kv(args)
         text = buffer.getvalue()
         assert rc == 0, text
-        assert "FIRST DIVERGENCE: none" in text, text
+        assert "FIRST DIVERGENCE (fp): none" in text, text
     finally:
         shutil.rmtree(out, ignore_errors=True)
 
