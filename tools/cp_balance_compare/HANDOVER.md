@@ -311,6 +311,8 @@ python tools/cp_balance_compare/check_zigzag_dumps.py --dir /root/cp_probe \
 
 | commit | 内容 |
 | --- | --- |
+| `0b6b2993c` | 判读健壮性：载荷宽度不一致不再崩/误判（rc=2）、act 的 `max\|d\|` 去 NaN 陷阱 |
+| `872f401ae` | 清理：删 2call 整条路径与 `l1024` 模式、selfcheck 瘦身 787→491 行、自测 18.3s→6.8s |
 | `51a4383fd` | 量化输入打点（`qin:<层>`）：一轮区分"量化"与"GEMM"两种根因；MLP hook 的元组静默跳过改为告警；probe 默认 spec 收敛到 layer 0/1 |
 | `c17005a01` | 文档 review：修 10 处事实/一致性/可执行性问题 |
 | `0877aa35a` | MLP 内部再切三段：`gate_up_proj`/`down_proj` 打点（`gu_out`/`dn_in`） |
