@@ -43,7 +43,7 @@
 | `check_zigzag_dumps.py` | CPU 侧判读 dump（`kv` / `topk` / `act`，见 §五） | 否 |
 | `compare_cp_rounds.py` | 把多轮 `summary.json` 并排，回答"改了某个变量后 `C−B` 是否回到噪声级" | 否 |
 | `mock_vllm_server.py` / `selftest_mock.py` | 假 server + CPU 自测（45 项：协议解析、指纹/payload、dump 判读、launcher 静态检查、端到端） | 否 |
-| `selfcheck.py` | 一键自检（现场体检 + 自测 + 配置门 + 命令预演）；`--collect` 收整轮证据 | 否 |
+| `selfcheck.py` | 环境体检（解释器/依赖/import 来源/NPU/端口/磁盘/残留进程）+ 跑一遍自测 + `--collect` 收整轮证据。**不做**配置门与命令预演——那两件事由 `ab_cp_compare.py --preflight` 与 `run_cp_diag.sh <mode> --dry-run` 负责（每轮都会跑，不会腐化） | 否 |
 | `prepare_env.sh` | 一次性 `source` 站点 rc + vendor 环境并 `export CP_AB_SKIP_SOURCE=1`，省掉每轮两次 source；**必须 source** | 否 |
 
 ## 四、一轮 NPU 轮次怎么跑
@@ -56,7 +56,6 @@
 | `sweep` | `r_sweep` | B/C + `kv:all` 全层 KV dump | 第几层的 KV 先不等（→ 上一层输出进入） |
 | `baseline` | `r1_baseline` | B/C/B2 + `topk:6,kv:0,6` | 现状差异多大、落在哪个分片 |
 | `check` | — | 直接 `exec check_zigzag_dumps.py --dir <dump> --kind ${KIND:-both}`（`KIND=act` 自动加 `--summary-only`） | 判读（不需要 NPU） |
-| `2call` / `l1024` | `r2_2call` / `r3_l1024` | 见 §七"已判定无信息量/低优先级" | 历史实验，按需 |
 
 ```bash
 # 当前这一步（一轮 ≈ 20 分钟，2 次模型加载）
@@ -125,7 +124,9 @@ in ─attention─▶ out ─pre-MLP norm─▶ mlp_in ─[量化]─▶ gu_q �
 - 退出码：**1** = 发现真差异/违规（kv 数值不同、topk 集合不同、dump 与因果窗口不符）；**0** = 干净（含"只翻零点符号位"的亚量化）；**2** = 找不到 dump。
 
 其它工具：`compare_cp_rounds.py <轮1>=<目录> <轮2>=<目录>` 并排多轮指标（回到噪声级 rc=0、仍超阈 1、无可比 case 2）；
-`selfcheck.py` 首跑/换机器时跑一次即可（**日常迭代不要重复跑**）。
+`selfcheck.py` 首跑/换机器时跑一次即可（**日常迭代不要重复跑**）；配置门与命令预演它不再重复实现：
+`python tools/cp_balance_compare/ab_cp_compare.py --preflight`（判据末行 `[preflight] all configs OK`）
+与 `bash tools/cp_balance_compare/run_cp_diag.sh probe --dry-run`。
 
 ## 六、指标与判定口径（driver）
 
@@ -141,12 +142,17 @@ in ─attention─▶ out ─pre-MLP norm─▶ mlp_in ─[量化]─▶ gu_q �
 driver 每个配置都会：校验 `[cp-ab]` 指纹与 `[cp-ab-cfg]` 里的 `additional_config`（`--config-check strict`）、
 确认 C 真进了 zigzag（`--zigzag-check strict`，没进就 `--on-zigzag-miss skip` 停掉整轮非 0 退出）。
 
-## 七、历史模式的状态（别重复跑）
+## 七、已删除的实验（别再去找开关）
 
-| 模式 | 状态 |
+| 曾经的模式 | 为什么删掉 |
 | --- | --- |
-| `2call`（`MERGED_CALL=0`） | **已判定无信息量**：只改 attention/indexer 的调用形状，而 layer 0 的 attention 输出在 B/C 下逐字节相同 |
-| `l1024`（`MIN_TOKENS=1024`） | 低优先级：查 `MIN_TOKENS` 边界是否被遵守，与本问题无直接关系 |
+| `2call`（`VLLM_ASCEND_CP_BALANCE_MERGED_CALL=0`，prev/next 两次调用） | A/B 已判定**无信息量**：它只改 attention/indexer 的调用形状，而 layer 0 的 attention 输出在 B/C 下逐字节相同。开关、两条调用分支与 `run_cp_diag.sh 2call` 一并删除（需要时从 git 历史取回） |
+| `l1024`（`MIN_TOKENS=1024`） | 只查 `MIN_TOKENS` 边界是否被遵守，与本问题无关。`MIN_TOKENS` 本身仍是产品开关，可用 `MIN_TOKENS=1024 PROMPT_LENS=1024 run_cp_diag.sh probe` 复现 |
+
+仍然有效的两条判读约定：
+
+| 约定 | 说明 |
+| --- | --- |
 | `--kind topk` 的 P1 断言 | 只对**短 prompt**（`< index_topk`）有信息量；长 prompt 下 indexer 走全选捷径，identity 断言不适用 |
 | `baseline` 的 `B2` | 噪声地板已实测为 0；除非换机器/换 TP，可 `--no-repeat` 省一次加载 |
 

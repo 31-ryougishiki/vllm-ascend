@@ -293,11 +293,18 @@ def verify_config(name: str, args: argparse.Namespace, log_path: Path) -> bool:
         return True
     expected = expected_fingerprint(name, args)
     line = None
-    for _ in range(10):
+    # Bounded wait for the launcher's fingerprint line: it is printed at start-up,
+    # but the driver may look before the child process got there.  The budget is a
+    # knob so the CPU selftest can assert the "no fingerprint" branch without
+    # sleeping through it.
+    wait_s = float(getattr(args, "fingerprint_wait_s", 5.0))
+    attempts = max(1, int(round(wait_s / 0.5)))
+    for _ in range(attempts):
         line = last_fingerprint(log_path)
         if line is not None:
             break
-        time.sleep(0.5)
+        if wait_s > 0:
+            time.sleep(0.5)
     if line is None:
         message = (
             f"server_{name}.log has no {FINGERPRINT_PREFIX} fingerprint; cannot "
@@ -843,7 +850,12 @@ def query_batch(url: str, args: argparse.Namespace, prompts: list[Prompt]) -> li
             return results
         except Exception as exc:  # noqa: BLE001
             last_err = exc
-            time.sleep(2 * (attempt + 1))
+            # Backoff is a driver knob: on a real box a failed request usually
+            # means the server is still loading (seconds matter), while the CPU
+            # selftest only wants the retry path exercised -- it passes 0.
+            backoff = float(getattr(args, "http_retry_backoff", 2.0))
+            if backoff > 0:
+                time.sleep(backoff * (attempt + 1))
     raise RuntimeError(f"request failed after {args.http_retries} tries: {last_err}")
 
 
@@ -1579,6 +1591,13 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     )
     parser.add_argument("--http-timeout", type=float, default=900)
     parser.add_argument("--http-retries", type=int, default=3)
+    parser.add_argument(
+        "--http-retry-backoff",
+        type=float,
+        default=2.0,
+        help="seconds multiplied by the attempt number between request retries "
+        "(0 = retry immediately; the CPU selftest uses 0)",
+    )
     parser.add_argument("--delta-threshold", type=float, default=0.05)
     parser.add_argument("--run-len", type=int, default=8)
     parser.add_argument("--agree-window", type=int, default=65)

@@ -174,6 +174,9 @@ def test_fingerprint_verification() -> None:
     try:
         strict = driver.parse_args(["--out", str(out), "--config-check", "strict"])
         warn = driver.parse_args(["--out", str(out), "--config-check", "warn"])
+        # The "no fingerprint" branch below must not wait out the real budget.
+        strict.fingerprint_wait_s = 0.0
+        warn.fingerprint_wait_s = 0.0
         log = out / "server_C.log"
 
         expected = driver.expected_fingerprint("C", strict)
@@ -1581,7 +1584,7 @@ def test_verify_response_used_by_query_batch() -> None:
     servers, urls = mock.start_mock_servers({"bad": 0.0})
     try:
         servers[0].break_mode = "truncate"
-        args = driver.parse_args(["--topk", "3", "--http-retries", "1"])
+        args = driver.parse_args(["--topk", "3", "--http-retries", "1", "--http-retry-backoff", "0"])
         try:
             driver.query_batch(urls["bad"], args, [[11, 22, 33]])
         except RuntimeError as exc:
@@ -1597,7 +1600,7 @@ def test_batch_prompt_echoes_per_choice() -> None:
     """A batch request must echo each choice's own tokens, not the flattened list."""
     servers, urls = mock.start_mock_servers({"ok": 0.0})
     try:
-        args = driver.parse_args(["--topk", "3", "--http-retries", "1"])
+        args = driver.parse_args(["--topk", "3", "--http-retries", "1", "--http-retry-backoff", "0"])
         prompts = [[1, 2, 3, 4], [9, 10, 11, 12]]
         entries = driver.query_batch(urls["ok"], args, prompts)
         assert [entry["prompt_token_ids"] for entry in entries] == prompts
@@ -1784,10 +1787,26 @@ def test_end_to_end_against_mock() -> None:
 
 
 def main() -> int:
+    """Run every ``test_*`` in this module; print per-test time and the slowest.
+
+    The CPU self test is the only regression gate on a box without an NPU, so it
+    has to stay cheap enough to run after every change; the timing line makes a
+    newly expensive test visible instead of felt as "the selftest is slow".
+    """
+    import time
+
     tests = [value for name, value in sorted(globals().items()) if name.startswith("test_") and callable(value)]
+    timings: list[tuple[float, str]] = []
+    started = time.perf_counter()
     for test in tests:
+        begin = time.perf_counter()
         test()
+        elapsed = time.perf_counter() - begin
+        timings.append((elapsed, test.__name__))
         print(f"[ok] {test.__name__}")
+    total = time.perf_counter() - started
+    slowest = ", ".join(f"{name}={secs:.1f}s" for secs, name in sorted(timings, reverse=True)[:5])
+    print(f"[time] {len(tests)} tests in {total:.1f}s; slowest: {slowest}")
     print("SELFTEST OK")
     return 0
 

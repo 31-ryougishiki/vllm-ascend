@@ -1350,7 +1350,6 @@ class AscendSFAImpl(MLAAttentionImpl):
     # CP_BALANCE diagnostics defaults.  Declared on the class so a subclass that
     # builds itself through a different __init__ chain can never trip over a
     # missing attribute from the diagnostic paths.
-    _zigzag_merged_call: bool = True
     _zigzag_dump_dir: str = SFA_ZIGZAG_DUMP_DIR
     _zigzag_dump_topk_layers: set[int] | None = None
     _zigzag_dump_kv_layers: set[int] | None = None
@@ -1506,8 +1505,7 @@ class AscendSFAImpl(MLAAttentionImpl):
 
         # ---- CP_BALANCE zigzag diagnostics (inert unless DUMP is set) ----
         # Read once at init: the forward path must not pay an os.environ lookup
-        # per call.  See CP_BALANCE_精度问题_下一步行动计划.md.
-        self._zigzag_merged_call = bool(ascend_envs.VLLM_ASCEND_CP_BALANCE_MERGED_CALL)
+        # per call.
         dump_spec = _parse_dump_spec(ascend_envs.VLLM_ASCEND_CP_BALANCE_DUMP)
         self._zigzag_dump_topk_layers = dump_spec.get("topk")
         self._zigzag_dump_kv_layers = dump_spec.get("kv")
@@ -2692,88 +2690,6 @@ class AscendSFAImpl(MLAAttentionImpl):
             block_table=block_table,
         )
 
-    def _indexer_select_post_process_zigzag(
-        self,
-        x: torch.Tensor,
-        q_c: torch.Tensor | tuple[torch.Tensor, torch.Tensor],
-        kv_cache: tuple[torch.Tensor, ...],
-        attn_metadata: M,
-        cos: torch.Tensor,
-        sin: torch.Tensor,
-    ) -> torch.Tensor:
-        """Run the LightningIndexer twice over the prev/next zigzag halves.
-
-        This is the pre-merge call shape (see git 143b3a573, which replaced it
-        with the merged 2 * B single call).  It is kept behind
-        ``VLLM_ASCEND_CP_BALANCE_MERGED_CALL=0`` so a single A/B round can tell
-        the merged-batch kernels apart from the shared metadata: both shapes
-        describe exactly the same math, with the same per-batch
-        ``(actual_seq_lengths_query, actual_seq_lengths_key)`` conventions.
-
-        ``x``, ``q_c`` and the derived weights are already in
-        [all_prev_blocks, all_next_blocks] local order.  The split point is
-        ``total_q_prev_tokens``, so multi-request and uneven blocks are split
-        at the true prev/next boundary instead of a hard-coded ``q_half``.
-        """
-        ctx = attn_metadata.dsa_cp_context
-        assert ctx is not None and ctx.zigzag_index is not None
-        split = ctx.total_q_prev_tokens
-        if split <= 0:
-            raise RuntimeError(
-                "zigzag indexer split point must be positive, got "
-                f"total_q_prev_tokens={split}"
-            )
-
-        assert self.wk_weights_proj is not None
-        kw, _ = self.wk_weights_proj(x)
-        weights = kw[:, self.head_dim :]
-        q_li, q_li_scale, q_li_shape_ori = self._indexer_qk_proj(
-            q_c, cos, sin, output_dtype=x.dtype
-        )
-        record_attention_compute_start()
-
-        parts = []
-        for split_idx, (token_count, q_len, kv_len) in enumerate(
-            (
-                (split, ctx.q_len_prev, ctx.kv_len_prev),
-                (ctx.total_q_next_tokens, ctx.q_len_next, ctx.kv_len_next),
-            )
-        ):
-            start = 0 if split_idx == 0 else split
-            if q_li_shape_ori is None:
-                q_li_h = q_li[start : start + token_count]
-                q_li_scale_h = None
-            else:
-                # LI-C8 flattens q_li to [T * n_head, head_dim].
-                head_start = start * self.n_head
-                head_end = head_start + token_count * self.n_head
-                q_li_h = q_li[head_start:head_end]
-                q_li_scale_h = (
-                    q_li_scale[head_start:head_end] if q_li_scale is not None else None
-                )
-            shape_h = (
-                (token_count, *q_li_shape_ori[1:])
-                if q_li_shape_ori is not None
-                else None
-            )
-            weights_h = weights[start : start + token_count]
-            parts.append(
-                DeviceOperator.indexer_select_post_process(
-                    self,
-                    q_li_h,
-                    q_li_scale_h,
-                    shape_h,
-                    weights_h,
-                    kv_cache,
-                    attn_metadata,
-                    q_len,
-                    kv_len,
-                    self.enable_sparse_li_c8,
-                    self.use_torch_npu_lightning_indexer,
-                )
-            )
-        return torch.cat(parts, dim=0)
-
     def _get_indexcache_topk_indices(self, num_tokens: int) -> torch.Tensor:
         if self.topk_indices_buffer is None:
             raise RuntimeError("IndexCache requires topk_indices_buffer when skip_topk is enabled.")
@@ -3379,36 +3295,24 @@ class AscendSFAImpl(MLAAttentionImpl):
                 assert q_c is not None
                 assert attn_metadata.dsa_cp_context is not None
                 ctx = attn_metadata.dsa_cp_context
-                if self._zigzag_merged_call:
-                    assert ctx.actual_seq_lengths_query_zigzag is not None
-                    assert ctx.actual_seq_lengths_key_zigzag is not None
-                    assert ctx.block_table_zigzag is not None
-                    # Single LightningIndexer call: prev and next are two batches
-                    # per request in the same TND tensor, distinguished by the
-                    # merged cumulative query lengths / per-batch KV lengths and
-                    # the duplicated block_table rows.
-                    topk_indices = self.indexer_select_post_process(
-                        x=hidden_states,
-                        q_c=q_c,
-                        kv_cache=kv_cache,
-                        attn_metadata=attn_metadata,
-                        cos=cos,
-                        sin=sin,
-                        actual_seq_lengths_query=ctx.actual_seq_lengths_query_zigzag,
-                        actual_seq_lengths_key=ctx.actual_seq_lengths_key_zigzag,
-                        block_table=ctx.block_table_zigzag,
-                    )
-                else:
-                    # A/B knob: prev/next as two single-batch calls.  Same math,
-                    # same metadata conventions, no duplicated block_table.
-                    topk_indices = self._indexer_select_post_process_zigzag(
-                        x=hidden_states,
-                        q_c=q_c,
-                        kv_cache=kv_cache,
-                        attn_metadata=attn_metadata,
-                        cos=cos,
-                        sin=sin,
-                    )
+                assert ctx.actual_seq_lengths_query_zigzag is not None
+                assert ctx.actual_seq_lengths_key_zigzag is not None
+                assert ctx.block_table_zigzag is not None
+                # Single LightningIndexer call: prev and next are two batches per
+                # request in the same TND tensor, distinguished by the merged
+                # cumulative query lengths / per-batch KV lengths and the
+                # duplicated block_table rows.
+                topk_indices = self.indexer_select_post_process(
+                    x=hidden_states,
+                    q_c=q_c,
+                    kv_cache=kv_cache,
+                    attn_metadata=attn_metadata,
+                    cos=cos,
+                    sin=sin,
+                    actual_seq_lengths_query=ctx.actual_seq_lengths_query_zigzag,
+                    actual_seq_lengths_key=ctx.actual_seq_lengths_key_zigzag,
+                    block_table=ctx.block_table_zigzag,
+                )
                 if self.use_index_cache:
                     self._update_indexcache_topk_indices(topk_indices)
                 self._maybe_dump_topk(topk_indices, attn_metadata, True)
@@ -3433,49 +3337,21 @@ class AscendSFAImpl(MLAAttentionImpl):
         if zigzag_active:
             assert attn_metadata.dsa_cp_context is not None
             ctx = attn_metadata.dsa_cp_context
-            if self._zigzag_merged_call:
-                assert ctx.actual_seq_lengths_query_zigzag is not None
-                assert ctx.actual_seq_lengths_key_zigzag is not None
-                assert ctx.block_table_zigzag is not None
-                # Single SFA call: Q and topk_indices stay in [prev, next] local
-                # order; the merged metadata describes each half as one batch.
-                attn_output = self._execute_sparse_flash_attention_process(
-                    ql_nope,
-                    q_pe,
-                    kv_cache,
-                    topk_indices,
-                    attn_metadata,
-                    ctx.actual_seq_lengths_query_zigzag,
-                    ctx.actual_seq_lengths_key_zigzag,
-                    block_table=ctx.block_table_zigzag,
-                )
-            else:
-                # A/B knob: prev/next as two single-batch SFA calls, split at
-                # the true prev/next boundary.
-                split = ctx.total_q_prev_tokens
-                if split <= 0:
-                    raise RuntimeError(
-                        f"zigzag SFA split point must be positive, got total_q_prev_tokens={split}"
-                    )
-                attn_prev = self._execute_sparse_flash_attention_process(
-                    ql_nope[:split],
-                    q_pe[:split],
-                    kv_cache,
-                    topk_indices[:split],
-                    attn_metadata,
-                    ctx.q_len_prev,
-                    ctx.kv_len_prev,
-                )
-                attn_next = self._execute_sparse_flash_attention_process(
-                    ql_nope[split:],
-                    q_pe[split:],
-                    kv_cache,
-                    topk_indices[split:],
-                    attn_metadata,
-                    ctx.q_len_next,
-                    ctx.kv_len_next,
-                )
-                attn_output = torch.cat([attn_prev, attn_next], dim=0)
+            assert ctx.actual_seq_lengths_query_zigzag is not None
+            assert ctx.actual_seq_lengths_key_zigzag is not None
+            assert ctx.block_table_zigzag is not None
+            # Single SFA call: Q and topk_indices stay in [prev, next] local
+            # order; the merged metadata describes each half as one batch.
+            attn_output = self._execute_sparse_flash_attention_process(
+                ql_nope,
+                q_pe,
+                kv_cache,
+                topk_indices,
+                attn_metadata,
+                ctx.actual_seq_lengths_query_zigzag,
+                ctx.actual_seq_lengths_key_zigzag,
+                block_table=ctx.block_table_zigzag,
+            )
         else:
             attn_output = self._execute_sparse_flash_attention_process(
                 ql_nope,

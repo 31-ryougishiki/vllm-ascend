@@ -1,14 +1,14 @@
 #!/usr/bin/env python3
 """Compare several CP_BALANCE A/B rounds side by side (CPU only, no NPU).
 
-读取每轮的 ``summary.json``，把关键指标并排打印，并直接回答 T1 的问题：
-"回退 prev/next 两次调用后，C−B 是否回到噪声级？"
+读取每轮的 ``summary.json``，把关键指标并排打印，回答"改了这个变量之后，
+``C−B`` 是否回到噪声级"。
 
 用法::
 
     python tools/cp_balance_compare/compare_cp_rounds.py \
-        baseline=/dev/shm/cp_ab/r1_baseline \
-        2call=/dev/shm/cp_ab/r2_2call
+        before=/dev/shm/cp_ab/r_probe \
+        after=/dev/shm/cp_ab_sweep/r_sweep
 
 每轮目录由 ``run_cp_diag.sh`` 产出（含 ``summary.json``）。
 判定口径与 driver 一致：``p99|d|C-B <= threshold`` 视为回到噪声级

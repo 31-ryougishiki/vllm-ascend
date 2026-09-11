@@ -13,44 +13,40 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 # This file is a part of the vllm-ascend project.
-"""One-shot self check before the first cp_balance A/B round (no NPU needed).
+"""One-shot self check for a new site or a repaired environment (no NPU needed).
 
 Typical use, from the vllm-ascend repository root::
 
     python tools/cp_balance_compare/selfcheck.py
 
-    # keep the site launcher explicit
-    python tools/cp_balance_compare/selfcheck.py \\
-        --launcher "bash tools/cp_balance_compare/launcher_glm52_w4a4c8_mxfp4.sh {port}"
-
-The script runs four groups of checks and prints, for every one of them, the
-result it expects, so a single log is enough to decide whether the expensive
+The script runs two groups of checks and prints, for every one of them, the
+result it expects, so a single log is enough to decide whether an expensive
 A/B round can start:
 
-1. **site**     -- repository / interpreter / dependencies / ``vllm_ascend``
-                   import source / NPU / port / disk / leftovers;
-2. **driver**   -- ``selftest_mock.py`` against the local mock vLLM server
-                   (no NPU, no model load);
-3. **config**   -- the launcher's ``DRY_RUN=1`` fingerprint for B, C and B2
-                   (the hard gate: ``SPEC``/``KV`` must be 0 or C silently
-                   falls back to the continuous-slice path);
-4. **round**    -- the exact command line ``run_cp_diag.sh baseline`` would run.
+1. **site**   -- repository / interpreter / dependencies / ``vllm_ascend``
+                 import source / NPU / port / disk / leftovers;
+2. **driver** -- ``selftest_mock.py`` against the local mock vLLM server
+                 (no NPU, no model load).
 
-After the round, the same script can collect the evidence to send back::
+Two things it deliberately does **not** duplicate, because the tools that own
+them already run them on every round (and a copy here only rots):
+
+* the configuration gate -- ``python tools/cp_balance_compare/ab_cp_compare.py --preflight``
+  (``--config-check strict`` is also applied to every real round);
+* the round command preview -- ``bash tools/cp_balance_compare/run_cp_diag.sh <mode> --dry-run``.
+
+After the round, the same script collects the evidence to send back::
 
     python tools/cp_balance_compare/selfcheck.py --collect
 
-Exit codes: ``0`` = ready to run the baseline round, ``1`` = at least one FAIL,
+Exit codes: ``0`` = ready to run a round, ``1`` = at least one FAIL,
 ``2`` = the script could not continue (bad repository layout).
 """
 
 from __future__ import annotations
 
 import argparse
-import contextlib
 import importlib
-import importlib.util
-import io
 import json
 import os
 import shutil
@@ -64,22 +60,10 @@ from typing import Any
 
 HERE = Path(__file__).resolve().parent
 REPO_ROOT = HERE.parent.parent
-DEFAULT_LAUNCHER = "bash tools/cp_balance_compare/launcher_glm52_w4a4c8_mxfp4.sh {port}"
 DEFAULT_DUMP_DIR = "/dev/shm/cp_balance_dump"
 DEFAULT_OUT_ROOT = "/dev/shm/cp_ab"
 
 PASS, WARN, FAIL, INFO = "PASS", "WARN", "FAIL", "INFO"
-
-TOOL_FILES = (
-    "ab_cp_compare.py",
-    "check_zigzag_dumps.py",
-    "compare_cp_rounds.py",
-    "run_cp_diag.sh",
-    "selftest_mock.py",
-    "mock_vllm_server.py",
-    "launcher_template.sh",
-)
-
 
 class Report:
     """Check results, mirrored to stdout and (optionally) to a log file."""
@@ -146,21 +130,6 @@ def _failure_excerpt(lines: list[str], span: int = 8) -> list[str]:
 # --------------------------------------------------------------------------- #
 # 1. site checks
 # --------------------------------------------------------------------------- #
-
-
-def check_tools(report: Report) -> bool:
-    missing = [name for name in TOOL_FILES if not (HERE / name).is_file()]
-    status = FAIL if missing else PASS
-    detail = f"{HERE}"
-    if missing:
-        detail += f" | 缺失: {', '.join(missing)}"
-    report.item(
-        status,
-        "工具目录",
-        detail,
-        "上面 7 个文件都在 tools/cp_balance_compare/ 下",
-    )
-    return not missing
 
 
 def check_interpreter(report: Report) -> None:
@@ -400,208 +369,6 @@ def run_selftest(report: Report, timeout: float = 900.0) -> None:
 
 
 # --------------------------------------------------------------------------- #
-# 3. configuration gate (launcher DRY_RUN + fingerprint)
-# --------------------------------------------------------------------------- #
-
-
-def load_driver(report: Report):
-    path = HERE / "ab_cp_compare.py"
-    try:
-        spec = importlib.util.spec_from_file_location("cp_balance_selfcheck_driver", path)
-        module = importlib.util.module_from_spec(spec)
-        sys.modules["cp_balance_selfcheck_driver"] = module
-        assert spec.loader is not None
-        spec.loader.exec_module(module)
-        return module
-    except Exception as exc:  # noqa: BLE001
-        report.item(FAIL, "载入 driver", f"{type(exc).__name__}: {exc}", "ab_cp_compare.py 能 import")
-        return None
-
-
-def _token_int(text: str, key: str) -> int | None:
-    """Value of a ``key=<int>`` token in a one-line log/echo line."""
-    for token in text.split():
-        name, sep, value = token.partition("=")
-        if sep and name == key:
-            try:
-                return int(value)
-            except ValueError:
-                return None
-    return None
-
-
-def _evaluate_launcher(
-    report: Report, driver: Any, args: argparse.Namespace, name: str
-) -> None:
-    """One config: run the launcher with DRY_RUN=1 and judge what it reports.
-
-    Reuses the driver's own ``_launcher_dry_run`` (the same helper ``preflight``
-    uses) so the env injection can never drift from a real run.
-    """
-    try:
-        rc, out, err = driver._launcher_dry_run(args, name)
-    except Exception as exc:  # noqa: BLE001
-        report.item(FAIL, f"配置 {name}", f"launcher 调用异常: {exc}", "见下方期望指纹")
-        return
-    lines = out.splitlines()
-    fp_line = driver.find_fingerprint(out)
-    cfg_line = next((line for line in lines if driver.CFG_JSON_PREFIX in line), None)
-    dry_line = next((line for line in lines if "dry-run" in line), "")
-    err_lines = [line for line in err.splitlines() if line.strip()]
-
-    report.say(f"         {name} 指纹行 : {fp_line or '(缺失)'}")
-    report.say(f"         {name} cfg 行 : {cfg_line or '(缺失)'}")
-    report.say(f"         {name} dry-run: {dry_line}")
-    for line in err_lines[:10]:
-        report.say(f"         {name} stderr : {line}")
-
-    expected = driver.expected_fingerprint(name, args)
-    actual = driver.parse_fingerprint(fp_line) if fp_line else {}
-    problems: list[str] = []
-    notes: list[str] = []
-    if rc is None:
-        problems.append("launcher 不认 DRY_RUN（已超时被杀，可能直接开始加载模型）")
-    elif rc != 0:
-        problems.append(f"dry-run 退出码 rc={rc}")
-    if fp_line is None:
-        problems.append("没有 [cp-ab] 指纹行，无法确认 env 覆盖是否生效")
-    elif actual != expected:
-        problems.append(f"指纹不符 expected={expected} actual={actual}")
-    if cfg_line is None:
-        notes.append("没有 [cp-ab-cfg] 行，additional_config 只做了 6 个 flag 级校验")
-    else:
-        try:
-            actual_cfg = json.loads(cfg_line.split(driver.CFG_JSON_PREFIX, 1)[1].strip())
-        except (IndexError, json.JSONDecodeError):
-            actual_cfg = None
-        expected_cfg = driver.expected_additional_config(name, args)
-        if actual_cfg != expected_cfg:
-            problems.append(
-                f"additional_config 不一致: expected={json.dumps(expected_cfg, ensure_ascii=False)} "
-                f"actual={json.dumps(actual_cfg, ensure_ascii=False)}"
-            )
-    if any("WARN" in line for line in err_lines):
-        notes.append("launcher 有 WARN（重点看 vendor set_env.bash 是否找到）")
-
-    tp = _token_int(dry_line, "tp")
-    if tp is not None and tp != int(args.cp_size):
-        notes.append(
-            f"launcher tp={tp} 与 driver --cp-size={args.cp_size} 不一致"
-            "（zigzag 的 cp_size 就是 tensor parallel size，两者必须相等）"
-        )
-
-    status = FAIL if problems else (WARN if notes else PASS)
-    detail = "; ".join(problems + notes) if (problems or notes) else "指纹与 additional_config 全部一致"
-    if actual:
-        detail += (
-            f" | CP_BALANCE={actual.get('CP_BALANCE')} DSA_CP={actual.get('DSA_CP')}"
-            f" MIN_TOKENS={actual.get('MIN_TOKENS')} SPEC={actual.get('SPEC')} KV={actual.get('KV')}"
-        )
-    report.item(
-        status,
-        f"配置 {name}",
-        detail,
-        "B: CP_BALANCE=0；C: CP_BALANCE=1；两者 DSA_CP=1 MIN_TOKENS=2048 EMBED_LOCAL=0 "
-        "SPEC=0 KV=0（SPEC/KV 非 0 → zigzag 不激活，C 会退化成 B）",
-    )
-
-
-def check_config_gate(
-    report: Report,
-    driver: Any,
-    launcher: str,
-    base_port: int,
-    repo_root: Path,
-) -> None:
-    args = driver.parse_args(
-        [
-            "--launcher", launcher,
-            "--configs", "B,C",
-            "--repeat-a",
-            "--base-port", str(base_port),
-            "--cp-size", str(driver.cp_size_default()),
-            "--repo-root", str(repo_root),
-        ]
-    )
-    names = ["B", "C", "B2"]
-    report.say(
-        f"[INFO] zigzag cp_size（= tensor parallel size）= {args.cp_size}；"
-        "launcher dry-run 打印的 tp= 必须与它一致（$CP_SIZE/$TP_SIZE 可覆盖）"
-    )
-    report.say("[INFO] driver 期望指纹（由 ab_cp_compare 自己算出来的）:")
-    for name in names:
-        report.say(f"         {name}: {json.dumps(driver.expected_fingerprint(name, args), sort_keys=True)}")
-    report.say("[INFO] driver 会给 server 注入的关键 env:")
-    for name in ("B", "C"):
-        env = driver.resolved_config(name, args)
-        report.say(
-            f"         {name}: CP_BALANCE={env['VLLM_ASCEND_CP_BALANCE']} "
-            f"MIN_TOKENS={env['VLLM_ASCEND_CP_BALANCE_MIN_TOKENS']} "
-            f"EMBED_LOCAL={env['VLLM_ASCEND_CP_BALANCE_EMBED_LOCAL']} "
-            f"SPEC={env['VLLM_ASCEND_SPEC_CONFIG']!r} "
-            f"KV={env['VLLM_ASCEND_KV_TRANSFER_CONFIG']!r}"
-        )
-    for name in ("B", "C"):
-        _evaluate_launcher(report, driver, args, name)
-
-    buffer = io.StringIO()
-    try:
-        with contextlib.redirect_stdout(buffer):
-            rc = driver.preflight(args, names)
-    except Exception as exc:  # noqa: BLE001
-        rc = 1
-        buffer.write(f"preflight 抛异常: {type(exc).__name__}: {exc}")
-    report.say("[INFO] driver --preflight 原始输出:")
-    for line in buffer.getvalue().rstrip().splitlines():
-        report.say(f"         {line}")
-    report.item(
-        PASS if rc == 0 else FAIL,
-        "driver preflight",
-        f"退出码 rc={rc}",
-        "打印 [preflight] all configs OK",
-    )
-
-
-# --------------------------------------------------------------------------- #
-# 4. round preview
-# --------------------------------------------------------------------------- #
-
-
-def preview_round(report: Report, repo_root: Path, base_port: int) -> None:
-    script = HERE / "run_cp_diag.sh"
-    if shutil.which("bash") is None:
-        report.item(WARN, "baseline 轮命令预览", "找不到 bash", "在 NPU 机器上会打印完整命令")
-        return
-    proc = _run(["bash", str(script), "baseline", "--dry-run"], cwd=repo_root, timeout=300.0)
-    if proc is None:
-        report.item(FAIL, "baseline 轮命令预览", "执行 run_cp_diag.sh 失败", "打印完整命令")
-        return
-    report.say("[INFO] run_cp_diag.sh baseline --dry-run 输出:")
-    for line in proc.stdout.splitlines():
-        report.say(f"         {line}")
-    for line in proc.stderr.splitlines():
-        report.say(f"         stderr| {line}")
-    out = proc.stdout
-    ok = proc.returncode == 0 and "ab_cp_compare.py" in out and "--configs" in out
-    detail = f"rc={proc.returncode}"
-    if "--repeat-a" not in out:
-        detail += " | 注意: 命令里没有 --repeat-a，拿不到噪声地板"
-    if "VLLM_ASCEND_CP_BALANCE_DUMP" not in out:
-        detail += " | 注意: 命令里没有 DUMP，T2/T3 无法判读"
-    if "--cp-size" not in out:
-        detail += " | 注意: 命令里没有 --cp-size，zigzag 分片标注会错"
-    if f"--base-port {base_port}" not in out:
-        detail += f" | 注意: 端口不是 {base_port}"
-    report.item(
-        PASS if ok else FAIL,
-        "baseline 轮命令预览",
-        detail,
-        "包含 --configs B,C --repeat-a --config-check strict --zigzag-check strict "
-        "和 VLLM_ASCEND_CP_BALANCE_DUMP=topk:6,kv:0,6",
-    )
-
-
-# --------------------------------------------------------------------------- #
 # evidence collection (after the round)
 # --------------------------------------------------------------------------- #
 
@@ -691,7 +458,6 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter
     )
     parser.add_argument("--repo-root", default=str(REPO_ROOT), help="vllm-ascend repository root")
-    parser.add_argument("--launcher", default=os.environ.get("LAUNCHER", DEFAULT_LAUNCHER))
     parser.add_argument("--base-port", type=int, default=8034)
     parser.add_argument("--dump-dir", default=DEFAULT_DUMP_DIR)
     parser.add_argument("--out-root", default=DEFAULT_OUT_ROOT)
@@ -724,10 +490,10 @@ def main(argv: list[str] | None = None) -> int:
 
     report.say(f"cp_balance selfcheck @ {time.strftime('%Y-%m-%d %H:%M:%S')}")
     report.say(f"repo_root = {repo_root}")
-    report.say(f"launcher  = {args.launcher}")
     report.say(f"base_port = {args.base_port}  dump_dir = {args.dump_dir}  out_root = {args.out_root}")
 
-    if not check_tools(report):
+    if not (HERE / "ab_cp_compare.py").is_file():
+        report.item(FAIL, "工具目录", f"{HERE} 里没有 ab_cp_compare.py", "从仓库根目录运行本脚本")
         report.close()
         return 2
 
@@ -748,19 +514,6 @@ def main(argv: list[str] | None = None) -> int:
         report.section("2. driver 自测（mock server，无 NPU）")
         run_selftest(report)
 
-    report.section("3. 配置门（launcher DRY_RUN=1 + 指纹）")
-    driver = load_driver(report)
-    if driver is not None:
-        old_cwd = os.getcwd()
-        try:
-            os.chdir(repo_root)
-            check_config_gate(report, driver, args.launcher, args.base_port, repo_root)
-        finally:
-            os.chdir(old_cwd)
-
-    report.section("4. baseline 轮命令预览")
-    preview_round(report, repo_root, args.base_port)
-
     report.section("总结")
     report.say(f"PASS={report.count(PASS)}  WARN={report.count(WARN)}  FAIL={report.count(FAIL)}")
     for status, name, detail in report.results:
@@ -768,14 +521,17 @@ def main(argv: list[str] | None = None) -> int:
             report.say(f"  [{status}] {name}: {detail}")
     if report.count(FAIL):
         report.say("")
-        report.say("[verdict] 有 FAIL，先修完再跑 baseline（跑一轮 = 2~3 次模型加载）。")
+        report.say("[verdict] 有 FAIL，先修完再跑轮次（跑一轮 = 2~3 次模型加载）。")
         rc = 1
     else:
         report.say("")
-        report.say("[verdict] READY：可以跑 baseline 轮")
-        report.say("  mkdir -p /dev/shm/cp_ab_logs")
-        report.say("  bash tools/cp_balance_compare/run_cp_diag.sh baseline 2>&1 \\")
-        report.say("      | tee /dev/shm/cp_ab_logs/run_baseline_$(date +%m%d_%H%M).log")
+        report.say("[verdict] READY：可以跑轮次")
+        # 配置门与命令预览不在本脚本里重复实现：驱动与 run_cp_diag 自己就带，
+        # 而且每轮都会跑（自检里那份会随指纹/spec 变化而腐化）。
+        report.say("  配置门（判据：末行 [preflight] all configs OK）:")
+        report.say("    python tools/cp_balance_compare/ab_cp_compare.py --preflight")
+        report.say("  命令预览（判据：打印 dir=/root/cp_probe 且 spec 含 qin:）:")
+        report.say("    bash tools/cp_balance_compare/run_cp_diag.sh probe --dry-run")
         rc = 0
     if report.path is not None:
         report.say(f"[selfcheck] 请把 {report.path} 发回来")

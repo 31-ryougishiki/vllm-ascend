@@ -4,9 +4,7 @@
 # 在 vllm-ascend 仓库根目录执行：
 #   bash tools/cp_balance_compare/run_cp_diag.sh baseline   # T0+T2+T3：基线 B/C/B2 + topk/KV dump
 #   bash tools/cp_balance_compare/run_cp_diag.sh sweep      # 多层扫描：B/C（无 B2）+ 全层 KV+FP dump
-#   bash tools/cp_balance_compare/run_cp_diag.sh probe      # op 级打点：B/C（无 B2）+ attention in/out 全精度剖面
-#   bash tools/cp_balance_compare/run_cp_diag.sh 2call      # T1：回退 prev/next 两次调用
-#   bash tools/cp_balance_compare/run_cp_diag.sh l1024      # T4：MIN_TOKENS=1024
+#   bash tools/cp_balance_compare/run_cp_diag.sh probe      # op 级打点：B/C（无 B2）+ 逐层激活/量化输入剖面
 #   bash tools/cp_balance_compare/run_cp_diag.sh check      # CPU 侧判读已有 dump（不需要 NPU）
 #   bash tools/cp_balance_compare/run_cp_diag.sh list       # 只打印将要执行的命令
 #   加 --no-repeat 可跳过 B2（等价于 REPEAT_A=0）
@@ -31,7 +29,7 @@
 set -euo pipefail
 
 # 参数解析：第一个非开关参数是模式；list/-n/--dry-run/--list 只打印命令不执行。
-# 这样 `run_cp_diag.sh 2call --dry-run` 不会误触发一轮真实运行（2~3 次模型加载）。
+# 这样 `run_cp_diag.sh probe --dry-run` 不会误触发一轮真实运行（2~3 次模型加载）。
 mode=""
 dry_run=false
 no_repeat=false
@@ -74,26 +72,13 @@ dump_dir="${DUMP_DIR:-/dev/shm/cp_balance_dump}"
 
 round_name=""
 extra_env=()
-# True only when this round actually injects the DUMP env (2call deliberately
-# does not), so the "no dump was produced" guard cannot fire a false alarm.
+# True only when this round actually injects the DUMP env, so the "no dump was
+# produced" guard cannot fire a false alarm.
 dump_active=false
 
 case "${mode}" in
   baseline)
     round_name="r1_baseline"
-    if [[ -n "${dump_spec}" ]]; then
-      extra_env+=(--env "VLLM_ASCEND_CP_BALANCE_DUMP=${dump_spec}")
-      dump_active=true
-    fi
-    ;;
-  2call)
-    round_name="r2_2call"
-    extra_env+=(--env "VLLM_ASCEND_CP_BALANCE_MERGED_CALL=0")
-    ;;
-  l1024)
-    round_name="r3_l1024"
-    prompt_lens="1024"
-    min_tokens="1024"
     if [[ -n "${dump_spec}" ]]; then
       extra_env+=(--env "VLLM_ASCEND_CP_BALANCE_DUMP=${dump_spec}")
       dump_active=true
@@ -159,7 +144,7 @@ case "${mode}" in
     ;;
   *)
     echo "unknown mode: ${mode}" >&2
-    echo "usage: $0 {baseline|sweep|probe|2call|l1024|check|list} [--no-repeat]" >&2
+    echo "usage: $0 {baseline|sweep|probe|check|list} [--no-repeat]" >&2
     exit 2
     ;;
 esac
@@ -207,7 +192,8 @@ if [[ "${dry_run}" == true ]]; then
   printf '%q ' "${cmd[@]}"
   printf '\n[run_cp_diag] then:\n'
   printf '  python %q --dir %s --kind %s%s\n' "${checker}" "${dump_dir}" "${check_kind}" "${check_extra}"
-  printf '  python %q baseline=%s 2call=%s\n' "${comparer}" "${out_root}/r1_baseline" "${out_root}/r2_2call"
+  printf '  # 与另一轮并排比较（把 <round1>/<round2> 换成 $OUT_ROOT 下的目录名）：\n'
+  printf '  python %q <round1>=%s/<round1> <round2>=%s/<round2>\n' "${comparer}" "${out_root}" "${out_root}"
   exit 0
 fi
 
@@ -248,5 +234,5 @@ fi
 echo
 echo "[run_cp_diag] round finished (rc=${rc}); analyse with:"
 echo "  python ${checker} --dir ${dump_dir} --kind ${check_kind}${check_extra}"
-echo "  python ${comparer} baseline=${out_root}/r1_baseline 2call=${out_root}/r2_2call"
+echo "  python ${comparer} <round1>=${out_root}/<round1> <round2>=${out_root}/<round2>"
 exit "${rc}"

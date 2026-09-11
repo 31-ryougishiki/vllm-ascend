@@ -37,7 +37,8 @@ in ─attn─▶ out ─norm─▶ mlp_in ─[量化]─▶ gu_q ─gate_up─�
 | `dn_q` 相同、**`mlp_out` 不同** | **down_proj 这个 GEMM**（含跨 rank 归约） |
 
 已排除：indexer 选点错、KV 重排/写错、元数据契约错、**attention 数值错**、pre-MLP norm/残差/归约错、
-合并 2B 调用（`2call`）、**"A-quant 的 scale 按批/按 rank 局部行集算"**（`w8a8_mxfp8.py:86-102` 的
+合并 2B 调用形状（T1，验证用的 `2call` 开关已随结论一并删除）、
+**"A-quant 的 scale 按批/按 rank 局部行集算"**（`w8a8_mxfp8.py:86-102` 的
 `npu_dynamic_mx_quant` + `group_sizes=[1,1,32]` 是按行、每 32 个 K 元素一个 scale ⇒ 与同 rank 上还有哪些行无关）。
 
 ## 1. 目标与判据口径
@@ -149,7 +150,8 @@ KV 写 slot 映射、attention/indexer 调用形状、模型边界 gather/rerang
 ### 3.5 indexer 跨排布：集合与顺序都相同
 
 `[topk/cross] set_diff=0 且 order_diff=0`（`identity` 几乎全是 256/256）⇒ indexer 输出与排布无关，
-"索引顺序不同导致 SFA 累加不同"这条线**排除**；连带 **`2call`（T1）无信息量**（它只改 attention 调用形状）。
+"索引顺序不同导致 SFA 累加不同"这条线**排除**；连带 **prev/next 两次调用（T1）无信息量**
+（它只改 attention 调用形状；该 A/B 开关已删除，见 README §七）。
 
 ### 3.6 其他
 
@@ -165,11 +167,11 @@ KV 写 slot 映射、attention/indexer 调用形状、模型边界 gather/rerang
 | 元数据契约错（prefix/block_table/kv_len） | **已排除**（`[check]` 告警从未触发） |
 | attention 数值（SFA/indexer/o_proj） | **已排除**（layer 0 attention 输出逐字节相同） |
 | pre-MLP norm / 残差 / 跨 rank 归约 | **已排除**（layer 0 `mlp_in` 逐字节相同） |
-| 合并 2B 调用（`2call`） | **已排除**（只改 attention 形状，而 attention 已逐位相同；别跑） |
+| 合并 2B 调用形状（T1，A/B 开关已删） | **已排除**（只改 attention 形状，而 attention 已逐位相同） |
 | **dense MLP：`gate_up_proj` 的量化 vs 它的 GEMM** | **下一刀**（`gu_q`/`gu_out` 已打点，见 §5.1） |
 | **dense MLP：silu 的量化 / `down_proj` 的 GEMM** | **下一刀**（`dn_in`/`dn_q`/`mlp_out` 已打点） |
 | MoE 层（≥3）的路由与专家计算 | 未测；等 layer 0 定死后再看是否需要 |
-| `MIN_TOKENS` 边界（`l1024`） | 未测；与本问题无关，最低优先级 |
+| `MIN_TOKENS` 边界 | 未测；与本问题无关，最低优先级 |
 
 **主导猜想（已按代码收窄）**：layer 0 的 dense MLP 是 **W8A8_MXFP8**（§2.2 实测），
 `w8a8_mxfp8.py:86-102` 的激活量化是 `npu_dynamic_mx_quant(x, dst_type=float8_e4m3fn)` +
