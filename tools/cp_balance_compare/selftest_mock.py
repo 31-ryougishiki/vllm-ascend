@@ -30,7 +30,7 @@ import json
 import shutil
 import subprocess
 import sys
-from contextlib import redirect_stdout
+from contextlib import redirect_stderr, redirect_stdout
 from pathlib import Path
 
 HERE = Path(__file__).resolve().parent
@@ -563,6 +563,45 @@ def test_cp_balance_modules_import_locally_used_stdlib() -> None:
                 ):
                     problems.append(f"{relative}:{node.lineno}: {func.name}() uses {node.id} without an import")
     assert not problems, "\n".join(problems)
+
+
+def test_check_zigzag_kv_handles_fp8_dumps() -> None:
+    """Sparse-C8 sites pack the KV as fp8; the comparison must not choke on it.
+
+    ``tensor.numpy()`` raises "Got unsupported ScalarType Float8_e4m3fn", which
+    crashed a whole 1248-dump sweep at the first comparison.  The conversion has
+    to go through torch (``.float()``).
+    """
+    if checker is None:
+        print("[skip] torch not available (check_zigzag_dumps needs it)")
+        return
+    import argparse
+
+    import torch
+
+    if not hasattr(torch, "float8_e4m3fn"):
+        print("[skip] this torch has no float8_e4m3fn")
+        return
+
+    out = _temp_dir("cp_ab_fp8_")
+    try:
+        torch.manual_seed(13)
+        base = torch.randn(64, 32).to(torch.float8_e4m3fn)
+        shifted = base.clone().float()
+        shifted[32:, :8] += 0.5
+        shifted = shifted.to(torch.float8_e4m3fn)
+        for rank in range(2):
+            torch.save({"kv_fp_nat": base.clone()}, out / f"kv_cpbal0_layer0_rank{rank}_pid{rank}_1000.pt")
+            torch.save({"kv_fp_nat": shifted.clone()}, out / f"kv_cpbal1_layer0_rank{rank}_pid{rank}_1001.pt")
+        buffer, errors = io.StringIO(), io.StringIO()
+        with redirect_stdout(buffer), redirect_stderr(errors):
+            rc = checker.check_kv(argparse.Namespace(dir=str(out), summary_only=True))
+        text = buffer.getvalue()
+        assert rc == 1, text + errors.getvalue()
+        assert "FIRST DIVERGENCE (fp): layer 0" in text, text
+        assert "first token 32" in text, text
+    finally:
+        shutil.rmtree(out, ignore_errors=True)
 
 
 def test_load_prompts_file() -> None:

@@ -305,13 +305,17 @@ def _natural_order_fp(
     slots_cpu: torch.Tensor,
     valid_cpu: torch.Tensor,
 ) -> torch.Tensor | None:
-    """Pre-quantization KV rows in natural token order, aligned with ``kv_nat``.
+    """The fused KV rows that are about to be written, in natural token order.
 
     Under zigzag the fused KV arrives in all-gather order
     (``[r0_prev, r0_next, r1_prev, ...]``); ``gather_index`` maps that order to
     natural order, so its inverse puts the rows back.  The continuous path is
     already natural.  Rows are then filtered by the same ``valid`` mask as the
     packed-cache dump, so row p is token p in both layouts.
+
+    These are the *same packed numbers* the cache receives (int8, or fp8 e4m3 +
+    e8m0 scales on a sparse-C8 site): the copy removes the dependency on the NPU
+    cache readback, **not** the quantization.
 
     Everything is done on CPU with the (*small*) fused tensor: the packed-cache
     readback needs an NPU index_select that is not reliable on every site
@@ -1561,11 +1565,13 @@ class AscendSFAImpl(MLAAttentionImpl):
         comparable across the B (continuous) and C (zigzag) configurations:
         row p of the dump is token p in both.
 
-        ``kv_fp`` (optional) is the *pre-quantization* fused KV of the same
-        tokens, also permuted to natural order.  The packed cache is int8/fp8
-        quantized, so two different FP values can quantize to the same byte and
-        a real divergence would stay invisible; the FP copy removes that blind
-        spot and reports the difference in real units.
+        ``kv_fp`` (optional) is the fused KV of the same tokens *before* it is
+        scattered into the cache, also permuted to natural order.  It carries the
+        same packed numbers (int8, or fp8 e4m3 + e8m0 scales on a sparse-C8
+        site), so it is not a higher-precision view -- its point is that the dump
+        no longer depends on the NPU cache readback, which is not reliable on
+        every site (aclnnIndexSelect 161002).  Sub-quantization differences stay
+        invisible either way.
         """
         if not self._zigzag_dump_enabled(self._zigzag_dump_kv_layers, self._zigzag_dump_kv_done):
             return
@@ -2890,8 +2896,9 @@ class AscendSFAImpl(MLAAttentionImpl):
                     # Diagnostics: read the packed cache back in natural token
                     # order so B (continuous) and C (zigzag) dumps are directly
                     # comparable per token.  No-op unless the dump env is set.
-                    # fused_kv_no_split rides along as the pre-quantization copy
-                    # (the packed cache is int8/fp8, which hides small FP deltas).
+                    # fused_kv_no_split rides along as the source-side copy of the
+                    # same packed rows, so the dump still works on a site where
+                    # the cache readback (NPU index_select) fails.
                     self._maybe_dump_kv(
                         kv_cache[0].view(-1, fused_kv_no_split.shape[-1]),
                         slot_mapping_sfa,

@@ -21,10 +21,17 @@ order, so row ``p`` of a cpbal0 dump and row ``p`` of a cpbal1 dump are the same
 token and can be compared byte for byte.  The first differing layer/token is the
 first place where the two layouts disagree.
 
+Each dump also carries ``kv_fp_nat``: the same packed rows taken from
+``fused_kv_no_split`` *before* the cache scatter.  That is what makes the analysis
+work on sites where the NPU cache readback (``index_select``) fails -- but it is
+the **same packed numbers** (fp8 e4m3 + e8m0 scales on a sparse-C8 site), so it
+does **not** remove quantization: sub-fp8 differences stay invisible and the first
+difference it reports is only an upper bound in depth.
+
 For a **multi-layer sweep** (``VLLM_ASCEND_CP_BALANCE_DUMP=kv:all``) use
 ``--summary-only``: it prints one compact table row per layer
-(``ranks_diff / rows_differ / first_token / max|int8|``), names the first layer
-whose KV already differs, and skips the per-pair detail.
+(``ranks_diff / rows_differ / first_token / max|d| / rel``), names the first layer
+whose KV already differs, and skips the per-pair detail (progress goes to stderr).
 """
 
 from __future__ import annotations
@@ -264,13 +271,30 @@ def _max_nope_diff(left: np.ndarray, right: np.ndarray, diff_rows: list[int]) ->
     return int(np.abs(left_part - right_part).max())
 
 
+def _as_float32(tensor: torch.Tensor) -> np.ndarray | None:
+    """float32 numpy view of a dump tensor, for *any* dtype (fp8 included).
+
+    numpy has no float8 dtype, so the conversion must go through torch
+    (``t.numpy()`` raises "Got unsupported ScalarType Float8_e4m3fn").  A
+    sparse-C8 site packs the KV as fp8 (e4m3) + e8m0 scales, which is exactly
+    what ``kv_fp_nat``/``kv_nat`` hold there.
+    """
+    try:
+        return tensor.detach().to("cpu").float().numpy()
+    except Exception as exc:
+        print(f"[dump] cannot convert {getattr(tensor, 'dtype', '?')} to float32: {exc}", file=sys.stderr)
+        return None
+
+
 def _fp_diff(left: dict, right: dict) -> tuple[int | None, int | None, float, float]:
-    """Row-wise comparison of the pre-quantization KV (``kv_fp_nat``).
+    """Row-wise comparison of the source-side packed KV copy (``kv_fp_nat``).
 
     Returns ``(differing_rows, first_row, max_abs_delta, max_rel_delta)``;
-    ``(None, None, 0.0, 0.0)`` when the dump has no FP copy.  This is the
-    sensitive comparison: the packed cache is int8/fp8 quantized, so two
-    different FP values can share a byte and a real divergence would hide.
+    ``(None, None, 0.0, 0.0)`` when the dump has no such copy.  It is the copy
+    taken before the cache scatter, i.e. the *same packed numbers* the cache
+    holds (fp8 on a sparse-C8 site) -- it removes the dependence on the NPU
+    cache readback, **not** the quantization: sub-fp8 differences stay invisible
+    here, so the first difference it reports is an upper bound in depth.
     """
     left_fp = left.get("kv_fp_nat")
     right_fp = right.get("kv_fp_nat")
@@ -278,8 +302,10 @@ def _fp_diff(left: dict, right: dict) -> tuple[int | None, int | None, float, fl
         return None, None, 0.0, 0.0
     if left_fp.shape != right_fp.shape:
         return None, None, 0.0, 0.0
-    lf = left_fp.numpy().astype(np.float32)
-    rf = right_fp.numpy().astype(np.float32)
+    lf = _as_float32(left_fp)
+    rf = _as_float32(right_fp)
+    if lf is None or rf is None:
+        return None, None, 0.0, 0.0
     delta = np.abs(lf - rf)
     per_row = delta.reshape(delta.shape[0], -1).max(axis=1)
     changed = per_row > 0
