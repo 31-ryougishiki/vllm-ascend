@@ -13,6 +13,8 @@
 因为两条路径的 kernel、模型、权重完全相同，只有 token 排布不同，所以 **`C-B` 的差值就是 cp_balance 的账**；`B2-B` 给出它必须打败的噪声地板。原设计里的 “A（关 DSA-CP）锚点” 已下线：它走的是不同代码路径，只能给粗参照，要 A 会被 driver 直接报错拒绝。
 
 > 本目录所有工具（含后续新增的诊断脚本）必须遵守[第八节](#八工具与脚本的五条硬要求)的五条要求。
+>
+> **接手这个问题**（或想知道"现在查到哪一步、下一步做什么"）请看 [`HANDOVER.md`](./HANDOVER.md)：里面有已确认的事实与数字、已排除/仍开放的假设、以及按优先级的下一步命令。本文（README）只讲工具怎么用、判据是什么。
 
 ## 一、目录里各文件的角色
 
@@ -21,11 +23,11 @@
 | `ab_cp_compare.py` | 主 driver：顺序拉起 B/C/B2、发请求、算指标、写 `summary.json` | 是 |
 | `launcher_glm52_w4a4c8_mxfp4.sh` | 站点 launcher（GLM-5.2 w4a4c8-mxfp4，TP=8），支持全部 cp_balance 环境覆盖并打印指纹 | 是 |
 | `launcher_template.sh` | launcher 参考实现（说明任何 launcher 必须遵守的两条规则） | 是 |
-| `run_cp_diag.sh` | 一轮 A/B 的标准入口，封装 baseline / 2call / l1024 / check 四种模式 | 是（`check` 除外） |
+| `run_cp_diag.sh` | 一轮 A/B 的标准入口，封装 `baseline` / `sweep` / `2call` / `l1024` / `check` 模式（加 `--no-repeat` 跳过 B2） | 是（`check` 除外） |
 | `check_zigzag_dumps.py` | CPU 侧判读 NPU 落盘的 `topk` / `kv` dump（对应 P1 / P2 两个假设） | 否 |
 | `compare_cp_rounds.py` | CPU 侧把多轮 `summary.json` 并排对比，回答“改一个变量后 C−B 是否回到噪声级” | 否 |
 | `mock_vllm_server.py` | 假 vLLM `/v1/completions` 服务（`/health` + echo/logprobs），用 offset 模拟 B/C 差异 | 否 |
-| `selftest_mock.py` | driver 的 CPU 自测（26 个 `test_*`），跑通全链路而不需要 NPU | 否 |
+| `selftest_mock.py` | driver 的 CPU 自测（38 个 `test_*`：mock 端到端 + 指纹/payload/校验和 + zizzag dump 判读 + launcher 静态检查），不需要 NPU | 否 |
 | `selfcheck.py` | 一键自检：现场体检 + driver 自测 + 配置门（launcher `DRY_RUN=1` 指纹）+ 轮次命令预演；`--collect` 收集整轮证据 | 否 |
 | `run_single.py` | 单配置手工调试：单独拉起 Base（`B`）或 `C` 的 server + 用与 A/B **完全相同**的请求体发一次推理；失败时打印 HTTP 状态与响应正文，并把 payload/response 落盘供 curl 复现；默认保留 server | 是 |
 | `prepare_env.sh` | 一次性准备环境（`source` 站点 rc + vendor `set_env.bash`，并 `export CP_AB_SKIP_SOURCE=1`），省掉每轮 launcher 的两次 source；**必须 source**，不能直接执行 | 否 |
@@ -43,7 +45,7 @@
 - preflight：假 launcher 下 env 覆盖与指纹逻辑；
 - 端到端：两/三个 mock 端口 + `--repeat-a` 跑完 `run()`，校验 `summary.json` 的 noise / first_div / p99 / top1% 数值。
 
-本机实测：`SELFTEST OK`（26 项全过，其中 2 项 launcher 用例在非 Linux 主机上打印 `[skip] bash not usable on this host`）。
+本机实测：`SELFTEST OK`（38 项；依赖假 `vllm` 可执行位的 launcher 用例在非 Linux 主机上打印 `[skip]`，fingerprint 格式校验那半边仍会跑）。
 
 ### L2 — NPU 上的 A/B 轮次（真正测精度）
 
@@ -63,10 +65,11 @@ prompt 默认是确定性随机 token-id（`--seed 1234`，词表 10 万），�
 
 - `check_zigzag_dumps.py --kind topk` → **P1**：对短于 `sparse_count` 的 prompt，LightningIndexer 每行有效前缀应当恰好是因果窗口 `{0..valid-1}`（identity 或仅顺序不同的同一集合）。有效集合缺项 ⇒ indexer 让 SFA 关注的位置少于因果窗口要求。
 - `check_zigzag_dumps.py --kind kv` → **P2**：dump 按自然 token 顺序存 packed KV，所以 cpbal0 的第 p 行与 cpbal1 的第 p 行是同一个 token，可逐字节比较。首个不同的 layer/token 就是两种排布第一次分歧的地方。
-  dump 里同时带一份**量化前**的 FP 副本（`kv_fp_nat`，同样自然序），因为 packed cache 是 int8/fp8 量化的——两个不同的 FP 值可能量化成同一个字节，真实分歧会被量化吃掉（"上一层相同"可能是假的）。判读因此打印两张表（`[kv/int8]` 与 `[kv/fp]`），`FIRST DIVERGENCE` 以 **FP 表**为准，并给出真实量级的 `max|d|` 与相对值 `rel`（1e-6 级 = 浮点归约顺序；1e-2 级 = 真逻辑差异）。做**多层扫描**（`DUMP_SPEC=kv:all`）时加 `--summary-only`：每层一行，直接给出 `FIRST DIVERGENCE: layer L`——第 L 层 KV 是"第 L 层输入隐状态"的投影，分歧实际是在 **L−1 层的输出**里进入的。
+  dump 里同时带一份**写 cache 之前的同源副本**（`kv_fp_nat`，同样自然序）：它取自 `fused_kv_no_split`，**与 cache 里是同一批打包数字**（sparse-C8 站点是 fp8 e4m3 + e8m0 scale），所以它**不消除量化掩盖**——比 fp8/int8 更细的差异在这份数据里依然看不见，它报出的"第一处不同"只是**深度上的上界**。它的价值在于：不再依赖某些站点上不可用的 NPU cache 回读（`aclnnIndexSelect 161002`），dump 因此仍能产出。判读打印两张表（`[kv/int8]` 与 `[kv/fp]`），`FIRST DIVERGENCE` 以同源副本为准，并给出 `max|d|` 与相对量级 `rel`。做**多层扫描**（`DUMP_DIR=... DUMP_SPEC=kv:all`）时加 `--summary-only`：每层一行、进度打到 stderr（全层 1248 个文件约几秒），直接给出 `FIRST DIVERGENCE: layer L`——第 L 层 KV 是"第 L 层输入隐状态"的投影，分歧实际是在 **L−1 层的输出**里进入的；若落在 layer 0，则只可能出自写 KV / rope / 布局本身。
 - `compare_cp_rounds.py baseline=... 2call=...` → 各轮指标并排 + 结论：最后一轮的 `C-B` 是否全部回到噪声级。
 
-dump 由 `vllm_ascend/attention/sfa_v1.py` 写，开关是 `VLLM_ASCEND_CP_BALANCE_DUMP`（语法 `kind:layers[,...]`，如 `topk:6,kv:0,6`、`topk:all`；空值=关），落在 `/dev/shm/cp_balance_dump`，文件名 `<kind>_cpbal<N>_layer<L>_rank<R>_pid<P>_<ts>.pt`——自带 cp_balance 标记，所以**一轮 A/B 的 B 与 C 数据可以同时收**，且多轮共用一个目录不会互相覆盖（判读时按 `(layer, rank, cpbal)` 取最新一份）。
+dump 由 `vllm_ascend/attention/sfa_v1.py` 写，开关是 `VLLM_ASCEND_CP_BALANCE_DUMP`（语法 `kind:layers[,...]`，如 `topk:6,kv:0,6`、`kv:all`；空值=关），目录默认 `/dev/shm/cp_balance_dump`，可用 `VLLM_ASCEND_CP_BALANCE_DUMP_DIR` 覆盖（`run_cp_diag.sh` 的 `DUMP_DIR` **同时**设置两者，一个旋钮保证 writer 与 checker 一致）；文件名 `<kind>_cpbal<N>_layer<L>_rank<R>_pid<P>_<ts>.pt`——自带 cp_balance 标记，所以**一轮 A/B 的 B 与 C 数据可以同时收**，且多轮共用一个目录不会互相覆盖（判读时按 `(layer, rank, cpbal)` 取最新一份）。
+⚠️ `kv:all` 一轮是 **GB 级**（78 层 × rank 数 × 2 配置 × 每份约 2.7MB），**别写在 `/dev/shm` 上**：写满会连 server 一起搞死（vLLM 的 IPC/prometheus 目录就在 `/dev/shm`），表现为 `torch.save ... inline_container.cc unexpected pos`、请求 `Connection refused`、以及截断的 dump 文件。
 
 ## 三、指标与判定口径
 
@@ -127,24 +130,26 @@ bash tools/cp_balance_compare/run_cp_diag.sh baseline
 # 只看将要执行的命令、不真跑：
 bash tools/cp_balance_compare/run_cp_diag.sh baseline --dry-run
 
-# 2b) 多层扫描诊断轮：B/C 两个配置（无 B2，噪声地板已知为 0）+ 全层 KV/FP dump，
-#     输出到 /dev/shm/cp_ab_sweep/r_sweep；一条命令、不依赖任何 env 前缀
+# 2b) 多层扫描诊断轮：B/C 两个配置（无 B2，噪声地板已知为 0）+ 全层 KV dump，
+#     输出到 /dev/shm/cp_ab_sweep/r_sweep；一条命令、不依赖任何 env 前缀。
+#     dump 是 GB 级，先把 DUMP_DIR 指到真实磁盘（单独一行 export，别写成命令前缀）：
+export DUMP_DIR=/root/cp_dump
 bash tools/cp_balance_compare/run_cp_diag.sh sweep
 
 # 3) T1：回退成 prev/next 两次调用
 bash tools/cp_balance_compare/run_cp_diag.sh 2call
 
-# 4) CPU 侧判读 dump + 并排对比两轮
-bash tools/cp_balance_compare/run_cp_diag.sh check
-python tools/cp_balance_compare/check_zigzag_dumps.py --dir /dev/shm/cp_balance_dump --kind both
+# 4) CPU 侧判读：dump 表（每层一行 + FIRST DIVERGENCE）与多轮并排对比
+python tools/cp_balance_compare/check_zigzag_dumps.py --dir "${DUMP_DIR:-/dev/shm/cp_balance_dump}" \
+    --kind kv --summary-only
 python tools/cp_balance_compare/compare_cp_rounds.py \
-    baseline=/dev/shm/cp_ab/r1_baseline 2call=/dev/shm/cp_ab/r2_2call
+    sweep=/dev/shm/cp_ab_sweep/r_sweep baseline=/dev/shm/cp_ab/r1_baseline
 
 # 5) 收集整轮证据（HEAD / dump 清单 / summary 指标 / 日志关键行）到一个文件里
-python tools/cp_balance_compare/selfcheck.py --collect
+python tools/cp_balance_compare/selfcheck.py --collect --out-root /dev/shm/cp_ab_sweep
 ```
 
-常用覆盖（`run_cp_diag.sh` 的环境变量）：`PROMPT_LENS`、`MIN_TOKENS`、`TP_SIZE`（launcher 的 TP，默认 8）、`CP_SIZE`（driver 的 `--cp-size`，默认取 `TP_SIZE`）、`REPEAT_A`（默认 1；`REPEAT_A=0` 或命令加 `--no-repeat` 跳过 B2 重复跑，**省一次模型加载**，噪声地板已知为 0 时用）、`OUT_ROOT`、`BASE_PORT`、`DUMP_SPEC`（置空=不 dump；支持 `kv:all` / `topk:all`）、`DUMP_DIR`、`LAUNCHER`。
+常用覆盖（`run_cp_diag.sh` 的环境变量）：`PROMPT_LENS`、`MIN_TOKENS`、`TP_SIZE`（launcher 的 TP，默认 8）、`CP_SIZE`（driver 的 `--cp-size`，默认取 `TP_SIZE`）、`REPEAT_A`（默认 1；`REPEAT_A=0` 或命令加 `--no-repeat` 跳过 B2 重复跑，**省一次模型加载**，噪声地板已知为 0 时用）、`OUT_ROOT`、`BASE_PORT`、`DUMP_SPEC`（置空=不 dump；支持 `kv:all` / `topk:all`）、`DUMP_DIR`（**writer 与 checker 共用**，默认 `/dev/shm/cp_balance_dump`）、`LAUNCHER`。
 
 > 诊断轮优先用 **`sweep` 模式**而不是一堆 env 前缀：脚本模式写在同一行命令里，粘贴时不会像 `VAR=... cmd` 那样被折断后**静默退回默认值**（那样会白跑一轮 B2）。
 
@@ -214,8 +219,12 @@ $OUT_ROOT/<round>/
 - **阈值不是绝对精度判据**：`0.05` 只是起步线，真正的判据是它和 5×噪声地板取大者；没有 B2 就没有噪声地板，`--repeat-a` 应默认带上。
 - **dump 目录会跨轮累积**：判读只取每个 `(layer, rank, cpbal)` 的最新一份，旧文件被忽略（会打印提示），不要求手动清理。
 - **`--kind topk` 对短 prompt 才最有信息量**：长 prompt 下 indexer 不做 `validS2Len < topkCount_` 快捷路径，identity 断言不再适用。
-- driver 需要 `requests` + `numpy`；`check_zigzag_dumps.py` 需要 `torch`（跑在 vLLM 宿主机上）；画图需要 `matplotlib`（缺了只警告跳过）。
+- driver 需要 `requests` + `numpy`；`check_zigzag_dumps.py` 需要 `torch`（跑在 vLLM 宿主机上）+ `numpy`；画图需要 `matplotlib`（缺了只警告跳过）。
 - 非 Linux 主机上，`selftest_mock.py` 里依赖 bash 的 launcher 用例会打印 `[skip]`（`bash not usable on this host` / 假 `vllm` 无法置可执行位时的 `fake vllm is not executable on this host`），属宿主差异，不是 driver 的问题；fingerprint 格式校验那半边仍会跑。
+- **`/dev/shm` 很小是常见坑**（容器默认 64MB 量级）：全层 dump 会把它写满，进而连 server 一起搞死（IPC/prometheus 都在那儿）。跑 sweep 前先 `df -h /dev/shm`，用 `DUMP_DIR=/真实磁盘` 落盘；写满的现场特征是 `torch.save … inline_container.cc unexpected pos`、请求 `Connection refused`、checker 读到截断文件（新版会跳过并告警，不再崩）。
+- **环境变量用 `export`，别用命令前缀**：`VAR=... cmd | tee ...` 这类长命令粘贴后前缀可能被吃掉，脚本会静默退回默认值（曾经因此白跑一轮 B2）。`sweep`/`baseline` 这类**模式词**和 `--no-repeat` 就是为此加的。
+- **dump 的量化精度**：sparse-C8 站点的 packed KV 是 fp8 (e4m3) + e8m0 scale。`kv_fp_nat` 只是"写 cache 之前的同源副本"（用来绕开不可用的 NPU `index_select`），**不是更高的精度**；要观察比量化更细的差异，只能在 op 级打点（如 attention 输入/输出）。
+- **改了 `vllm_ascend/` 的模块要防"模块级用了未 import 的名字"**：`sfa_v1.py` 把 stdlib import 放在函数内，`os`/`time` 在模块级直接用会在**加载模型时**才炸（`selftest_mock.py` 里有 AST 静态检查覆盖这一类）。
 
 ## 八、工具与脚本的五条硬要求
 
