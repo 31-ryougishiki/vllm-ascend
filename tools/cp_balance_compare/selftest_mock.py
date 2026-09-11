@@ -905,6 +905,60 @@ def test_check_zigzag_topk_cross_layout_uses_positions() -> None:
         shutil.rmtree(out, ignore_errors=True)
 
 
+def test_check_zigzag_act_positions_are_slots_not_token_indices() -> None:
+    """A non-zero block base must not shrink (or shift) the comparison.
+
+    ``positions`` are KV-cache slots: a 2048-token request whose block table
+    starts at block 1 occupies slots 128..2175.  The checker used to drop rows
+    with ``slot >= num_actual_tokens`` -- comparing 1920 of 2048 tokens and
+    mislabelling the first divergence by the base.  It must instead keep every
+    ``slot >= 0`` row and report the natural-stream token index.
+    """
+    if checker is None:
+        print("[skip] torch not available (check_zigzag_dumps needs it)")
+        return
+    import argparse
+
+    import torch
+
+    out = _temp_dir("cp_ab_slotbase_")
+    try:
+        torch.manual_seed(41)
+        base_t = torch.randn(8, 4).to(torch.bfloat16)
+        shifted = base_t.clone()
+        shifted[3:] = (shifted[3:].float() + 0.5).to(torch.bfloat16)
+        slots = [128, 129, 130, 131, 132, 133, 134, 135]  # blocks start at block 1
+
+        def save(kind: str, cpbal: int, data) -> None:
+            torch.save(
+                {
+                    "kind": "act",
+                    "op": kind[3:],
+                    "positions": torch.tensor(slots, dtype=torch.int64),
+                    "act": data.clone(),
+                    "num_actual_tokens": 8,  # a *token* count, smaller than the slots
+                },
+                out / f"{kind}_cpbal{cpbal}_layer0_rank0_pid100_{1000 + cpbal}.pt",
+            )
+
+        for cpbal, data in ((0, base_t), (1, shifted)):
+            save("actin", cpbal, base_t)   # inputs identical
+            save("actout", cpbal, data)    # outputs differ from token 3 on
+        buffer, errors = io.StringIO(), io.StringIO()
+        with redirect_stdout(buffer), redirect_stderr(errors):
+            rc = checker.check_act(argparse.Namespace(dir=str(out), summary_only=True, block_size=4))
+        text = buffer.getvalue()
+        assert rc == 1, text + errors.getvalue()
+        fp_row = next(line for line in text.splitlines() if line.startswith("[act]     0  out"))
+        # [act] <layer> <op> <compared> <differ> <first_pos> <max|d|> <rel> <block>
+        cols = fp_row.split()
+        assert cols[3:6] == ["8", "5", "3"], fp_row   # all 8 tokens compared, first at token 3
+        assert cols[8] == "0", fp_row                 # token 3 is in block 0 (block size 4)
+        assert "[act]     0   in         8        0" in text, text
+    finally:
+        shutil.rmtree(out, ignore_errors=True)
+
+
 def test_load_prompts_file() -> None:
     out = Path(_temp_dir("cp_ab_pf_"))
     try:

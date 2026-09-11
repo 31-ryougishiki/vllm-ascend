@@ -243,6 +243,9 @@ def _compare_topk_layouts(layer: int, left: tuple, right: tuple) -> dict:
     table_r, width_r = right
     width = min(width_l, width_r)
     common = sorted(set(table_l) & set(table_r))
+    # Positions are cache slots (see `_act_table`): normalise by the common base
+    # so the reported token indices are natural-stream indices.
+    base = common[0] if common else 0
     set_diff = order_diff = 0
     first_set = first_order = None
     sample = None
@@ -257,15 +260,16 @@ def _compare_topk_layouts(layer: int, left: tuple, right: tuple) -> dict:
         if sorted(list_l) != sorted(list_r):
             set_diff += 1
             if first_set is None:
-                first_set = position
+                first_set = position - base
                 if sample is None:
-                    sample = (position, sorted(set(list_l) - set(list_r))[:8], sorted(set(list_r) - set(list_l))[:8])
+                    sample = (position - base, sorted(set(list_l) - set(list_r))[:8],
+                              sorted(set(list_r) - set(list_l))[:8])
         else:
             order_diff += 1
             if first_order is None:
-                first_order = position
+                first_order = position - base
                 if sample is None:
-                    sample = (position, list_l[:6], list_r[:6])
+                    sample = (position - base, list_l[:6], list_r[:6])
     return {
         "layer": layer, "compared": len(common), "set_diff": set_diff, "order_diff": order_diff,
         "first_set": first_set, "first_order": first_order, "sample": sample,
@@ -822,8 +826,15 @@ def _act_table(paths: list[str]):
     """Concatenate one layout's ranks into a position-indexed table.
 
     Ranks hold disjoint token sets, so concatenating them rebuilds the sequence;
-    padding positions (``>= num_actual_tokens``) are dropped because their
-    content is meaningless in both layouts.
+    padding rows (slot ``-1``) are dropped because their content is meaningless
+    in both layouts.
+
+    ``positions`` are **KV-cache slots**, not token indices: a request's block
+    table need not start at block 0 (a 2048-token request whose blocks start at
+    block 1 occupies slots 128..2175).  They are therefore returned raw and
+    normalised by the caller, and must never be filtered against a *token* count
+    such as ``num_actual_tokens`` -- doing that silently drops the tail of every
+    request whose base is non-zero (observed: 1920 of 2048 tokens compared).
     """
     pos_parts: list[np.ndarray] = []
     raw_parts: list[np.ndarray] = []
@@ -837,12 +848,7 @@ def _act_table(paths: list[str]):
         if rows is None:
             continue
         pos, raw, fp, itemsize = rows
-        limit = int(payload.get("num_actual_tokens") or 0)
-        # Padding rows carry slot -1 (and land past num_actual_tokens): their
-        # content is meaningless in both layouts, so they must not be compared.
         keep = pos >= 0
-        if limit > 0:
-            keep &= pos < limit
         if not keep.any():
             continue
         pos_parts.append(pos[keep])
@@ -857,7 +863,9 @@ def _act_table(paths: list[str]):
     return pos[order], raw[order], fp[order], itemsize
 
 
-def _print_act_summary(rows: list[dict], ignored: int) -> tuple[int | None, str | None, dict | None]:
+def _print_act_summary(
+    rows: list[dict], ignored: int, block_size: int = 0
+) -> tuple[int | None, str | None, dict | None]:
     """Compact per-(layer, op) table plus the first divergence, in layer order."""
     print()
     if ignored:
@@ -868,8 +876,8 @@ def _print_act_summary(rows: list[dict], ignored: int) -> tuple[int | None, str 
     for stats in sorted(rows, key=lambda s: (s["layer"], _ACT_OP_ORDER.get(s["op"], 9))):
         span = "-" if stats["first_pos"] is None else str(stats["first_pos"])
         block = "-"
-        if stats["first_pos"] is not None and stats["block"]:
-            block = str(stats["first_pos"] // stats["block"])
+        if stats["first_pos"] is not None and block_size > 0:
+            block = str(stats["first_pos"] // block_size)
         detail = (
             f"{stats['max_abs']:>10.3e}  {stats['max_rel']:>9.2e}"
             if stats["differ"]
@@ -941,6 +949,11 @@ def check_act(args) -> int:
         index_l = {int(p): i for i, p in enumerate(pos_l)}
         index_r = {int(p): i for i, p in enumerate(pos_r)}
         common = sorted(set(index_l) & set(index_r))
+        # Positions are cache slots; both layouts share the request's block table,
+        # so subtracting the common base turns them into natural-stream token
+        # indices (equal to the prompt token index for a single request) and makes
+        # the printed numbers comparable with the KV dump's row indices.
+        base = min(common) if common else 0
         stats = {
             "layer": layer, "op": op, "compared": len(common), "differ": 0,
             "first_pos": None, "max_abs": 0.0, "max_rel": 0.0, "block": None,
@@ -954,7 +967,7 @@ def check_act(args) -> int:
             if stats["differ"]:
                 where = np.nonzero(mask)[0]
                 first_at = int(where[0])
-                stats["first_pos"] = common[first_at]
+                stats["first_pos"] = common[first_at] - base
                 delta = np.abs(fp_l[rows_l[where]] - fp_r[rows_r[where]])
                 stats["max_abs"] = float(delta.max())
                 scale = float(np.abs(fp_l[rows_l[where]]).max()) or 1.0
@@ -966,16 +979,17 @@ def check_act(args) -> int:
                 stats["cols"] = [int(c) // max(1, itemsize) for c in cols[:8]]
         rows.append(stats)
         if not args.summary_only and stats["differ"]:
-            print(f"\n[act] layer={layer} op={op}: first differing token={stats['first_pos']} "
+            first_token = common[int(np.nonzero(mask)[0][0])] - base
+            print(f"\n[act] layer={layer} op={op}: first differing token={first_token} "
                   f"({stats['ncols']}/{stats['width']} elements differ on that row), "
                   f"differing tokens={stats['differ']}/{stats['compared']} "
-                  f"(tokens {common[int(np.nonzero(mask)[0][0])]}..{common[-1]}), "
+                  f"(tokens {first_token}..{common[-1] - base}), "
                   f"max|d|={stats['max_abs']:.3e} rel={stats['max_rel']:.2e}, "
                   f"first columns={stats['cols']}")
         if index % 8 == 0 or index == total:
             print(f"[act] compared {index}/{total} (layer, op) groups", file=sys.stderr)
 
-    layer, op, stats = _print_act_summary(rows, ignored)
+    layer, op, stats = _print_act_summary(rows, ignored, getattr(args, "block_size", 0))
     print()
     if layer is None:
         print("[act] RESULT: traced activations are bit-identical across layouts")
@@ -1008,6 +1022,13 @@ def main(argv=None) -> int:
     parser.add_argument("--dir", default="/dev/shm/cp_balance_dump", help="dump directory")
     parser.add_argument("--kind", choices=("topk", "kv", "act", "both", "all"), default="both")
     parser.add_argument("--list", action="store_true", help="only list the dumps found")
+    parser.add_argument(
+        "--block-size",
+        type=int,
+        default=0,
+        help="zigzag block size = seq_len / (2 * cp_size) (TP=8, 2048 tokens -> 128); "
+        "only used to label which block the first divergence falls into (0 = don't label)",
+    )
     parser.add_argument(
         "--summary-only",
         action="store_true",

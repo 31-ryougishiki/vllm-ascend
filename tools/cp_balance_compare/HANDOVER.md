@@ -112,6 +112,11 @@
 - 之后每层 `in`/`out` 都在同一批 token 上不同，rel 稳定在 1e-2 量级 ⇒ 分歧在层间传递（不是重新产生）。
 - 形态是**普遍而平滑**（80% 的 token 都差、幅度同量级），不像"少数 token 跳到别的专家"那种离散翻转。
 
+⚠️ 口径修正（重要）：表里的 `first_pos=384` 是 **KV cache slot**，不是 token 序号。`compared=1920=2048-128`
+反推出**这一轮请求的块表从 block 1 开始**（slot = token + 128）⇒ 真实起点是 **token 256**，
+与 §2.5 全层 KV 剖面的 `first_token = 256` **完全吻合**（KV 剖面的行号本身就是自然序 token 序号）。
+判读脚本已修（不再拿 slot 和 `num_actual_tokens` 比、按公共 base 归一化、`--block-size 128` 可标出所在 block）。
+
 同轮 `[topk/cross]`：`compared=1920`、`set_diff=0`、`order_diff=0` ⇒ **同一个 token 在 B/C 下选出的索引集合与顺序完全相同**
 （`identity` 也几乎全是 256/256）⇒ indexer 输出**与排布无关**，索引顺序这条线**排除**。
 
@@ -298,7 +303,7 @@ one-shot，所以只有第一个请求（2048）的数据。`topk` 的跨排布�
 | 诊断轮（2 次加载 + 全层 KV dump） | `export DUMP_DIR=/root/cp_dump; bash tools/cp_balance_compare/run_cp_diag.sh sweep` | `dump: +N file(s)`、`[runtime] C:{T,T}`、`[case.*] p99≈0.575` |
 | 判读 KV dump | `python tools/cp_balance_compare/check_zigzag_dumps.py --dir $DUMP_DIR --kind kv --summary-only` | `FIRST DIVERGENCE (fp): layer L` |
 | op 级剖面轮（2 次加载 + 全精度 in/out） | `bash tools/cp_balance_compare/run_cp_diag.sh probe` | `dump: +N file(s)`、`[runtime] C:{T,T}` |
-| 判读激活剖面 | `python tools/cp_balance_compare/check_zigzag_dumps.py --dir $DUMP_DIR --kind act --summary-only` | `FIRST DIVERGENCE (act): layer L op=in\|out at token P` |
+| 判读激活剖面 | `python tools/cp_balance_compare/check_zigzag_dumps.py --dir $DUMP_DIR --kind act --summary-only --block-size 128` | `FIRST DIVERGENCE (act): layer L op=in\|out at token P` |
 | 判读索引表（跨排布） | `... --kind topk --summary-only` | `[topk/cross] RESULT: ... ORDER / DIFFERENT SET / layout invariant` |
 | 路由预检（2 分钟） | `VLLM_ASCEND_KV_TRANSFER_CONFIG="" EXTRA_SERVE_ARGS="--enable-return-routed-experts" python tools/cp_balance_compare/run_single.py --config C --no-keep` | 响应里有 `"routed_experts": "k05VTVBZA…"` |
 | 单配置手工调试 | `python tools/cp_balance_compare/run_single.py [--config C]` | `[http] <- 200` + `[result]` 行；server 默认保留 |
@@ -317,7 +322,7 @@ one-shot，所以只有第一个请求（2048）的数据。`topk` 的跨排布�
 8. **截断的 dump** 会让判读崩（已改为跳过 + 告警）；无 dump 的轮次 `run_cp_diag.sh` 会以 rc=3 明确失败。
 9. **`act` 是 one-shot**：每层每进程只写一次、跳过 profile/warmup，所以只有第一个 prefill 请求（driver 发的 2048）有数据；想换层要改 `DUMP_SPEC` 再跑一轮，不是改判读。
 10. **`probe` 轮默认落 `/root/cp_probe`，但它尊重已导出的 `DUMP_DIR`**：如果 shell 里还留着 sweep 的 `export DUMP_DIR=/root/cp_dump`，probe 的数据会被"吸"到那里（`/root/cp_probe` 根本不出现）。跑之前先 `unset DUMP_DIR` 或看 `run_cp_diag.sh probe --dry-run` 打印的 `dir=`（脚本现在会对继承来的 DUMP_DIR 打 WARN）。
-11. **`act`/`topk` 的 `positions` 是 KV cache slot，不一定是 token 序号**（单请求、无 prefix cache、块表连续时二者相等）。**跨轮次比 `first_pos` 要小心**：不同 server 启动的块分配不同，同一个 slot 号可能对应不同 token；只有**同轮内 B vs C** 的比较是严格对齐的。
+11. **`act`/`topk` 的 `positions` 是 KV cache slot，不一定是 token 序号**（请求的块表可能不是从 block 0 开始：2048 token 的请求若首块是 block 1，slots 就是 128..2175）。判读脚本现在按 B/C 的公共 base 归一化成"自然序 token 序号"，并且**不再拿 slot 和 `num_actual_tokens`（token 数）比较**——旧版因此把每轮请求的尾部丢掉（实测 1920/2048），还会让 first_pos 偏移一个 base。跨轮次比位置仍要小心（不同 server 的块分配不同），只有**同轮内 B vs C** 是严格对齐的。
 12. **MoE 的 Triton 报错是噪音**（见 §4.5.2），别被它带偏到 CUDA 后端那条线。
 
 ## 7. 相关提交（最近，按时间倒序）

@@ -85,7 +85,7 @@ prompt 默认是确定性随机 token-id（`--seed 1234`，词表 10 万），�
   - `in` 相同、`out` 不同 ⇒ 差异是**本层 attention 内部**产生的（indexer 选点顺序 / SFA 归约 / o_proj）；
   - 第 L 层 `out` 相同、第 L+1 层 `in` 不同 ⇒ 差异是**中间那层的 MoE/MLP**（或其间 norm/残差）产生的。
 
-  剖面按 **token 位置**对齐（不是按行号：zigzag 下每个 rank 持有 `[prev,next]` 两块，连续切片下持有 `[local_start, local_end)`，同一个行号是不同 token）。位置取自写 KV 用的同一个 `slot_mapping_cp`，所以不会和写路径漂移；`-1` 的 padding 行被丢弃。判读输出每层两行（`in`/`out`）的紧凑表 + `FIRST DIVERGENCE (act): layer L op=… at token P`。
+  剖面按 **token 位置**对齐（不是按行号：zigzag 下每个 rank 持有 `[prev,next]` 两块，连续切片下持有 `[local_start, local_end)`，同一个行号是不同 token）。位置取自写 KV 用的同一个 `slot_mapping_cp`，所以不会和写路径漂移；`-1` 的 padding 行被丢弃。⚠️ 它是 **KV cache slot**，不是 token 序号（请求的块表可能从 block 1 起，slot = token + 128）；判读会按 B/C 的公共 base 归一化，`--block-size 128` 还会标出"落在第几个 zigzag 块"。判读输出每层两行（`in`/`out`）的紧凑表 + `FIRST DIVERGENCE (act): layer L op=… at token P`。
 
 dump 由 `vllm_ascend/attention/sfa_v1.py` 写，开关是 `VLLM_ASCEND_CP_BALANCE_DUMP`（语法 `kind:layers[,...]`，如 `topk:6,kv:0,6`、`kv:all`、`act:0,1,2,3`；空值=关），目录默认 `/dev/shm/cp_balance_dump`，可用 `VLLM_ASCEND_CP_BALANCE_DUMP_DIR` 覆盖（`run_cp_diag.sh` 的 `DUMP_DIR` **同时**设置两者，一个旋钮保证 writer 与 checker 一致）；文件名 `<kind>_cpbal<N>_layer<L>_rank<R>_pid<P>_<ts>.pt`——自带 cp_balance 标记，所以**一轮 A/B 的 B 与 C 数据可以同时收**，且多轮共用一个目录不会互相覆盖（判读时按 `(layer, rank, cpbal)` 取最新一份；`act` 按 `(layer, op, rank, cpbal)`）。
 ⚠️ `kv:all` 一轮是 **GB 级**（78 层 × rank 数 × 2 配置 × 每份约 2.7MB），`act` 是**百 MB 级**（每个 sample ≈ 全 rank 合计 `hidden × 2B × 序列长度`，hidden=7168、2048 token 时约 29MB，一层两个 sample），**都别写在 `/dev/shm` 上**：写满会连 server 一起搞死（vLLM 的 IPC/prometheus 目录就在 `/dev/shm`），表现为 `torch.save ... inline_container.cc unexpected pos`、请求 `Connection refused`、以及截断的 dump 文件。`probe` 模式因此默认把 `DUMP_DIR` 指到 `/root/cp_probe`。
