@@ -3517,6 +3517,68 @@ class NPUModelRunner(GPUModelRunner):
             # collect eplb heat for all requests.
             self.eplb_heat_collection_status =  True
 
+    def _cp_balance_dump_positions(self, rows: int):
+        """``(positions, source)`` for a rank-local **or** all-gathered row set.
+
+        Dumps are keyed by the token's KV-cache position, and the row order depends
+        on the layout.  The MLP boundary sees rank-local ``[prev, next]`` rows, but
+        ``mlp.gate_up_proj``'s output and ``mlp.down_proj``'s input are produced by
+        a FlashComm all-gather -- rank order: natural under the continuous slice,
+        ``[r0_prev, r0_next, ...]`` under zigzag.  Keying those with the rank-local
+        rule silently dropped every ``gu_out``/``dn_in`` sample (a 2048-row tensor
+        has no 2048-entry ``slot_mapping_cp``), which is how two rounds of evidence
+        went missing without a single error.
+
+        ``source`` goes into the payload: a cross-layout comparison is only
+        meaningful when both sides named the same *natural* token positions.
+        """
+        import torch
+
+        from vllm_ascend.ascend_forward_context import _EXTRA_CTX
+
+        try:
+            from vllm.forward_context import get_forward_context
+
+            attn_metadata = getattr(get_forward_context(), "attn_metadata", None)
+        except Exception:
+            attn_metadata = None
+        metas = list(attn_metadata.values()) if isinstance(attn_metadata, dict) else [attn_metadata]
+
+        ctx = getattr(_EXTRA_CTX, "zigzag_cp_context", None)
+        if ctx is None or getattr(ctx, "slot_mapping_cp", None) is None:
+            ctx = None
+            for meta in metas:
+                candidate = getattr(meta, "dsa_cp_context", None)
+                if candidate is not None and getattr(candidate, "slot_mapping_cp", None) is not None:
+                    ctx = candidate
+                    break
+        if ctx is None or rows <= 0:
+            return None, "none"
+
+        local = getattr(ctx, "slot_mapping_cp", None)
+        if isinstance(local, torch.Tensor) and local.numel() == rows:
+            return local.detach().to("cpu").to(torch.int64), "local"
+
+        natural = None
+        for meta in metas:
+            slots = getattr(meta, "slot_mapping", None)
+            if isinstance(slots, torch.Tensor) and slots.numel() >= rows:
+                natural = slots
+                break
+        if natural is None:
+            return None, "none"
+        gather = getattr(ctx, "zigzag_gather_index", None)
+        if isinstance(gather, torch.Tensor) and gather.numel() >= rows:
+            try:
+                return natural[gather[:rows]].detach().to("cpu").to(torch.int64), "gather_zigzag"
+            except Exception as exc:  # pragma: no cover - diagnostics only
+                logger.warning(
+                    "[CP_BALANCE][dump] zigzag gather order unusable (%s); "
+                    "falling back to natural order",
+                    exc,
+                )
+        return natural[:rows].detach().to("cpu").to(torch.int64), "gather_natural"
+
     def _install_cp_balance_mlp_dumps(self) -> None:
         """Trace the MLP boundary of selected layers (CP_BALANCE diagnostics).
 
@@ -3559,43 +3621,6 @@ class NPUModelRunner(GPUModelRunner):
         skipped: set[tuple[int, str]] = set()
         skipped_tuple: set[str] = set()
 
-        def _dsa_cp_context():
-            """The DSA-CP context of the current forward, zigzag or continuous.
-
-            ``_EXTRA_CTX.zigzag_cp_context`` is only set when the batch really
-            runs in the zigzag layout (``_find_zigzag_cp_context`` requires
-            ``ctx.zigzag_index is not None``), so relying on it alone makes the
-            B side (continuous slices) silently skip every dump -- which is
-            exactly what happened on the first run.  Fall back to the raw
-            per-layer metadata, which carries ``slot_mapping_cp`` in both
-            layouts.
-            """
-            ctx = getattr(_EXTRA_CTX, "zigzag_cp_context", None)
-            if ctx is not None and getattr(ctx, "slot_mapping_cp", None) is not None:
-                return ctx
-            try:
-                from vllm.forward_context import get_forward_context
-
-                meta = getattr(get_forward_context(), "attn_metadata", None)
-            except Exception:
-                return None
-            if meta is None:
-                return None
-            candidates = meta.values() if isinstance(meta, dict) else [meta]
-            for candidate in candidates:
-                ctx = getattr(candidate, "dsa_cp_context", None)
-                if ctx is not None and getattr(ctx, "slot_mapping_cp", None) is not None:
-                    return ctx
-            return None
-
-        def _positions(rows: int):
-            """Token position (cache slot) of every row, or None when unknown."""
-            ctx = _dsa_cp_context()
-            slots = getattr(ctx, "slot_mapping_cp", None) if ctx is not None else None
-            if isinstance(slots, torch.Tensor) and slots.numel() >= rows:
-                return slots[:rows].detach().to("cpu").to(torch.int64)
-            return None
-
         def _summarise(name: str, layer_idx: int, op: str, kind: str, value) -> None:
             if (layer_idx, op) in done:
                 return
@@ -3624,25 +3649,24 @@ class NPUModelRunner(GPUModelRunner):
                 return
             if not isinstance(value, torch.Tensor) or value.ndim != 2:
                 return
-            positions = _positions(int(value.shape[0]))
+            rows = int(value.shape[0])
+            positions, positions_from = self._cp_balance_dump_positions(rows)
             if positions is None:
-                # Decode steps, non-DSA-CP batches and the all-gathered (padded)
-                # row set cannot be keyed by token; skip instead of writing a
-                # dump that no two layouts could be compared on.  Warn once so a
-                # *systematic* skip (e.g. a layout with no context) is visible in
-                # the log instead of silently producing half the data.
+                # Decode steps and non-DSA-CP batches cannot be keyed by token; skip
+                # instead of writing a dump that no two layouts could be compared
+                # on.  Warn once so a *systematic* skip is visible in the log
+                # instead of silently producing half the data.
                 if (layer_idx, op) not in skipped:
                     skipped.add((layer_idx, op))
-                    ctx = _dsa_cp_context()
-                    slots = getattr(ctx, "slot_mapping_cp", None) if ctx is not None else None
                     logger.warning(
                         "[CP_BALANCE][dump] %s layer=%s skipped: no token positions "
-                        "(rows=%s ctx=%s slot_mapping_cp=%s)",
+                        "for rows=%s (neither the rank-local slot_mapping_cp nor the "
+                        "padded natural slot mapping covers it) -- compare with "
+                        "qin:%s, which keys the same GEMM input",
                         kind,
                         layer_idx,
-                        int(value.shape[0]),
-                        type(ctx).__name__ if ctx is not None else None,
-                        "None" if slots is None else int(slots.numel()),
+                        rows,
+                        layer_idx,
                     )
                 return
             done.add((layer_idx, op))
@@ -3652,6 +3676,10 @@ class NPUModelRunner(GPUModelRunner):
                 "op": op,
                 "layer_name": name,
                 "layer_idx": layer_idx,
+                # Provenance: how many rows the hook saw and which rule turned them
+                # into token positions (``local`` vs ``gather_zigzag``/``gather_natural``).
+                "rows": rows,
+                "positions_from": positions_from,
                 "positions": positions[:rows],
                 "act": value.detach()[:rows].to("cpu"),
             }
@@ -3764,70 +3792,9 @@ class NPUModelRunner(GPUModelRunner):
         done: set[tuple[int, str]] = set()
         skipped: set[tuple[int, str]] = set()
 
-        def _forward_attn_metadata():
-            try:
-                from vllm.forward_context import get_forward_context
-
-                return getattr(get_forward_context(), "attn_metadata", None)
-            except Exception:
-                return None
-
-        def _dsa_cp_context():
-            ctx = getattr(_EXTRA_CTX, "zigzag_cp_context", None)
-            if ctx is not None and getattr(ctx, "slot_mapping_cp", None) is not None:
-                return ctx
-            meta = _forward_attn_metadata()
-            if meta is None:
-                return None
-            for candidate in meta.values() if isinstance(meta, dict) else [meta]:
-                ctx = getattr(candidate, "dsa_cp_context", None)
-                if ctx is not None and getattr(ctx, "slot_mapping_cp", None) is not None:
-                    return ctx
-            return None
-
-        def _natural_slots(rows: int):
-            meta = _forward_attn_metadata()
-            if meta is None:
-                return None
-            for candidate in meta.values() if isinstance(meta, dict) else [meta]:
-                slots = getattr(candidate, "slot_mapping", None)
-                if isinstance(slots, torch.Tensor) and slots.numel() >= rows:
-                    return slots
-            return None
-
         def _positions(rows: int):
-            """``(positions, source)``; ``source`` records which rule produced them.
-
-            The rule is part of the evidence, not an implementation detail: a
-            comparison is only valid if both layouts keyed the sample by the same
-            *natural* token position, so the dump has to say whether the rows were
-            rank-local (``local``) or came from a FlashComm all-gather
-            (``gather_zigzag`` / ``gather_natural``).  Without it, a mis-keyed row
-            set looks exactly like a real numerical difference.
-            """
-            ctx = _dsa_cp_context()
-            if ctx is None or rows <= 0:
-                return None, "none"
-            local = getattr(ctx, "slot_mapping_cp", None)
-            if isinstance(local, torch.Tensor) and local.numel() == rows:
-                return local.detach().to("cpu").to(torch.int64), "local"
-            natural = _natural_slots(rows)
-            if isinstance(natural, torch.Tensor):
-                gather = getattr(ctx, "zigzag_gather_index", None)
-                if isinstance(gather, torch.Tensor) and gather.numel() >= rows:
-                    try:
-                        return (
-                            natural[gather[:rows]].detach().to("cpu").to(torch.int64),
-                            "gather_zigzag",
-                        )
-                    except Exception as exc:  # pragma: no cover - diagnostics only
-                        logger.warning(
-                            "[CP_BALANCE][dump] zigzag gather order unusable (%s); "
-                            "falling back to natural order",
-                            exc,
-                        )
-                return natural[:rows].detach().to("cpu").to(torch.int64), "gather_natural"
-            return None, "none"
+            """Token positions of the GEMM's rows (rank-local *or* gathered)."""
+            return self._cp_balance_dump_positions(rows)
 
         def _emit(layer_idx, op, name, quant, scale, in_act, fused) -> None:
             key = (layer_idx, op)

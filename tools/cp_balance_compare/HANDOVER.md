@@ -20,9 +20,30 @@ in ──attention──▶ out ──pre-MLP norm──▶ mlp_in ══gate_up
 ⇒ 分歧**诞生在 layer 0 的 dense MLP 内部**（layer 0/1/2 是 dense MLP，`first_k_dense_replace=3`，
 **没有专家、没有路由**），再逐层放大（到 layer 77 时未量化的 rope 段已差到 7e-1）。
 
-**下一步（已把打点补齐）**：这一层的 dense MLP 是 **`W8A8_MXFP8`**（`quant_model_description.json`，见 §2.2），
-所以"同一个 bf16 输入、逐行数学、却算出不同结果"只剩两种根因，而它们用**一轮**就能分开——
-新增 `qin:<层>` 打点，直接记录两个 MLP GEMM **实际吃到的量化输入**（fp8 + e8m0 scale）：
+### 0.1 `qin` 轮已跑（`log.log`，2026-09-12）：结论指向 **down_proj 的 GEMM**
+
+这一层的 dense MLP 是 **`W8A8_MXFP8`**（`quant_model_description.json`，见 §2.2），
+新增的 `qin:<层>` 打点记录了两个 MLP GEMM **实际吃到的量化输入**（fp8 + e8m0 scale）。
+本轮实测（layer 0）：
+
+```
+in ─attn─▶ out ─norm─▶ mlp_in ─[量化]─▶ gu_q ─gate_up─▶ gu_out ─silu─▶ dn_in ─[量化]─▶ dn_q ─down_proj─▶ mlp_out
+   ✅0         ✅0          ✅0         ✅0        (缺失*)          (缺失)      ✅0                  ❌ 1664/2048, token≥256
+```
+
+* **`gu_q` / `dn_q` 逐位相同**（各 2048 个 token 全等）⇒ 两个 GEMM 的**量化输入**在 B/C 下完全一致；
+  这也顺带证明"按行 MX 量化与排布无关"，以及 `qin` 的位置键（gather 序 → 自然 token）是对的。
+* `mlp_out` 仍差（`max|d|=9.766e-04`，`rel=7.52e-03`，首个分歧在 token 256 = 第 2 个 zigzag 块）。
+* **`gu_out`/`dn_in` 两行为空**：不是 spec 问题，是旧 `_positions` 只认 rank 本地行、把 all-gather 后的
+  2048 行采样静默跳过（**已修**，见 §5.1 的告警说明）。
+* ⚠️ 这一轮把 dump 写进了共用的 `/root/cp_probe`，判读提示 `272 older dump(s) ignored`
+  且表里出现 layer 2（新 spec 已不打 layer 2）⇒ **该表可能混了上一轮的旧文件**；
+  判读器现在会打印"选中 dump 时间跨度"，`probe` 也改成每轮一个 `<时间戳>` 子目录。
+
+⇒ **根因候选：`down_proj` 这个 GEMM（与其跨 rank 归约）——输入（fp8+scale）逐位相同却给出不同输出。**
+按逐行数学推理，只剩两种解释，**一轮即可分开**：
+① 内核与行序相关（同样的行、不同的排列给出不同结果）；② 内核不可复现（同输入跑两次也不同）。
+**下一步**：`--configs C,C2`（两次 C，≈20 分钟）量 `C2−C`——为 0 即①，非 0 即②。
 
 ```
 in ─attn─▶ out ─norm─▶ mlp_in ─[量化]─▶ gu_q ─gate_up─▶ gu_out ─silu─▶ dn_in ─[量化]─▶ dn_q ─down_proj─▶ mlp_out
@@ -104,6 +125,7 @@ KV 写 slot 映射、attention/indexer 调用形状、模型边界 gather/rerang
 | MoE aux 重排（`input_ids`/`mc2_mask`） | `ascend_forward_context.set_ascend_forward_context` + `cp_zigzag.zigzag_reorder_moe_aux` |
 | MLP 边界打点（**在本仓库内**可行的挂钩方式；模型代码在 site-packages 里） | `vllm_ascend/worker/model_runner_v1.py::_install_cp_balance_mlp_dumps`（按模块名 `layers.<L>.mlp[.gate_up_proj\|.down_proj]` 挂 forward hook） |
 | 量化输入打点（`qin:<层>`：两个 MLP GEMM 实际吃到的 fp8 + e8m0 scale） | `vllm_ascend/worker/model_runner_v1.py::_install_cp_balance_quant_dumps`（按层包住 `AscendLinearMethod.apply`：元组走融合分支直接 dump，否则在该次 `apply` 内拦截 `npu_dynamic_mx_quant`/`npu_dynamic_quant`） |
+| 采样点位置键（两种布局共用） | `vllm_ascend/worker/model_runner_v1.py::_cp_balance_dump_positions`：rank 本地行用 `slot_mapping_cp`；all-gather 后的行按 `zigzag_gather_index`（C）或自然序（B）取自然 slot mapping。**旧版只认本地行 ⇒ `gu_out`/`dn_in` 被静默跳过** |
 | ⚠️ 误导项 | `vllm_ascend/patch/worker/patch_deepseek_v2.py` 里的 `_zigzag_layer_forward` / `_patched_forward` **对本模型不生效**：它 patch 的是 `DeepseekV2DecoderLayer/Model`，而本模型用 `DeepseekV32DecoderLayer/Model`（无继承关系） |
 
 ## 3. 已确认的事实（带数字，可直接引用）
@@ -197,8 +219,9 @@ C 里 rank 0 的 block 0（token 0..127，与尾块同处一个 rank）会被污
 cd /home/z30055003/vllm-ascend
 unset DUMP_DIR                                  # ⚠️ 否则继承的 DUMP_DIR 会把数据吸到别的目录（§6.3）
 bash tools/cp_balance_compare/run_cp_diag.sh probe --dry-run   # 先看 dir= 与 spec
-bash tools/cp_balance_compare/run_cp_diag.sh probe      # B/C 各一次加载 ≈ 20 分钟 → /root/cp_probe
-python tools/cp_balance_compare/check_zigzag_dumps.py --dir /root/cp_probe \
+bash tools/cp_balance_compare/run_cp_diag.sh probe      # B/C 各一次加载 ≈ 20 分钟
+# 判读：--dir 用上面打印的那个（probe 每轮写 /root/cp_probe/<时间戳>，防串味）
+python tools/cp_balance_compare/check_zigzag_dumps.py --dir /root/cp_probe/<时间戳> \
     --kind act --summary-only --block-size 128 2>&1 | tee tools/cp_balance_compare/log.log
 ```
 
@@ -219,14 +242,20 @@ python tools/cp_balance_compare/check_zigzag_dumps.py --dir /root/cp_probe \
 若打印 `mlp trace requested … no 'layers.<L>.mlp*' module matched`（或 quant trace 的同类告警），
 说明模块名不匹配 → 把该行贴回来。
 
-判读表 layer 0 最多 8 行，**取最早不等的那一行**：
+判读表 layer 0 **最多 8 行**（`in/out/mlp_in/gu_q/gu_out/dn_in/dn_q/mlp_out`），**取最早不等的那一行**：
 
 | 最早不等 | 结论 | 下一步查什么 |
 | --- | --- | --- |
 | `gu_q`（量化输入） | **激活量化这一步**：同一批 bf16 行量化出不同 fp8/scale | 该量化/融合内核的入参形状与 tile（`fuse_norm_quant` 是否生效、gather 与 quant 的先后） |
-| `gu_out`（且 `gu_q` 相同） | **`npu_quant_matmul` 这个 GEMM 内核** | 内核 tiling/workspace/**确定性**：同配置重跑一次（`--configs C,B --repeat-a`）即可判定 |
+| `gu_out`（且 `gu_q` 相同） | **`npu_quant_matmul` 这个 GEMM 内核** | 内核 tiling/workspace/**确定性**：同配置重跑一次（`--configs C,C2`）即可判定 |
 | `dn_q` | **silu 之后的量化** | 激活量化实现与融合 |
-| `mlp_out`（且 `dn_q` 相同） | **`down_proj` 的 GEMM**（含跨 rank 归约） | row-parallel 的 partial/reduce 路径与内核确定性 |
+| `mlp_out`（且 `dn_q` 相同） | **`down_proj` 的 GEMM**（含跨 rank 归约）：输入逐位相同却给出不同输出 | 离线行置换实验 + `--configs C,C2` 确定性对照 |
+
+⚠️ **`gu_out`/`dn_in` 曾经两轮都缺**：它们是 all-gather 后的 2048 行张量，而旧的 `_positions`
+只认 rank 本地行（`slot_mapping_cp` 只有 256 项）⇒ 采样被静默跳过。现已统一为
+`_cp_balance_dump_positions`（本地行用 `slot_mapping_cp`，gather 行按 `[r0_prev, r0_next, …]`
+或自然序取自然 slot），payload 里带 `rows`/`positions_from` 可审计。所以本轮起 layer 0
+应当**八行齐全**（除非该点输入是融合量化元组 → `dn_in` 由 `dn_q` 顶替）。
 
 判读器会自己把相邻行合起来给结论：`gu_out` 先不等时，若同层 `gu_q` 也不等就指向量化，
 若 `gu_q` 逐位相同就明确指向 GEMM 内核；spec 没写 `qin:` 时会写明"本层未打点 qin，无法区分"。

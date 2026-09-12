@@ -52,7 +52,7 @@
 
 | 模式 | 轮次目录 | 做什么 | 回答什么 |
 | --- | --- | --- | --- |
-| **`probe`** | `r_probe`（dump→`/root/cp_probe`） | B/C（无 B2）+ `act:0,1,mlp:0,1,qin:0,topk:0,kv:0,1` | **当前主用**：哪一步先不等（attention / pre-MLP / MLP 内部的量化 vs GEMM） |
+| **`probe`** | `r_probe`（dump→`/root/cp_probe/<轮次时间戳>`） | B/C（无 B2）+ `act:0,1,mlp:0,1,qin:0,topk:0,kv:0,1` | **当前主用**：哪一步先不等（attention / pre-MLP / MLP 内部的量化 vs GEMM） |
 | `sweep` | `r_sweep` | B/C + `kv:all` 全层 KV dump | 第几层的 KV 先不等（→ 上一层输出进入） |
 | `baseline` | `r1_baseline` | B/C/B2 + `topk:6,kv:0,6` | 现状差异多大、落在哪个分片 |
 | `check` | — | 直接 `exec check_zigzag_dumps.py --dir <dump> --kind ${KIND:-both}`（`KIND=act` 自动加 `--summary-only`） | 判读（不需要 NPU） |
@@ -62,10 +62,13 @@
 unset DUMP_DIR                                     # ⚠️ 继承的 DUMP_DIR 会让 dump 改道（§八.1）
 bash tools/cp_balance_compare/run_cp_diag.sh probe --dry-run    # 先看 dir= 与 spec 对不对
 bash tools/cp_balance_compare/run_cp_diag.sh probe
-# 判读
-python tools/cp_balance_compare/check_zigzag_dumps.py --dir /root/cp_probe \
+# 判读（--dir 用上一行 dry-run/运行输出里打印的那个，每轮都不同）
+python tools/cp_balance_compare/check_zigzag_dumps.py --dir /root/cp_probe/<时间戳> \
     --kind act --summary-only --block-size 128 2>&1 | tee tools/cp_balance_compare/log.log
 ```
+⚠️ `probe` 每轮写进 `/root/cp_probe/<时间戳>` 子目录：共用一个大目录时，判读按
+`(layer, op, rank, cpbal)` 取"最新一份"，会把上一轮的旧文件混进来（spec 变过就更是两次
+测量拼一张表）。判读开头会打印**选中文件的时间跨度**，超过 90 分钟会告警。
 
 **跑起来先看两行**：模型加载完应打印 `[CP_BALANCE][dump] mlp trace armed for [...]` 与
 `[CP_BALANCE][dump] quant trace armed for [...]`（后者只在 spec 带 `qin:` 时出现）；
@@ -76,6 +79,8 @@ python tools/cp_balance_compare/check_zigzag_dumps.py --dir /root/cp_probe \
 ⚠️ 若出现 `[CP_BALANCE][dump] dnin layer=0 skipped: value is a quantized tuple …`，
 说明该层的 norm+quant 已被融合（`fuse_norm_quant`），此时 `dn_in` 少 16 个文件（N≈256），
 **该缺口由同一轮的 `dn_q` 补上**——它是同一个数据的量化版本。
+⚠️ 若出现 `… skipped: no token positions for rows=2048 …`，说明该采样点既不是 rank 本地行、
+也不在补齐后的自然 slot mapping 覆盖范围内 → 该行会缺失（判读会打 `注意: … 缺 … 行`）。
 
 常用覆盖：`PROMPT_LENS`、`MIN_TOKENS`、`TP_SIZE`、`CP_SIZE`、`REPEAT_A=0`/`--no-repeat`（省一次加载）、`OUT_ROOT`、
 `DUMP_SPEC`（如 `act:0,1,2,3,mlp:0,1,2,3`、`kv:all`；置空=不 dump）、`DUMP_DIR`（**writer 与 checker 共用一个旋钮**）、`KIND`、`LAUNCHER`。
@@ -160,7 +165,7 @@ driver 每个配置都会：校验 `[cp-ab]` 指纹与 `[cp-ab-cfg]` 里的 `add
 
 1. **`DUMP_DIR` 会被继承**：`probe` 尊重已导出的 `DUMP_DIR`，sweep 留下的 `/root/cp_dump` 会让 probe 数据改道、`/root/cp_probe` 不出现。跑前 `unset DUMP_DIR`，或先 `--dry-run` 看 `dir=`（脚本会对继承值打 WARN）。
 2. **`/dev/shm` 很小**（容器默认几十 MB）：`kv:all` 是 GB 级、`act`/`mlp` 是几百 MB 级 ⇒ 一律落真实磁盘；写满会连 server 一起搞死（IPC/prometheus 在那儿）。
-3. **dump 目录跨轮累积**：判读按 `(layer[, op], rank, cpbal)` 取最新一份 ⇒ 不同轮次混在同一目录会"串味"，每类轮次用独立目录（`sweep`→`/root/cp_dump`、`probe`→`/root/cp_probe`）。
+3. **dump 目录跨轮累积**：判读按 `(layer[, op], rank, cpbal)` 取最新一份 ⇒ 不同轮次混在同一目录会"串味"。`probe` 已默认写进 `/root/cp_probe/<时间戳>` 子目录；`sweep` 等其他模式仍写固定目录，跨轮复用前先换目录。判读会打印选中文件的时间跨度，>90 分钟即告警。
 4. **`VAR=... cmd | tee` 前缀会静默丢**：用 `export` 单独一行，或用模式词（`probe`/`sweep`/`--no-repeat`）。
 5. **打点是 one-shot**（每层每进程一次、跳过 profile/warmup）⇒ 只有**第一个 prefill 请求**（driver 发的 2048）有数据；换层要改 `DUMP_SPEC` 再跑一轮。
 6. **截断的 dump** 判读会跳过并告警（不再崩）；一轮跑完却没有 dump，`run_cp_diag.sh` 以 rc=3 明确失败。

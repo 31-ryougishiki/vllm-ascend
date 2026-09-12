@@ -54,6 +54,7 @@ import glob
 import os
 import re
 import sys
+import time
 from collections import defaultdict
 
 import numpy as np
@@ -996,6 +997,23 @@ def check_act(args) -> int:
         print(f"[act] no usable dump under {args.dir}", file=sys.stderr)
         return 2
 
+    # Rounds share a dump directory unless the caller gives each one its own, and
+    # "newest per (layer, op, rank, cpbal) wins" happily stitches two rounds into
+    # one table whenever a spec change leaves some keys untouched (observed: a new
+    # round's gu_q/dn_q next to the previous round's mlp_out).  The spread of the
+    # selected files is the cheap tell.
+    stamps = sorted(int(meta["ts"]) for _path, meta in latest.values())
+    if stamps:
+        span_min = (stamps[-1] - stamps[0]) / 60e9
+        newest = time.strftime("%m-%d %H:%M", time.localtime(stamps[-1] / 1e9))
+        print(f"[act] 选中 dump 时间跨度 {span_min:.1f} 分钟（最新 {newest}）")
+        if span_min > 90:
+            print(
+                f"[act] 警告: 跨度 {span_min:.0f} 分钟远超一轮时长 ⇒ 很可能混了旧轮次的文件；"
+                "判读前请给每轮独立的 DUMP_DIR（run_cp_diag.sh probe 现在默认按时间戳建子目录）",
+                file=sys.stderr,
+            )
+
     rows: list[dict] = []
     incomplete: list[str] = []
     provenance: list[str] = []
@@ -1139,11 +1157,20 @@ def check_act(args) -> int:
     if op in ("gu_q", "gu_out", "dn_in", "dn_q", "mlp_out"):
         # The whole point of the MLP trace is the (qin, GEMM-out) pairing; if the
         # spec did not trace one of them, say so instead of leaving the reader to
-        # notice a missing row on their own.
+        # notice a missing row on their own.  And when ``mlp:`` *was* traced (its
+        # ``mlp_in``/``mlp_out`` rows are here), the absence of ``gu_out``/``dn_in``
+        # is a *skipped sample*, not a missing spec -- the two have completely
+        # different fixes.
         absent = [name for name in ("mlp_in", "gu_q", "gu_out", "dn_q", "mlp_out") if name not in same_layer]
         if absent:
-            print(f"[act] 注意: layer {layer} 缺 {', '.join(absent)} 行（spec 未打点对应 kind）"
-                  f"⇒ 「量化 vs GEMM」的区分不完整；要完整对照请用 probe 的默认 spec")
+            mlp_traced = ("mlp_in" in same_layer) or ("mlp_out" in same_layer)
+            cause = (
+                "mlp: 已打点 ⇒ gu_out/dn_in 是**被跳过**的采样（看服务端日志的 "
+                "'skipped: no token positions'，或输入是融合量化元组）；GEMM 输入侧由 qin 的 gu_q/dn_q 覆盖"
+                if mlp_traced
+                else "mlp: 未打点（spec 缺 mlp:<层>）"
+            )
+            print(f"[act] 注意: layer {layer} 缺 {', '.join(absent)} 行 ⇒ 「量化 vs GEMM」的区分不完整；{cause}")
     if op == "in":
         if layer == 0:
             print("[act] -> layer 0 的输入是 embedding（与排布无关）却在两种排布下不同："

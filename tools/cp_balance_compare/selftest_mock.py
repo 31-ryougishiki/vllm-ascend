@@ -530,62 +530,94 @@ def test_check_zigzag_kv_skips_truncated_dumps() -> None:
         shutil.rmtree(out, ignore_errors=True)
 
 
-def test_cp_balance_modules_import_locally_used_stdlib() -> None:
-    """A stdlib name used at module level without an import is a NameError at start-up.
+def test_cp_balance_modules_use_only_defined_names() -> None:
+    """Every name a function loads must be definable: local, closure, module, builtin.
 
-    This exact bug cost a round: ``_dump_dir()`` called ``os.getenv`` at import
-    time while ``sfa_v1.py`` only imported ``os`` inside one function.  Neither
-    py_compile nor importing the tool modules can see it, and the only symptom is
-    a server that dies while loading the model -- so check it statically here.
+    Generalises the check that once caught ``_dump_dir()`` calling ``os.getenv``
+    while ``os`` was only imported inside another function (a server that dies
+    while loading the model, invisible to ``py_compile``).  The narrow
+    stdlib-only version missed a real defect of the same family: after a
+    refactor one dump installer kept calling a helper that had just been deleted
+    -- same silent failure mode, different name.  So resolve scopes instead of
+    listing names: parameters, assignments, imports and nested defs of the
+    function, plus everything the enclosing function/class/module defines.
     """
     import ast
+    import builtins
 
-    stdlib = {"os", "sys", "time", "math", "json", "shutil", "glob", "re", "threading"}
     repo = HERE.parent.parent
     problems: list[str] = []
-    # ``model_runner_v1.py`` hosts the MLP/quant dump installers, i.e. the code
-    # most likely to grow a function-local import we forget to declare.
-    for relative in (
+    targets = (
         "vllm_ascend/attention/sfa_v1.py",
         "vllm_ascend/envs.py",
         "vllm_ascend/worker/model_runner_v1.py",
-    ):
+    )
+    builtin_names = set(dir(builtins)) | {"__file__", "__name__", "__doc__", "__package__"}
+
+    def bound_names(node: ast.AST) -> set[str]:
+        """Names this subtree can define (params, assignments, imports, defs).
+
+        Deliberately a superset: a name bound only inside a *nested* function also
+        lands here, which can hide a defect but can never invent one.
+        """
+        names: set[str] = set()
+        for child in ast.walk(node):
+            if isinstance(child, ast.Name) and isinstance(child.ctx, ast.Store):
+                names.add(child.id)
+            elif isinstance(child, ast.arg):
+                names.add(child.arg)
+            elif isinstance(child, (ast.Import, ast.ImportFrom)):
+                names.update(alias.asname or alias.name.split(".")[0] for alias in child.names)
+            elif isinstance(child, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+                names.add(child.name)
+            elif isinstance(child, ast.ExceptHandler) and child.name:
+                names.add(child.name)
+        return names
+
+    def module_bindings(tree: ast.Module) -> set[str]:
+        """Top-level bindings only: a name defined inside a function is not module scope."""
+        names: set[str] = set()
+        for node in tree.body:
+            if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+                names.add(node.name)
+            else:
+                names |= bound_names(node)
+        return names
+
+    for relative in targets:
         path = repo / relative
         if not path.is_file():
             continue
         tree = ast.parse(path.read_text(encoding="utf-8"))
-        # Only *top-level* imports count as module scope: a function-local
-        # `import os` must not make `os` look available to another function.
-        module_level: set[str] = set()
-        for node in tree.body:
-            if isinstance(node, ast.Import):
-                module_level.update(alias.asname or alias.name.split(".")[0] for alias in node.names)
-            elif isinstance(node, ast.ImportFrom):
-                module_level.update(alias.asname or alias.name for alias in node.names)
+        if any(
+            isinstance(node, ast.ImportFrom) and any(alias.name == "*" for alias in node.names)
+            for node in ast.walk(tree)
+        ):
+            problems.append(f"{relative}: star import -- cannot resolve names statically")
+            continue
+        module_level = module_bindings(tree)
 
-        def imported_in(scope: ast.AST) -> set[str]:
-            names: set[str] = set()
-            for node in ast.walk(scope):
-                if isinstance(node, ast.Import):
-                    names.update(alias.asname or alias.name.split(".")[0] for alias in node.names)
-                elif isinstance(node, ast.ImportFrom):
-                    names.update(alias.asname or alias.name for alias in node.names)
-                elif isinstance(node, ast.Name) and isinstance(node.ctx, ast.Store):
-                    names.add(node.id)
-            return names
-
-        for func in [n for n in ast.walk(tree) if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef))]:
-            local = {arg.arg for arg in (*func.args.args, *func.args.kwonlyargs)} | imported_in(func)
+        def check(func: ast.AST, inherited: set[str]) -> None:
+            known = inherited | bound_names(func) | builtin_names
             for node in ast.walk(func):
-                if (
-                    isinstance(node, ast.Name)
-                    and isinstance(node.ctx, ast.Load)
-                    and node.id in stdlib
-                    and node.id not in local
-                    and node.id not in module_level
-                ):
-                    problems.append(f"{relative}:{node.lineno}: {func.name}() uses {node.id} without an import")
-    assert not problems, "\n".join(problems)
+                if isinstance(node, ast.Name) and isinstance(node.ctx, ast.Load) and node.id not in known:
+                    problems.append(
+                        f"{relative}:{node.lineno}: {getattr(func, 'name', '?')}() loads undefined name {node.id}"
+                    )
+
+        for node in tree.body:
+            if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                check(node, module_level)
+            elif isinstance(node, ast.ClassDef):
+                inner_scope = module_level | bound_names(node)
+                for inner in node.body:
+                    if isinstance(inner, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                        check(inner, inner_scope)
+            else:
+                for sub in ast.walk(node):
+                    if isinstance(sub, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                        check(sub, module_level)
+    assert not problems, "\n".join(problems[:20])
 
 
 def test_check_zigzag_kv_handles_fp8_dumps() -> None:

@@ -112,18 +112,19 @@ case "${mode}" in
     #   量化输入也变 => 根因在量化/融合内核；量化输入相同而 GEMM 输出不同 => 根因在 GEMM 内核。
     # 只打 layer 0/1（0 是根因所在，1 作对照）：层数越多 dump 越大，而 2 层已足够定位。
     # 规模：每层每 rank ≈16MB × 8 rank × 2 配置 ⇒ 2 层 ≈ 510MB，加 qin ≈ 575MB
-    # → 必须落真实磁盘，默认 /root/cp_probe。
+    # → 必须落真实磁盘；**每轮一个独立子目录**（下面按时间戳生成），否则判读会把
+    # 上一轮的旧文件按"最新一份"混进来 —— 不同轮次的 spec 不同，混了就等于把两次
+    # 测量拼成一张表（现场发生过：新轮的 gu_q/dn_q 配旧轮的 mlp_out）。
     round_name="r_probe"
     repeat_a=0
     dump_spec="${DUMP_SPEC:-act:0,1,mlp:0,1,qin:0,topk:0,kv:0,1}"
     out_root="${OUT_ROOT:-/dev/shm/cp_ab_probe}"
     if [[ -z "${DUMP_DIR:-}" ]]; then
-      dump_dir="/root/cp_probe"
-    elif [[ "${DUMP_DIR}" != "/root/cp_probe" ]]; then
+      dump_dir="/root/cp_probe/$(date +%m%d_%H%M%S)"
+    else
       # A stale `export DUMP_DIR=/root/cp_dump` from a sweep round silently
-      # redirects this round's dumps into the sweep's directory -- then
-      # /root/cp_probe never appears and the data mixes with another round.
-      echo "[run_cp_diag] WARN: DUMP_DIR=${DUMP_DIR} 已设置，本轮 dump 会写进它（probe 默认 /root/cp_probe）" >&2
+      # redirects this round's dumps into the sweep's directory.
+      echo "[run_cp_diag] WARN: DUMP_DIR=${DUMP_DIR} 已设置，本轮 dump 会写进它（默认是 /root/cp_probe/<时间戳>）" >&2
       echo "[run_cp_diag]       若该目录里已有别的轮次，判读按 (layer, rank, cpbal) 取最新一份 → 会串味；" >&2
       echo "[run_cp_diag]       要用默认值就先 unset DUMP_DIR" >&2
     fi
