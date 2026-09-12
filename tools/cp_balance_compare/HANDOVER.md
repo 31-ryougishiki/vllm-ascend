@@ -155,6 +155,45 @@ re-assert，并对每个被 rc 改掉的键打印 `[cp-ab] NOTE: 站点 rc 把 X
 `mlp_out` 是 **reduce_scatter 之后**的 rank-local 张量（`dn_q` 是 all-gather 后的 2048 行、`gu_q` 是 rank-local），
 所以"GEMM 输入逐位相同 + GEMM 行序无关"留下的唯一去处就是那次跨 rank 归约本身。
 
+**2026-09-12 A3：`HCCL_DET=strict` 轮 —— 根因确认（保序即消除）**：
+
+```
+=== round 确定性（strict）===
+case              len   top1%   p99|d|  max|d|  first_div  block@first_div        verdict
+single_L2048     2048  100.00        0        0          -  -                      OK     ← 逐位相同
+single_L2049     2049   98.97    0.167    0.655       1992  rank1/next(b1950-2015) DIFF
+single_L4096     4096   77.88    0.349     1.09        335  rank2/prev(b256-384)   DIFF
+vs 基线: -100.0% / -57.0% / -11.0%
+act 剖面（本轮的，覆盖第一个请求 L2048）：layer 0/1 全部采样点 differ=0，
+    包括此前唯一不等的 layer 0 mlp_out（1920/2048 → 0）
+[act] FIRST DIVERGENCE (act): none -- every compared token is bit-identical in both layouts
+```
+
+⇒ **根因确认：分歧诞生在跨 rank 归约的"归约顺序"上**（`tensor_model_parallel_reduce_scatter`
+→ HCCL ReduceScatter；`HCCL_DETERMINISTIC=strict` 的保序把它消掉了）。整条链闭合：
+GEMM 侧（两站点 × 两量化 × 随机/真实权重 × 真实形状）全部行序无关 ⇒ 只剩归约 ⇒ 保序后第一个请求逐位相同。
+
+⚠️ 两个尾巴，都指向"下一轮怎么跑"：
+* **`LCCL_DETERMINISTIC` 这轮仍是 0**：`[cp-ab-hccl]` 显示 `LCCL_DETERMINISTIC=0` 且**没有**
+  `[cp-ab] NOTE: 站点 rc 把 …` ⇒ **站点还没同步 `a8af7d312` 的 re-assert**，A3 的 rc 又把 `1` 覆盖成 `0`
+  （LCCL 管 rankSize ≤ 8 的小消息保序，MC2/EP 子组走的正是它）⇒ L2049/L4096 的残余很可能就是这条没开。
+* **act dump 是 one-shot，只覆盖第一个 prefill 请求**，这轮第一个是 L2048（已干净）⇒ L2049/L4096 缺算子级证据。
+  要让它们可判读：`PROMPT_LENS=2049,2048 bash tools/cp_balance_compare/run_cp_diag.sh probe`。
+
+**下一步（同步 `a8af7d312` 后）**：
+
+```bash
+export HCCL_DET=strict
+unset DUMP_DIR
+PROMPT_LENS=2049,2048 bash tools/cp_balance_compare/run_cp_diag.sh probe
+```
+
+判据：① `[cp-ab-hccl] … HCCL_DETERMINISTIC=strict LCCL_DETERMINISTIC=1` **且**出现
+`[cp-ab] NOTE: 站点 rc 把 LCCL_DETERMINISTIC 从 '1' 改成 '0'，按本轮要求改回 '1'`（证明 re-assert 生效）；
+② L2049 的 `p99|d|C-B` 是否归 0；③ 本轮 act 覆盖 2049，看是否仍 `FIRST DIVERGENCE: none`。
+两个旋钮都生效后若仍有差异 ⇒ 残余不在 HCCL 归约顺序（ragged/padding 形状走了非保序算法，或 MoE/MC2
+内部通信域不受该开关影响），再决定收窄到具体算子还是接受"非整除长度残留"。
+
 **rank 覆盖现状**（A5：`--all-ranks` 已扫过 1..7，rank 0 另有两次单跑；A3（16 卡）：目前只有 rank 0，
 `--all-ranks --tp-size 16` 还没扫 —— TP=16 的权重分片形状不同，严格来说要补一次）：
 
@@ -249,8 +288,8 @@ pre-MLP norm/残差/跨 rank 归约错（`mlp_in` 相同）、**激活量化与�
 prev/next 两次调用形状（验证用的 `2call` 开关已随结论删除，见 README §七）、
 **"这是 A5/mxfp4 特有的算子问题"**（A3+W4A8C8 上同一形态复现，见 §1）。
 
-**仍开放**：**那次跨 rank 归约**（`tensor_model_parallel_reduce_scatter`；GEMM 已在两个站点、
-真实形状下排除 —— A3 见 §1 的 `[768,6144]` 复现，A5 待用 `--n 6144` 补一遍）；
+**仍开放**：L2049/L4096 的**残余差异**（`HCCL_DETERMINISTIC=strict` 下 0.167 / 0.349，而 L2048 已 0；
+疑似 `LCCL_DETERMINISTIC` 未生效 + ragged/padding 形状或 MoE/MC2 内部通信域）；
 MoE 层（≥3，需 `--enable-return-routed-experts`）；`MIN_TOKENS` 边界（与本问题无关）。
 
 ## 3. 环境与关键事实
