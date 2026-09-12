@@ -64,11 +64,19 @@
 ```bash
 # 站点点错了整轮作废：先确认（也用于切换节点）
 export CP_AB_SITE=its                              # its=A3 7.246.78.75/16 卡（默认）；share=141.61.133.104/8 卡
-# 当前这一步（一轮 ≈ 20 分钟，2 次模型加载）
+# 两个不需要 NPU 的门，跑轮次前各跑一次：
+#   ① 命令预演：看 site=/tp_size=/dir= 与 spec 对不对（**不碰 launcher、不查路径**）
+#   ② 配置门：真跑一遍 launcher 的 DRY_RUN，查 [cp-ab] 指纹、additional_config、
+#      vllm/model/repo/vendor 四条路径可达性（**必须显式 --launcher**，否则用的是
+#      launcher_template.sh 的占位路径，等于白查）
 unset DUMP_DIR                                     # ⚠️ 继承的 DUMP_DIR 会让 dump 改道（§九.1）
-bash tools/cp_balance_compare/run_cp_diag.sh probe --dry-run    # 先看 site=/tp_size=/dir= 与 spec 对不对
+bash tools/cp_balance_compare/run_cp_diag.sh probe --dry-run    # ①
+python tools/cp_balance_compare/ab_cp_compare.py --preflight \
+    --launcher "bash tools/cp_balance_compare/launcher_glm52_w4a4c8_mxfp4.sh {port}" \
+    --cp-size 16                                   # ② 判据：末行 [preflight] all configs OK
+# 然后跑一轮（≈20 分钟，2 次模型加载）
 bash tools/cp_balance_compare/run_cp_diag.sh probe
-# 判读（--dir 用上一行 dry-run/运行输出里打印的那个，每轮都不同）
+# 判读（--dir 用上面输出里打印的那个，每轮都不同）
 python tools/cp_balance_compare/check_zigzag_dumps.py --dir /root/cp_probe/<时间戳> \
     --kind act --summary-only --block-size 128 2>&1 | tee tools/cp_balance_compare/log.log
 ```
@@ -137,8 +145,9 @@ in ─attention─▶ out ─pre-MLP norm─▶ mlp_in ─[量化]─▶ gu_q �
 
 其它工具：`compare_cp_rounds.py <轮1>=<目录> <轮2>=<目录>` 并排多轮指标（回到噪声级 rc=0、仍超阈 1、无可比 case 2）；
 `selfcheck.py` 首跑/换机器时跑一次即可（**日常迭代不要重复跑**）；配置门与命令预演它不再重复实现：
-`python tools/cp_balance_compare/ab_cp_compare.py --preflight`（判据末行 `[preflight] all configs OK`）
-与 `bash tools/cp_balance_compare/run_cp_diag.sh probe --dry-run`。
+`python tools/cp_balance_compare/ab_cp_compare.py --preflight --launcher "bash tools/cp_balance_compare/launcher_glm52_w4a4c8_mxfp4.sh {port}" --cp-size <TP>`
+（判据末行 `[preflight] all configs OK`；**漏 `--launcher` 会退回到 `launcher_template.sh` 的占位路径**）
+与 `bash tools/cp_balance_compare/run_cp_diag.sh probe --dry-run`（只预览命令，不查路径）。
 
 ## 六、指标与判定口径（driver）
 

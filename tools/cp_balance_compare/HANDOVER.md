@@ -258,7 +258,8 @@ python tools/cp_balance_compare/check_zigzag_dumps.py --dir "$DIR" \
 | CPU 自测（改完代码必跑） | `python tools/cp_balance_compare/selftest_mock.py` | 每项 `[run]`/`[ok] …(Ns)`，末行 `SELFTEST OK`（57 项）；卡住时最后一行 `[run]` 就是卡住的用例，90s 后自动超时并打栈；慢 bash 站点自动 `[skip]` 4 个 launcher 用例（`--only/--skip` 可覆盖） |
 | 版本指纹（无 git） | `python tools/cp_balance_compare/selfcheck.py --fingerprint` | 末行 `[fp] <16 位>` + 文件摘要 + marker OK/MISSING |
 | 环境体检 | `python tools/cp_balance_compare/selfcheck.py` | `[verdict] READY`、无 FAIL |
-| 配置门（不加载模型） | `ab_cp_compare.py --preflight` | 末行 `[preflight] all configs OK` |
+| 配置门（不加载模型） | `ab_cp_compare.py --preflight --launcher "bash tools/cp_balance_compare/launcher_glm52_w4a4c8_mxfp4.sh {port}" --cp-size <TP>` | 末行 `[preflight] all configs OK`；查 `[cp-ab]` 指纹 + additional_config + vllm/model/repo/vendor 路径。⚠️ 漏 `--launcher` 会用 `launcher_template.sh` 的占位路径 |
+| 命令预演（只预览） | `bash tools/cp_balance_compare/run_cp_diag.sh <mode> --dry-run` | 打印 site/tp/dir/spec 与实际 driver 命令；**不碰 launcher、不查路径** |
 | 一轮 A/B（B/C） | `unset DUMP_DIR; bash tools/cp_balance_compare/run_cp_diag.sh probe` | 上述三件套；N≈272（融合路径下 `dn_in` 缺 16 个，N≈256） |
 | 一轮 A/B + C 重复 | `… run_cp_diag.sh probe2` | 三件套 + `[noise] C2 vs C` |
 | **归约确定性轮** | `export HCCL_DET=strict; unset DUMP_DIR; bash tools/cp_balance_compare/run_cp_diag.sh probe` | 轮次目录 `r_probe_det`；日志有 `[cp-ab-hccl] … HCCL_DETERMINISTIC=strict LCCL_DETERMINISTIC=1`；与 `r_probe` 并排看是否回噪（README §七） |
