@@ -163,28 +163,45 @@ B/C 差异已收敛到紧随 down_proj 的跨 rank 归约（`tensor_model_parall
 | `LCCL_DETERMINISTIC` | LCCL 侧 AllReduce（保序加），**rankSize ≤ 8 时生效**（本站 TP=8 正命中） | `0`(默认) / `1` |
 | `ATB_MATMUL_SHUFFLE_K_ENABLE` / `ATB_LLM_LCOC_ENABLE` | ATB 矩阵乘洗牌 / 低比特通信优化（仓库 FAQ §15 的确定性配方） | `0` 关闭 |
 
-`HCCL_DET` 取值（整轮生效，B/C 同设置，只差 token 排布）：
+`HCCL_DET` 取值（整轮生效，B/C 同设置，只差 token 排布；**按这个顺序试**）：
 
 ```bash
-export HCCL_DET=strict     # ← 单独一行！`VAR=... cmd | tee` 的前缀会静默丢（§九.4）
+export HCCL_DET=true       # ← 单独一行！`VAR=... cmd | tee` 的前缀会静默丢（§九.4）
 unset DUMP_DIR
 bash tools/cp_balance_compare/run_cp_diag.sh probe
-# → round=r_probe_det，env=HCCL_DETERMINISTIC=strict LCCL_DETERMINISTIC=1
-#   取值：strict | true | atb(=true + LCCL + 两个 ATB 旋钮)；留空 = 不开（保持 r_probe）
+# → round=r_probe_det，env=HCCL_DETERMINISTIC=true LCCL_DETERMINISTIC=1
+#   true（先用）/ atb（+ATB 两旋钮 + CLOSE_MATMUL_K_SHIFT=1）/ expand（+HCCL_OP_EXPANSION_MODE=2）
+#   / strict（**本站已证不可用**，见下）/ 留空 = 不开（保持 r_probe）
 ```
+
+⚠️ **`strict` 在本站不可用（2026-09-12 实测）**：B 配置在 **profile run** 阶段就死，栈底是
+MoE 的 token dispatch（`torch_npu.npu_moe_distribute_dispatch_v2`）内部的 **HcclReduceScatter**：
+
+```
+E39999: ... an exception occurred during AICPU execution ... errcode:11003, msg:get kernel failed
+  soName=libccl_kernel.so, funcName=RunAicpuIndOpCommInit, errorCode=0x2a
+RuntimeError: ... the current working operator name is HcclReduceScatter.
+```
+
+即"保序"所需的 AICPU kernel 在这套芯片/CANN 上装不出来。两点结论：① 环境变量是**全局**的，
+连 MC2/MoE 内部通信域一起吃（而我们要改的只是 TP 组上那次 MLP 归约）；② **按通信域配置这条路
+也走不通** —— torch_npu 的 `pg_options.hccl_config` 目前只支持
+`hccl_buffer_size` / `group_name` / `qos_service_level` / `qos_traffic_class` / `hccl_op_expansion_mode`
+五个键（[官方说明](https://gitcode.com/Ascend/pytorch/blob/master/docs/en/framework_feature_guide_pytorch/setting_HCCL_communicator_parameter.md)），没有确定性键。
+所以候选顺序是：`true` → `atb` → `expand` → 换归约实现（`all_reduce + slice`）。
+（`true` 档是社区配方：torchtitan-npu 的 NPU 确定性就是 `HCCL_DETERMINISTIC=true` + `CLOSE_MATMUL_K_SHIFT=1`。）
 
 **判据**（三条一起看）：
 
-1. 配置生效：启动日志有 launcher 的 `[cp-ab-hccl] … HCCL_DETERMINISTIC=strict LCCL_DETERMINISTIC=1 …`
-   与 `[run_cp_diag] hccl_det=strict env=…`；driver 的 `[check] B/C fingerprint OK` 仍通过。
+1. 配置生效：启动日志有 launcher 的 `[cp-ab-hccl] … HCCL_DETERMINISTIC=true LCCL_DETERMINISTIC=1 …`
+   与 `[run_cp_diag] hccl_det=true env=…`；driver 的 `[check] B/C fingerprint OK` 仍通过。
 2. 与基线轮并排：`python tools/cp_balance_compare/compare_cp_rounds.py 基线=/dev/shm/cp_ab_probe/r_probe 确定性=/dev/shm/cp_ab_probe/r_probe_det`
    → `back to the noise floor`（`p99|d|C-B ≤ 0.05`）⇒ 归约顺序即根因、且确定性开关可作缓解；仍 `above threshold` ⇒ 换归约实现（`all_reduce + slice`）再 A/B。
 3. 同轮 `[act]` 表里 layer 0 的 `mlp_out`：1664/2048 → 0 差异，等于在**算子级**确认（比只看 logprob 更硬）。
 
-⚠️ `strict` 的官方约束：归约保序需**对称分布**（卡数对称）、INF/NaN 模式（非饱和），
+⚠️ `strict` 的官方约束（今后换机器可参考）：归约保序需**对称分布**（卡数对称）、INF/NaN 模式（非饱和），
 在 A2/A3 上支持 AllReduce/ReduceScatter（bf16/fp16/fp32、sum、rank ≥ 3），
-机间只用 HCCS-SDMA（不支持 RoCE RDMA）。单机 TP=8 满足；若站点 CANN/芯片不支持 `strict`，
-退一步用 `HCCL_DET=true` 再跑一轮。
+机间只用 HCCS-SDMA（不支持 RoCE RDMA）。
 
 ## 八、已删除的实验（别再去找开关）
 

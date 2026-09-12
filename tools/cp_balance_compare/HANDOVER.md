@@ -105,24 +105,32 @@ NZ 内部格式（`RuntimeError: ... copy_ do not support internal format`）—
 
 **后续分支**（8/8 rank 都行序无关 ⇒ 归约侧；两步走，先便宜的后贵的）：
 
-**第 1 步 — 开 HCCL 归约确定性（一轮 probe ≈20 分钟，先做这个）**。这条归约就是
+**第 1 步 — 开 HCCL 归约确定性（一轮 probe ≈20 分钟）**。这条归约就是
 `tensor_model_parallel_reduce_scatter` → vLLM `base_device_communicator.reduce_scatter` →
 `torch.distributed.reduce_scatter_tensor` → **HCCL ReduceScatter**，而 HCCL 本身有归约类算子的
 确定性与保序开关（官方说明见 [HCCL_DETERMINISTIC](https://gitcode.com/cann/hccl/blob/master/docs/user_guide/hccl_env/HCCL_DETERMINISTIC.md)：
 `false`(默认)/`true`/`strict`，覆盖 AllReduce / ReduceScatter / ReduceScatterV / Reduce；
-`LCCL_DETERMINISTIC=1` 在 rankSize ≤ 8 时生效 —— 本站 TP=8 正命中）：
+`LCCL_DETERMINISTIC=1` 在 rankSize ≤ 8 时生效 —— 本站 TP=8 正命中）。
+
+⚠️ **`strict` 已证不可用（2026-09-12 实测）**：B 配置在 profile run 就死 —— MoE dispatch
+（`npu_moe_distribute_dispatch_v2`）内部的 **HcclReduceScatter** 报
+`E39999 … AICPU … RunAicpuIndOpCommInit get kernel failed (11003)`（`libccl_kernel.so`），
+即保序所需的 AICPU kernel 在这套芯片/CANN 上装不出来；而且环境变量是**全局**的，会连 MC2/MoE
+内部通信域一起吃。**按通信域配置也走不通**：torch_npu 的 `pg_options.hccl_config` 只支持
+`hccl_buffer_size`/`group_name`/`qos_service_level`/`qos_traffic_class`/`hccl_op_expansion_mode`，
+没有确定性键。⇒ 候选顺序 **`true` → `atb` → `expand` → 换归约实现**。
 
 ```bash
-export HCCL_DET=strict        # 单独一行：VAR=... 前缀在同一条命令里会静默丢
+export HCCL_DET=true          # 单独一行：VAR=... 前缀在同一条命令里会静默丢
 unset DUMP_DIR
-bash tools/cp_balance_compare/run_cp_diag.sh probe      # → r_probe_det，env=HCCL_DETERMINISTIC=strict LCCL_DETERMINISTIC=1
+bash tools/cp_balance_compare/run_cp_diag.sh probe      # → r_probe_det，env=HCCL_DETERMINISTIC=true LCCL_DETERMINISTIC=1
 ```
 
-判据：① 日志有 `[cp-ab-hccl] … HCCL_DETERMINISTIC=strict LCCL_DETERMINISTIC=1 …`；
+判据：① 日志有 `[cp-ab-hccl] … HCCL_DETERMINISTIC=true LCCL_DETERMINISTIC=1 …`；
 ② `compare_cp_rounds.py 基线=/dev/shm/cp_ab_probe/r_probe 确定性=/dev/shm/cp_ab_probe/r_probe_det`
 末行 `back to the noise floor`（`p99|d|C-B ≤ 0.05`）⇒ 归约顺序即根因、且这是可用的缓解手段（代价是性能）；
 ③ 同轮 `[act]` 里 layer 0 `mlp_out` 从 1664/2048 变 0 ⇒ 算子级确认。
-`strict` 不被芯片/CANN 支持时退到 `HCCL_DET=true`。
+`true`/`atb`/`expand` 都不行时，走第 2 步。
 
 **第 2 步（第 1 步无效才做）** — 换归约实现：把 row-parallel 归约换成 `all_reduce + slice` 做 A/B
 （或继续查 HCCL 算法/展开模式 `HCCL_ALGO`、`HCCL_OP_EXPANSION_MODE`），再用 `probe2` 看 `C−B` 是否回噪。

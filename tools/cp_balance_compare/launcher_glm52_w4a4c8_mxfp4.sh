@@ -234,7 +234,7 @@ echo "[cp-ab] DUMP=${VLLM_ASCEND_CP_BALANCE_DUMP:-<unset>}"
 # deterministic / layout independent is exactly what these knobs control, so the
 # round has to say which setting it ran with.  NOT part of the [cp-ab] line:
 # that line is parsed as int KEY=VALUE pairs by the driver's --config-check.
-echo "[cp-ab-hccl] HCCL_ALGO=${HCCL_ALGO} HCCL_DETERMINISTIC=${HCCL_DETERMINISTIC:-<unset>} LCCL_DETERMINISTIC=${LCCL_DETERMINISTIC:-<unset>} ATB_MATMUL_SHUFFLE_K_ENABLE=${ATB_MATMUL_SHUFFLE_K_ENABLE:-<unset>} ATB_LLM_LCOC_ENABLE=${ATB_LLM_LCOC_ENABLE:-<unset>}"
+echo "[cp-ab-hccl] HCCL_ALGO=${HCCL_ALGO} HCCL_DETERMINISTIC=${HCCL_DETERMINISTIC:-<unset>} LCCL_DETERMINISTIC=${LCCL_DETERMINISTIC:-<unset>} HCCL_OP_EXPANSION_MODE=${HCCL_OP_EXPANSION_MODE:-<unset>} ATB_MATMUL_SHUFFLE_K_ENABLE=${ATB_MATMUL_SHUFFLE_K_ENABLE:-<unset>} ATB_LLM_LCOC_ENABLE=${ATB_LLM_LCOC_ENABLE:-<unset>} CLOSE_MATMUL_K_SHIFT=${CLOSE_MATMUL_K_SHIFT:-<unset>}"
 
 port="${2:-${1:-8034}}"
 

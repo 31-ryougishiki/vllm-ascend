@@ -1844,12 +1844,17 @@ def test_hccl_determinism_round_is_wired_and_self_describing() -> None:
     with (the two rounds then look identical afterwards).
     """
     script = (HERE / "run_cp_diag.sh").read_text(encoding="utf-8")
-    assert "HCCL_DETERMINISTIC=strict LCCL_DETERMINISTIC=1" in script, script
+    assert "HCCL_DETERMINISTIC=true LCCL_DETERMINISTIC=1" in script, script
     assert "ATB_MATMUL_SHUFFLE_K_ENABLE=0" in script, script
+    assert "HCCL_OP_EXPANSION_MODE=2" in script, script
+    assert "CLOSE_MATMUL_K_SHIFT=1" in script, script
     assert 'round_name="${round_name}_det"' in script, script
     launcher = (HERE / "launcher_glm52_w4a4c8_mxfp4.sh").read_text(encoding="utf-8")
     assert "[cp-ab-hccl]" in launcher, launcher
     assert "HCCL_DETERMINISTIC=${HCCL_DETERMINISTIC:-<unset>}" in launcher, launcher
+    # A determinism round is only interpretable if the log says what it ran with,
+    # including the orthogonal knobs (expansion mode changes which kernels HCCL uses).
+    assert "HCCL_OP_EXPANSION_MODE=${HCCL_OP_EXPANSION_MODE:-<unset>}" in launcher, launcher
     # The knobs must stay out of the [cp-ab] fingerprint line: that line is parsed
     # as int KEY=VALUE pairs (HCCL_DETERMINISTIC=strict would be dropped silently).
     fingerprint = next(line for line in launcher.splitlines() if "[cp-ab] CP_BALANCE=" in line)
@@ -1861,7 +1866,7 @@ def test_hccl_determinism_round_is_wired_and_self_describing() -> None:
     import subprocess
 
     env = os.environ.copy()
-    env["HCCL_DET"] = "strict"
+    env["HCCL_DET"] = "true"
     try:
         proc = subprocess.run(
             ["bash", "tools/cp_balance_compare/run_cp_diag.sh", "probe", "--dry-run"],
@@ -1878,8 +1883,8 @@ def test_hccl_determinism_round_is_wired_and_self_describing() -> None:
         return
     text = proc.stdout + proc.stderr
     assert proc.returncode == 0, text
-    assert "hccl_det=strict" in text, text
-    assert "--env HCCL_DETERMINISTIC=strict --env LCCL_DETERMINISTIC=1" in text, text
+    assert "hccl_det=true" in text, text
+    assert "--env HCCL_DETERMINISTIC=true --env LCCL_DETERMINISTIC=1" in text, text
     assert "round=r_probe_det" in text, text
 
 

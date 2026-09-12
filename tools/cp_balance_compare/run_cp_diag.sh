@@ -27,13 +27,20 @@
 #   HCCL_DET     默认空（关）。开启集合通信确定性（CANN 环境变量参考 HCCL_DETERMINISTIC /
 #                LCCL_DETERMINISTIC；仓库自身用法见 vllm_ascend/batch_invariant.py:82-87
 #                与 docs/source/faqs.md §15）。取值：
-#                  strict → HCCL_DETERMINISTIC=strict + LCCL_DETERMINISTIC=1
-#                  true   → HCCL_DETERMINISTIC=true   + LCCL_DETERMINISTIC=1
-#                  atb    → 上面两个 + ATB_MATMUL_SHUFFLE_K_ENABLE=0 + ATB_LLM_LCOC_ENABLE=0
+#                  true   → HCCL_DETERMINISTIC=true   + LCCL_DETERMINISTIC=1   ← **先用这个**
+#                  atb    → 上面 + ATB_MATMUL_SHUFFLE_K_ENABLE=0 + ATB_LLM_LCOC_ENABLE=0
+#                           + CLOSE_MATMUL_K_SHIFT=1（torchtitan-npu 的 NPU 确定性配方用的就是 true 这档）
+#                  expand → 上面(true 档) + HCCL_OP_EXPANSION_MODE=2（AICPU 展开：A3 文档称
+#                           该模式下归约类算子本身即确定性）
+#                  strict → HCCL_DETERMINISTIC=strict（**本站不可用**：2026-09-12 实测在
+#                           profile run 的 MoE dispatch 里炸 —— HcclReduceScatter 的 AICPU
+#                           kernel RunAicpuIndOpCommInit "get kernel failed"(11003)，见 README §七）
 #                用途：B/C 差异已收敛到跨 rank 归约（tensor_model_parallel_reduce_scatter），
 #                这一轮回答"归约顺序的不确定性/排布相关性是不是根因"。
-#                判据：`[cp-ab-hccl]` 行里能看到 HCCL_DETERMINISTIC/LCCL_DETERMINISTIC，
-#                且该轮 `p99|d|C-B <= 阈值`（0.05）⇒ 确定性配置即缓解；仍超阈 ⇒ 换归约实现。
+#                判据：`[cp-ab-hccl]` 行里能看到这些变量，且该轮 `p99|d|C-B <= 阈值`（0.05）
+#                ⇒ 确定性配置即缓解；仍超阈 ⇒ 换归约实现（all_reduce + slice）再 A/B。
+#                另可单独 `export HCCL_OP_EXPANSION_MODE=<0|1|2|3>` / `HCCL_ALGO=…` 做正交实验，
+#                launcher 会把它们打进 `[cp-ab-hccl]` 行（环境本身是透传的）。
 #
 # 说明：digest 变量在 B/C 两个 server 上取值相同，dump 文件名自带 cpbal{0|1}，
 # 所以一轮就能同时拿到 B 与 C 的数据。每轮输出到 $OUT_ROOT/<round>。
@@ -88,14 +95,22 @@ hccl_det="${HCCL_DET:-}"
 hccl_det_env=()
 case "${hccl_det}" in
   ""|0|off|false) hccl_det="" ;;
+  # ``strict`` is kept only so the known-bad round can be reproduced on purpose: on
+  # the site it kills the server in the profile run (AICPU kernel
+  # RunAicpuIndOpCommInit "get kernel failed", see README §七).
   strict) hccl_det_env=(HCCL_DETERMINISTIC=strict LCCL_DETERMINISTIC=1) ;;
   true|1) hccl_det_env=(HCCL_DETERMINISTIC=true LCCL_DETERMINISTIC=1) ;;
   atb)
     hccl_det_env=(HCCL_DETERMINISTIC=true LCCL_DETERMINISTIC=1
-                  ATB_MATMUL_SHUFFLE_K_ENABLE=0 ATB_LLM_LCOC_ENABLE=0)
+                  ATB_MATMUL_SHUFFLE_K_ENABLE=0 ATB_LLM_LCOC_ENABLE=0
+                  CLOSE_MATMUL_K_SHIFT=1)
+    ;;
+  expand)
+    hccl_det_env=(HCCL_DETERMINISTIC=true LCCL_DETERMINISTIC=1
+                  HCCL_OP_EXPANSION_MODE=2)
     ;;
   *)
-    echo "[run_cp_diag] unknown HCCL_DET=${hccl_det}（可选 strict|true|atb，或留空关闭）" >&2
+    echo "[run_cp_diag] unknown HCCL_DET=${hccl_det}（可选 true|atb|expand|strict，或留空关闭）" >&2
     exit 2
     ;;
 esac
