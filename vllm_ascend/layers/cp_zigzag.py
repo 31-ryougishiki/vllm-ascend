@@ -40,15 +40,6 @@ _PURE_PREFILL_ATTENTION_STATES = {
 }
 
 
-def is_zigzag_cp_active() -> bool:
-    from vllm_ascend.ascend_forward_context import _EXTRA_CTX
-
-    try:
-        return bool(_EXTRA_CTX.zigzag_cp_active)
-    except Exception:
-        return False
-
-
 def get_zigzag_cp_context():
     from vllm_ascend.ascend_forward_context import _EXTRA_CTX
 

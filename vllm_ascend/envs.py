@@ -95,34 +95,6 @@ env_variables: dict[str, Callable[[], Any]] = {
     "VLLM_ASCEND_CP_BALANCE_EMBED_LOCAL": lambda: bool(
         int(os.getenv("VLLM_ASCEND_CP_BALANCE_EMBED_LOCAL", "0"))
     ),
-    # Debug switch for tools/cp_balance_compare: log once per process when the
-    # zigzag CP metadata is built and when the forward context activates it.
-    # This is how the A/B/C driver proves that configuration C did not silently
-    # fall back to the continuous-slice path.
-    "VLLM_ASCEND_CP_BALANCE_DEBUG_LOG": lambda: bool(
-        int(os.getenv("VLLM_ASCEND_CP_BALANCE_DEBUG_LOG", "0"))
-    ),
-    # Diagnostics for the zigzag precision triage. One switch covers every dump
-    # kind; an empty value (default) disables them. Syntax: "kind:layers[,...]"
-    # where kind is topk (LightningIndexer output), kv (packed KV cache rows in
-    # natural token order), act (attention/MLP trace), mlp (MLP boundary) or qin
-    # (fp8 + e8m0 scale fed to a layer's MLP GEMMs), and layers is "all" or a
-    # comma separated list, e.g.
-    #   VLLM_ASCEND_CP_BALANCE_DUMP=topk:6      (only layer 6, top-k)
-    #   VLLM_ASCEND_CP_BALANCE_DUMP=kv:0,6      (layers 0 and 6, KV)
-    #   VLLM_ASCEND_CP_BALANCE_DUMP=act:0,1,mlp:0,1,qin:0
-    # Files land in sfa_v1.SFA_ZIGZAG_DUMP_DIR as
-    # <kind>_cpbal<N>_layer<L>_rank<R>_pid<P>_<ts>.pt, so the B
-    # (CP_BALANCE=0) and C (CP_BALANCE=1) servers of one A/B round never
-    # overwrite each other. Read them with
-    # tools/cp_balance_compare/check_zigzag_dumps.py.
-    "VLLM_ASCEND_CP_BALANCE_DUMP": lambda: os.getenv("VLLM_ASCEND_CP_BALANCE_DUMP", ""),
-    # Where those dumps are written.  Default /dev/shm/cp_balance_dump, which is
-    # fine for a few layers but NOT for a full-layer sweep (kv:all is GBs): a
-    # full /dev/shm also breaks the server itself (its IPC/prometheus dirs live
-    # there), so point this at a real disk when shm is small.  run_cp_diag.sh
-    # forwards its DUMP_DIR here, so one knob controls writer and checker.
-    "VLLM_ASCEND_CP_BALANCE_DUMP_DIR": lambda: os.getenv("VLLM_ASCEND_CP_BALANCE_DUMP_DIR", ""),
     # Whether to enable weight cast format to FRACTAL_NZ.
     # 0: close nz;
     # 1: only quant case enable nz;

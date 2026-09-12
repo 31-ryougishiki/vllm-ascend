@@ -12,7 +12,6 @@ from vllm.distributed import get_dp_group, get_ep_group, get_tensor_model_parall
 from vllm.forward_context import BatchDescriptor, get_forward_context, set_forward_context
 from vllm.logger import logger
 
-from vllm_ascend import envs as ascend_envs
 from vllm_ascend.ascend_config import get_ascend_config
 from vllm_ascend.layers.cp_zigzag import zigzag_reorder_moe_aux
 from vllm_ascend.utils import (
@@ -344,19 +343,6 @@ def set_ascend_forward_context(
         else:
             forward_context.zigzag_cp_context = zigzag_cp_context
             forward_context.zigzag_cp_active = zigzag_cp_active
-
-        if (
-            zigzag_cp_active
-            and zigzag_cp_context is not None
-            and ascend_envs.VLLM_ASCEND_CP_BALANCE_DEBUG_LOG
-        ):
-            # Runtime proof for tools/cp_balance_compare: the forward context
-            # really enabled the model-level zigzag path for this batch.
-            logger.info_once(
-                "[CP_BALANCE] forward zigzag_active=1 num_tokens=%s local_tokens=%s",
-                zigzag_cp_context.num_tokens,
-                zigzag_cp_context.zigzag_index.shape[0] if zigzag_cp_context.zigzag_index is not None else -1,
-            )
 
         if zigzag_cp_active and zigzag_cp_context is not None and input_ids is not None:
             # MoE hash routing runs once per MoE layer, but the reorder is
