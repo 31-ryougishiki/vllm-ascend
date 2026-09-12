@@ -1561,6 +1561,11 @@ def test_cp_balance_weight_dump_survives_an_internal_format() -> None:
     assert "_weight_to_cpu" in source, source
     assert "ACL_FORMAT_FRACTAL_ND" in source, source
     assert '"weight_format"' in source, source
+    assert '"weight_shape"' in source, source
+    # The "already dumped" set must be keyed by (layer, op): keyed by layer alone it
+    # let gate_up_proj consume the slot and the reproducer loaded that weight for a
+    # down_proj dump (K mismatch inside the kernel).
+    assert "weights_done: set[tuple[int, str]]" in source, source
     assert 'return None, "unavailable"' in source, "the fallback must not raise"
     # The site verifies the fix without git through this marker.
     assert "w dump NZ 兜底" in (HERE / "selfcheck.py").read_text(encoding="utf-8")
@@ -1816,6 +1821,99 @@ def test_repro_row_order_dispatches_the_int8_scheme() -> None:
             assert call["pt"] is torch.float32, call
             assert call["mx"] == (False, False), call  # no MXFP8-only args
             assert call["out"] is torch.bfloat16, call
+    finally:
+        if previous is None:
+            sys.modules.pop("torch_npu", None)
+        else:
+            sys.modules["torch_npu"] = previous
+        shutil.rmtree(out, ignore_errors=True)
+
+
+def test_repro_row_order_uses_the_weight_of_its_own_op() -> None:
+    """The ``w`` dump is per (layer, op); the reproducer must not take the sibling's.
+
+    Site 2026-09-12 (A3): the weight tap keyed its "already dumped" set by layer, so
+    ``gate_up_proj`` consumed the slot and the reproducer loaded that weight for a
+    ``dn_q`` dump -- ``K dimension of x1 and x2 must be equal (768 vs 6144)``.  Both
+    halves are pinned here: pick the matching op even when the sibling is newer, and
+    say which ops *were* found when the needed one is missing.
+    """
+    import importlib.util
+    import os
+    import types
+
+    import torch
+
+    path = HERE / "repro_row_order.py"
+    spec = importlib.util.spec_from_file_location("cp_ab_repro_row_order_op", path)
+    assert spec is not None and spec.loader is not None
+    module = importlib.util.module_from_spec(spec)
+    sys.modules["cp_ab_repro_row_order_op"] = module
+    spec.loader.exec_module(module)
+
+    seen: list[tuple] = []
+    stub = types.ModuleType("torch_npu")
+
+    def _quant_matmul(q, weight, weight_scale, **kwargs):  # noqa: ANN001 - mimics the vendor op
+        seen.append(tuple(weight.shape))
+        return torch.ones(q.shape[0], weight.shape[1], dtype=torch.bfloat16)
+
+    stub.npu_quant_matmul = _quant_matmul
+    stub.npu_format_cast = lambda tensor, fmt, **kwargs: tensor
+    stub.float8_e8m0fnu = None
+
+    out = _temp_dir("cp_ab_repro_op_")
+    previous = sys.modules.get("torch_npu")
+    sys.modules["torch_npu"] = stub
+    try:
+        for cpbal in (0, 1):
+            torch.save(
+                {
+                    "kind": "qin", "op": "dn_q", "fused": False, "rows": 4,
+                    "positions_from": "gather_natural" if cpbal == 0 else "gather_zigzag",
+                    "positions": torch.arange(4, dtype=torch.int64),
+                    "q": torch.zeros(4, 64, dtype=torch.int8),
+                    "s": torch.ones(4, dtype=torch.float32),
+                    "in_dtype": "torch.bfloat16",
+                },
+                out / f"dnq_cpbal{cpbal}_layer0_rank0_pid1_{1000 + cpbal}.pt",
+            )
+        # The sibling (gate_up: K=hidden=128 here) is *newer*, so "newest wins" picks
+        # the wrong tensor; the down_proj weight (K=64 = q's K) is the right one.
+        torch.save(
+            {
+                "kind": "w", "op": "dn_q", "layer_idx": 0,
+                "weight": torch.zeros(64, 8, dtype=torch.int8),
+                "weight_scale": torch.ones(8, dtype=torch.float32),
+                "weight_dtype": "torch.int8", "weight_format": "as-is",
+            },
+            out / "w_cpbal1_layer0_rank0_pid1_1400.pt",
+        )
+        torch.save(
+            {
+                "kind": "w", "op": "gu_q", "layer_idx": 0,
+                "weight": torch.zeros(128, 16, dtype=torch.int8),
+                "weight_scale": torch.ones(16, dtype=torch.float32),
+                "weight_dtype": "torch.int8", "weight_format": "as-is",
+            },
+            out / "w_cpbal1_layer0_rank0_pid1_1500.pt",
+        )
+        buffer = io.StringIO()
+        with redirect_stdout(buffer):
+            rc = module.main(["--dir", str(out), "--layer", "0", "--run-op", "--device", "meta"])
+        text = buffer.getvalue()
+        assert rc == 0, text
+        assert seen == [(64, 8), (64, 8)], (seen, text)
+
+        # Only the sibling exists: an explicit message, not a kernel error.
+        os.remove(out / "w_cpbal1_layer0_rank0_pid1_1400.pt")
+        errors = io.StringIO()
+        with redirect_stdout(io.StringIO()), redirect_stderr(errors):
+            rc = module.main(
+                ["--dir", str(out), "--layer", "0", "--run-op", "--device", "meta"]
+            )
+        assert rc == 2, errors.getvalue()
+        assert "只有 op=['gu_q'] 的" in errors.getvalue(), errors.getvalue()
     finally:
         if previous is None:
             sys.modules.pop("torch_npu", None)

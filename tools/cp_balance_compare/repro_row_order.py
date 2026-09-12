@@ -58,25 +58,43 @@ NAME_RE = re.compile(
 )
 
 
-def _latest(dump_dir: str, kind: str, layer: int, cpbal: int, rank: int):
-    """Newest dump of ``kind`` for one (layer, cpbal, rank), or ``None``."""
+def _latest(dump_dir: str, kind: str, layer: int, cpbal: int, rank: int, op: str | None = None):
+    """Newest dump of ``kind`` for one (layer, cpbal, rank), or ``None``.
+
+    ``op`` filters on the payload's ``op`` field: the weight tap writes one file
+    per (layer, op), and the filenames do not carry the op, so "newest" alone would
+    hand the reproducer the sibling GEMM's weight -- which has a different (K, N)
+    and dies inside the kernel with "K dimension of x1 and x2 must be equal".
+    """
     pattern = os.path.join(dump_dir, f"{kind}_cpbal{cpbal}_layer{layer}_rank{rank}_pid*_*.pt")
-    best = None
+    candidates = []
     for path in glob.glob(pattern):
         match = NAME_RE.search(os.path.basename(path))
         if match is None:
             continue
-        stamp = int(match.group("ts"))
-        if best is None or stamp > best[0]:
-            best = (stamp, path)
-    if best is None:
-        return None, None
-    try:
-        payload = torch.load(best[1], map_location="cpu")
-    except Exception as exc:  # noqa: BLE001 - a truncated dump must not crash the analysis
-        print(f"[repro] cannot read {best[1]}: {exc}", file=sys.stderr)
-        return None, None
-    return best[1], payload
+        candidates.append((int(match.group("ts")), path))
+    candidates.sort(reverse=True)
+    found_ops: set[str] = set()
+    for _stamp, path in candidates:
+        try:
+            payload = torch.load(path, map_location="cpu")
+        except Exception as exc:  # noqa: BLE001 - a truncated dump must not crash the analysis
+            print(f"[repro] cannot read {path}: {exc}", file=sys.stderr)
+            continue
+        if op is not None:
+            found_ops.add(str(payload.get("op")))
+            if str(payload.get("op")) != op:
+                continue
+        return path, payload
+    if op is not None and found_ops:
+        # Say *which* op was there instead of silently falling through to the
+        # random-weight path (or to the sibling's weight).
+        print(
+            f"[repro] {kind}_cpbal{cpbal}_layer{layer}_rank{rank}: 只有 op={sorted(found_ops)} 的 "
+            f"dump，需要 op={op}（打点按 (layer, op) 各写一份；旧轮次每层只写了一个 op）",
+            file=sys.stderr,
+        )
+    return None, None
 
 
 def _describe(tag: str, path: str, payload: dict) -> None:
@@ -156,22 +174,37 @@ def _e8m0_dtype():
     return getattr(torch_npu, "float8_e8m0fnu", None)
 
 
-def _random_weight(args, q, device: torch.device):
-    """A same-shaped random fp8 weight, so the op can be re-run without a w dump.
+def _random_weight(args, q, device: torch.device, scheme: str):
+    """A same-shaped random weight, so the op can be re-run without a w dump.
 
     Order sensitivity is a property of the *call shape* (tiling / accumulation), not
     of the weight values, so a random weight of the right shape answers "does this
     op care about the row order".  The layout still has to be the one the kernel
-    expects -- post-loading the layer keeps ``weight`` transposed to ``[K, N]`` and
-    NZ-cast, and the scale packed as ``[K/group/2, N, 2]`` -- so the same cast is
-    applied here (``npu_format_cast``, what ``maybe_trans_nz`` wraps).
+    expects -- post-loading, ``weight`` is ``[K, N]`` (row-parallel keeps the full
+    output dim N, so ``--n`` is the layer's full output size, **not** ``N/tp``) and
+    is NZ-cast for fp8 -- so the same transforms are applied here.
 
     ``device`` comes from ``--device``; ``q`` only supplies the K dimension (it was
     loaded on the CPU, so its device would make the cast fail).
     """
     import torch_npu
 
+    if not args.n:
+        raise ValueError(
+            "--random-weight 需要显式 --n（该层的输出维）。行并行 down_proj 的 N 是 "
+            "hidden_size（GLM-5.2 = 6144），不是 hidden/tp —— 旧默认 768 是错的形状"
+        )
     k = int(q.shape[1])
+    if scheme == "int8":
+        # W8A8_DYNAMIC: int8 weight + per-channel fp32 scale, no NZ/MX packing.
+        weight = torch.randint(-127, 127, (k, args.n), dtype=torch.int8, device=device)
+        scale = torch.ones(args.n, dtype=torch.float32, device=device)
+        print(
+            f"[repro] 随机权重（int8, device={device}）: weight={tuple(weight.shape)} "
+            f"{weight.dtype} | scale={tuple(scale.shape)} {scale.dtype}"
+        )
+        return weight, scale
+
     group = max(1, args.group_size)
     if k % group or (k // group) % 2:
         raise ValueError(f"K={k} 不能被 group={group} 整除两次，MX scale 无法打包")
@@ -327,10 +360,11 @@ def _reproduce_rank(args, device: torch.device, rank: int, quiet: bool = False) 
     print(f"[repro] rank {rank}: scheme={scheme}（按 dump 的 q dtype 判定；可用 --scheme 覆盖）")
 
     # Per rank: that rank's own weight shard when its ``w`` dump exists (rank 0
-    # only, by design), otherwise the same-shaped random weight.
-    wpath, wpayload = _latest(args.dir, "w", args.layer, 1, rank)
+    # only, by design), otherwise a same-shaped random weight.
+    need_op = "dn_q" if args.kind == "dnq" else "gu_q"
+    wpath, wpayload = _latest(args.dir, "w", args.layer, 1, rank, op=need_op)
     if wpayload is None:
-        wpath, wpayload = _latest(args.dir, "w", args.layer, 0, rank)
+        wpath, wpayload = _latest(args.dir, "w", args.layer, 0, rank, op=need_op)
     weight_scale = None
     source = "w"
     if wpayload is not None:
@@ -356,24 +390,13 @@ def _reproduce_rank(args, device: torch.device, rank: int, quiet: bool = False) 
                 f"[repro] weight(rank {rank}): {weight_format} → NZ 已重放"
                 f"（customize_dtype={weight.dtype}）"
             )
-    elif args.random_weight and scheme != "mxfp8":
-        # ``_random_weight`` builds an fp8+e8m0 weight, which only matches the MXFP8
-        # scheme; for int8 the weight dtype/shape would have to be derived from the
-        # layer's own tensor.  Refuse instead of feeding the kernel a wrong layout.
-        print(
-            f"[repro] rank {rank}: --random-weight 目前只实现 mxfp8（fp8+e8m0）方案，"
-            f"本层是 {scheme}；请用真实 w dump（带 `qin:<层>` 的轮次会写 rank 0 的 "
-            "w_cpbal*_layer0_rank0_*.pt）",
-            file=sys.stderr,
-        )
-        return 2, {"rank": rank, "status": "random-weight-unsupported", "scheme": scheme}
     elif args.random_weight:
-        # No w dump (it is only written for rank 0): a same-shaped random weight
-        # still answers "does this op care about the row order", and it needs no
-        # extra round.
+        # No w dump for this (layer, op) -- e.g. an older round, or a rank other than
+        # 0: a same-shaped random weight still answers "does this op care about the
+        # row order", and it needs no extra round.
         source = "random"
         try:
-            weight, weight_scale = _random_weight(args, sides[1]["q"], device)
+            weight, weight_scale = _random_weight(args, sides[1]["q"], device, scheme)
         except Exception as exc:  # noqa: BLE001
             print(f"[repro] rank {rank}: 随机权重构造失败: {type(exc).__name__}: {exc}", file=sys.stderr)
             return 2, {"rank": rank, "status": "weight-failed"}
@@ -466,8 +489,10 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument(
         "--n",
         type=int,
-        default=768,
-        help="output dim of the GEMM for --random-weight (down_proj: hidden_size / TP)",
+        default=0,
+        help="output dim of the GEMM for --random-weight (row-parallel down_proj: "
+        "hidden_size, NOT hidden/tp -- the old 768 default was wrong). Required with "
+        "--random-weight; rows/K come from the dump.",
     )
     parser.add_argument(
         "--no-nz",

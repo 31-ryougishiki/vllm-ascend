@@ -3957,7 +3957,11 @@ class NPUModelRunner(GPUModelRunner):
             return apply
 
         installed = []
-        weights_done: set[int] = set()
+        # Keyed by (layer, op): the tap traces both ``gu_q`` and ``dn_q`` of a layer,
+        # and keying by layer alone let the first op (gate_up_proj) consume the slot
+        # -- the offline reproducer then loaded *that* weight for a down_proj dump
+        # and died with "K dimension of x1 and x2 must be equal" (2026-09-12, A3).
+        weights_done: set[tuple[int, str]] = set()
         weight_copy_warned: set[str] = set()
 
         def _weight_to_cpu(tensor: "torch.Tensor", what: str) -> tuple["torch.Tensor | None", str]:
@@ -4008,7 +4012,7 @@ class NPUModelRunner(GPUModelRunner):
                     return None, "unavailable"
 
         def _dump_weights(layer, layer_idx: int, op: str, name: str) -> None:
-            """Save the GEMM's own weight/scale once per layer (rank 0 only).
+            """Save the GEMM's own weight/scale, once per (layer, op), rank 0 only.
 
             The offline row-order reproducer needs the exact tensors the kernel
             consumed; reconstructing them from the checkpoint is not equivalent
@@ -4017,10 +4021,14 @@ class NPUModelRunner(GPUModelRunner):
             per-token comparison needs -- and keeping it to one rank keeps the
             round's dump size unchanged.
 
+            ``op`` is part of the key on purpose: a layer's ``gate_up_proj`` and
+            ``down_proj`` have different (K, N), so a single slot per layer makes
+            the reproducer load the wrong one and die inside the kernel.
+
             Fail-safe by construction: a weight that cannot leave the device is a
             missing sample (warned once), never a dead inference.
             """
-            if layer_idx in weights_done or getattr(_EXTRA_CTX, "in_profile_run", False):
+            if (layer_idx, op) in weights_done or getattr(_EXTRA_CTX, "in_profile_run", False):
                 return
             try:
                 from vllm.distributed import get_tp_group
@@ -4034,17 +4042,17 @@ class NPUModelRunner(GPUModelRunner):
             if not torch.is_tensor(weight):
                 return
             weight_cpu, weight_format = _weight_to_cpu(
-                weight, f"w layer={layer_idx} weight"
+                weight, f"w layer={layer_idx} op={op} weight"
             )
             if weight_cpu is None:
                 # Better no file than one without its weight: the reproducer cannot
                 # reproduce anything from a payload whose weight is missing.
-                weights_done.add(layer_idx)
+                weights_done.add((layer_idx, op))
                 return
             scale_cpu = None
             if torch.is_tensor(scale):
-                scale_cpu, _ = _weight_to_cpu(scale, f"w layer={layer_idx} weight_scale")
-            weights_done.add(layer_idx)
+                scale_cpu, _ = _weight_to_cpu(scale, f"w layer={layer_idx} op={op} weight_scale")
+            weights_done.add((layer_idx, op))
             _zigzag_dump(
                 {
                     "kind": "w",
@@ -4054,6 +4062,10 @@ class NPUModelRunner(GPUModelRunner):
                     "weight": weight_cpu,
                     "weight_scale": scale_cpu,
                     "weight_dtype": str(weight.dtype),
+                    # The reproducer's own sanity check: K must equal the traced
+                    # activation's K, and N is the row-parallel output dim the
+                    # ``--random-weight`` fallback has to be told (``--n``).
+                    "weight_shape": tuple(int(dim) for dim in weight.shape),
                     # "as-is" (the kernel's own layout, NZ included) or "ND" (the copy
                     # had to undo the internal format; the reproducer re-applies it).
                     "weight_format": weight_format,

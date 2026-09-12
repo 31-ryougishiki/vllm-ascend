@@ -81,7 +81,17 @@ dump: 16 个 rank 齐全（act/mlp 各 64、guq/dnq/topk 各 32、kv 64）且 **
 → `npu_quant_matmul(q, w, w_scale, pertoken_scale=s, output_dtype=bf16)`，见
 `w8a8_dynamic.py:114-121`）；A5 是 `q=(2048,1536) fp8` + `s=(2048,24,2) uint8`（MXFP8，需
 `scale_dtype`/`group_sizes=[1,1,32]`）。`repro_row_order.py --run-op` 现在按 dump 的 `q` dtype
-自动选形状（`--scheme auto|mxfp8|int8`），`--random-weight` 仍只支持 mxfp8。
+自动选形状（`--scheme auto|mxfp8|int8`），`--random-weight` 两种方案都支持（int8 需要 `--n`）。
+
+**⚠️ 2026-09-12 两处工具缺陷（都已修，见 §9）**：
+① `w` dump 原来按"每层一次"去重 ⇒ 层 0 的 `gate_up_proj` 先跑，占掉了名额，复现器拿到的是**兄弟 op 的权重**
+（`[K=6144, N=1536]`），喂给 `dn_q` 的调用就报 `K dimension of x1 and x2 must be equal (768 vs 6144)`。
+现在按 `(layer, op)` 各写一份，复现器按 op 选（选错会打印"只有 op=[…] 的 dump"而不是让内核报错）。
+② **`--n` 的语义原来写错了**：行并行 down_proj 的权重是 `[K=I/tp, N=hidden]`（N 不切分），
+`--n` 必须是 **hidden_size（GLM-5.2 = 6144）**，不是 `hidden/tp`；旧默认 768 让 A5 的那次
+"GEMM 与行序无关"跑在了**非模型真实形状**上（N=768），结论需在 N=6144 下复核（免费，一次 `--run-op`）。
+A3 侧可由已有 `w` dump 直接读出真形状：`gate_up [6144, 1536] = [hidden, 2I/tp]` ⇒ hidden=6144、
+I=12288、`dn_q` 的 K=I/tp=768 ⇒ down_proj 权重应为 `[768, 6144]`。
 `differing=0/2048 max|d|=0.000e+00`；rank 0 在此前两轮同命令下同样 0。⚠️ 那轮 dump 目录里
 **没有 rank 0 的 `dnq`**，所以工具报的是 `7/7 … 覆盖不完整（缺 rank [0]）`（工具现在会显式告警，
 判词不再写成 N/N）。综合 ⇒ **GEMM 侧在全部 8 个 rank 上都排除**（rank≠0 用同形状随机权重），
@@ -282,7 +292,7 @@ python tools/cp_balance_compare/check_zigzag_dumps.py --dir "$DIR" \
 
 | 目的 | 命令 | 判据 |
 | --- | --- | --- |
-| CPU 自测（改完代码必跑） | `python tools/cp_balance_compare/selftest_mock.py` | 每项 `[run]`/`[ok] …(Ns)`，末行 `SELFTEST OK`（58 项）；卡住时最后一行 `[run]` 就是卡住的用例，90s 后自动超时并打栈；慢 bash 站点自动 `[skip]` 4 个 launcher 用例（`--only/--skip` 可覆盖） |
+| CPU 自测（改完代码必跑） | `python tools/cp_balance_compare/selftest_mock.py` | 每项 `[run]`/`[ok] …(Ns)`，末行 `SELFTEST OK`（59 项）；卡住时最后一行 `[run]` 就是卡住的用例，90s 后自动超时并打栈；慢 bash 站点自动 `[skip]` 4 个 launcher 用例（`--only/--skip` 可覆盖） |
 | 版本指纹（无 git） | `python tools/cp_balance_compare/selfcheck.py --fingerprint` | 末行 `[fp] <16 位>` + 文件摘要 + marker OK/MISSING |
 | 环境体检 | `python tools/cp_balance_compare/selfcheck.py` | `[verdict] READY`、无 FAIL |
 | 配置门（不加载模型） | `ab_cp_compare.py --preflight --launcher "bash tools/cp_balance_compare/launcher_glm52_w4a4c8_mxfp4.sh {port}" --cp-size <TP>` | 末行 `[preflight] all configs OK`；查 `[cp-ab]` 指纹 + additional_config + vllm/model/repo/vendor 路径。⚠️ 漏 `--launcher` 会用 `launcher_template.sh` 的占位路径 |
@@ -292,7 +302,7 @@ python tools/cp_balance_compare/check_zigzag_dumps.py --dir "$DIR" \
 | **归约确定性轮** | `export HCCL_DET=strict; unset DUMP_DIR; bash tools/cp_balance_compare/run_cp_diag.sh probe` | 轮次目录 `r_probe_det`；日志有 `[cp-ab-hccl] … HCCL_DETERMINISTIC=strict LCCL_DETERMINISTIC=1`；与 `r_probe` 并排看是否回噪（README §七） |
 | 判读激活剖面 | `check_zigzag_dumps.py --dir <dir> --kind act --summary-only --block-size 128` | `FIRST DIVERGENCE (act): layer L op=…` + layer 0 八行 + 判词 |
 | 判读索引表 / 全层 KV | `… --kind topk --summary-only` / `export DUMP_DIR=/root/cp_dump; run_cp_diag.sh sweep` → `… --kind kv --summary-only` | `[topk/cross] RESULT: …` / `FIRST DIVERGENCE (fp/value\|fp/bytes): layer L` |
-| **行序复现** | `repro_row_order.py --dir <dir> --layer 0 [--run-op [--random-weight] [--no-nz]] [--all-ranks [--tp-size N]]` | 数据模式：token→行号置换；`--run-op`：`differing>0` ⇒ 行序相关，最小复现成立；`--all-ranks` 出逐 rank 汇总（缺 rank 会告警，判词写"覆盖不完整"）；权重来源打在 `w=w\|random`（`w->ND` = 该 dump 走了 ND 兜底、已在复现器里重放 NZ） |
+| **行序复现** | `repro_row_order.py --dir <dir> --layer 0 [--run-op [--random-weight --n <hidden_size>] [--no-nz]] [--all-ranks [--tp-size N]]` | 数据模式：token→行号置换；`--run-op`：`differing>0` ⇒ 行序相关，最小复现成立；`--all-ranks` 出逐 rank 汇总（缺 rank 会告警，判词写"覆盖不完整"）；权重来源打在 `w=w\|random`（`w->ND` = 该 dump 走了 ND 兜底、已在复现器里重放 NZ）；⚠️ `--random-weight` 的 `--n` 是**该层输出维**（down_proj = hidden_size = 6144，不是 hidden/tp），不传会直接报错 |
 
 | 单配置手工调试 | `run_single.py [--config C]` | `[http] <- 200` + `[result]` |
 | 收整轮证据 | `selfcheck.py --collect --out-root /dev/shm/cp_ab_sweep` | 一个文件含 HEAD/摘要/dump 清单/指标/日志关键行 |
