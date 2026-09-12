@@ -1737,6 +1737,93 @@ def test_site_profiles_switch_the_node_in_one_variable() -> None:
         shutil.rmtree(out, ignore_errors=True)
 
 
+def test_repro_row_order_dispatches_the_int8_scheme() -> None:
+    """An int8 dump (A3 / W8A8_DYNAMIC) must get the plain ``npu_quant_matmul`` call.
+
+    The A5 site's layer 0 is fp8+e8m0 (``group_sizes``/``scale_dtype``); the A3
+    site's is int8 with a per-token fp32 scale.  Calling the A5 shape on an int8
+    dump fails inside the kernel and reads like a model finding, so the dump's
+    ``q`` dtype selects the shape (``--scheme`` can override).
+    """
+    import importlib.util
+    import types
+
+    import torch
+
+    path = HERE / "repro_row_order.py"
+    spec = importlib.util.spec_from_file_location("cp_ab_repro_row_order_i8", path)
+    assert spec is not None and spec.loader is not None
+    module = importlib.util.module_from_spec(spec)
+    sys.modules["cp_ab_repro_row_order_i8"] = module
+    spec.loader.exec_module(module)
+
+    seen: list[dict] = []
+    stub = types.ModuleType("torch_npu")
+
+    def _quant_matmul(q, weight, weight_scale, **kwargs):  # noqa: ANN001 - mimics the vendor op
+        seen.append(
+            {
+                "q": (q.dtype, q.device.type),
+                "w": (weight.dtype, weight.device.type),
+                "pt": kwargs.get("pertoken_scale").dtype,
+                "mx": ("scale_dtype" in kwargs, "group_sizes" in kwargs),
+                "out": kwargs.get("output_dtype"),
+            }
+        )
+        return torch.ones(q.shape[0], weight.shape[1], dtype=torch.bfloat16)
+
+    stub.npu_quant_matmul = _quant_matmul
+    stub.npu_format_cast = lambda tensor, fmt, **kwargs: tensor
+    stub.float8_e8m0fnu = None
+
+    out = _temp_dir("cp_ab_repro_i8_")
+    previous = sys.modules.get("torch_npu")
+    sys.modules["torch_npu"] = stub
+    try:
+        for cpbal in (0, 1):
+            torch.save(
+                {
+                    "kind": "qin", "op": "dn_q", "fused": False, "rows": 4,
+                    "positions_from": "gather_natural" if cpbal == 0 else "gather_zigzag",
+                    "positions": torch.arange(4, dtype=torch.int64),
+                    "q": torch.zeros(4, 64, dtype=torch.int8),
+                    "s": torch.ones(4, dtype=torch.float32),
+                    "in_dtype": "torch.bfloat16",
+                },
+                out / f"dnq_cpbal{cpbal}_layer0_rank0_pid1_{1000 + cpbal}.pt",
+            )
+        torch.save(
+            {
+                "kind": "w", "op": "dn_q", "layer_idx": 0,
+                "weight": torch.zeros(64, 8, dtype=torch.int8),
+                "weight_scale": torch.ones(8, dtype=torch.float32),
+                "weight_dtype": "torch.int8",
+                "weight_format": "as-is",
+            },
+            out / "w_cpbal1_layer0_rank0_pid1_1500.pt",
+        )
+        buffer = io.StringIO()
+        with redirect_stdout(buffer):
+            rc = module.main(
+                ["--dir", str(out), "--layer", "0", "--run-op", "--device", "meta"]
+            )
+        text = buffer.getvalue()
+        assert rc == 0, text
+        assert "scheme=int8" in text, text
+        assert seen, text
+        for call in seen:
+            assert call["q"] == (torch.int8, "meta"), call
+            assert call["pt"] is torch.float32, call
+            assert call["mx"] == (False, False), call  # no MXFP8-only args
+            assert call["out"] is torch.bfloat16, call
+    finally:
+        if previous is None:
+            sys.modules.pop("torch_npu", None)
+        else:
+            sys.modules["torch_npu"] = previous
+        shutil.rmtree(out, ignore_errors=True)
+
+
 def test_selfcheck_fingerprint_markers_match_the_code() -> None:
     """Every behaviour marker in ``selfcheck.fingerprint_lines`` must be present here.
 

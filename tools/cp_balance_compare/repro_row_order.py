@@ -189,27 +189,66 @@ def _random_weight(args, q, device: torch.device):
     return weight, scale
 
 
-def _run_op(args, q, scale, weight, weight_scale, device: torch.device):
+def _scheme_of(args, payload) -> str:
+    """Which quantized-GEMM call shape this dump came from.
+
+    Two shapes exist in this repo and they are **not** interchangeable:
+
+    * ``mxfp8`` (A5, W8A8_MXFP8 -- what layer 0 used on the share site): fp8
+      activation + e8m0 MX scale (3-D uint8), needs ``scale_dtype`` /
+      ``pertoken_scale_dtype`` and ``group_sizes=[1,1,group]``.
+    * ``int8`` (A3, W8A8_DYNAMIC -- layer 0 on the its site): int8 activation +
+      per-token fp32 scale (1-D float32), plain ``pertoken_scale`` and no MX args
+      (``vllm_ascend/quantization/methods/w8a8_dynamic.py:114-121``).
+
+    The dump itself says which one it is; guessing here would waste a round with
+    an op error that looks like a model problem.
+    """
+    if args.scheme != "auto":
+        return args.scheme
+    q = payload.get("q")
+    if torch.is_tensor(q) and q.dtype == torch.float8_e4m3fn:
+        return "mxfp8"
+    if torch.is_tensor(q) and q.dtype == torch.int8:
+        return "int8"
+    return "unknown"
+
+
+def _run_op(args, q, scale, weight, weight_scale, device: torch.device, scheme: str):
     """Run the layer's own quantized GEMM once, on ``device``, with these inputs.
 
     Every input is moved to ``device`` first: the payload was loaded on the CPU
-    (``map_location="cpu"``), and ``npu_quant_matmul`` refuses CPU arguments.  The
-    result comes back to the CPU so the comparison below cannot depend on a device
-    sync.
+    (``map_location="cpu"``), and the NPU ops refuse CPU arguments.  The result
+    comes back to the CPU so the comparison below cannot depend on a device sync.
     """
     import torch_npu
 
-    output = torch_npu.npu_quant_matmul(
-        _to_device(q, device),
-        _to_device(weight, device),
-        _to_device(weight_scale, device),
-        scale_dtype=_e8m0_dtype(),
-        pertoken_scale=_to_device(scale, device),
-        pertoken_scale_dtype=_e8m0_dtype(),
-        bias=None,
-        output_dtype=torch.bfloat16,
-        group_sizes=[1, 1, args.group_size],
-    )
+    q = _to_device(q, device)
+    scale = _to_device(scale, device)
+    weight = _to_device(weight, device)
+    weight_scale = _to_device(weight_scale, device)
+
+    if scheme == "int8":
+        output = torch_npu.npu_quant_matmul(
+            q,
+            weight,
+            weight_scale,
+            pertoken_scale=scale,
+            bias=None,
+            output_dtype=torch.bfloat16,
+        )
+    else:
+        output = torch_npu.npu_quant_matmul(
+            q,
+            weight,
+            weight_scale,
+            scale_dtype=_e8m0_dtype(),
+            pertoken_scale=scale,
+            pertoken_scale_dtype=_e8m0_dtype(),
+            bias=None,
+            output_dtype=torch.bfloat16,
+            group_sizes=[1, 1, args.group_size],
+        )
     return output.to("cpu") if torch.is_tensor(output) else output
 
 
@@ -273,6 +312,20 @@ def _reproduce_rank(args, device: torch.device, rank: int, quiet: bool = False) 
             )
         return 0, summary
 
+    scheme = _scheme_of(args, sides[1])
+    summary["scheme"] = scheme
+    if scheme == "unknown":
+        q, s = sides[1].get("q"), sides[1].get("s")
+        print(
+            f"[repro] rank {rank}: 认不出量化方案 —— q={getattr(q, 'dtype', None)} "
+            f"{tuple(q.shape) if torch.is_tensor(q) else None} / "
+            f"s={getattr(s, 'dtype', None)} {tuple(s.shape) if torch.is_tensor(s) else None}；"
+            "用 --scheme mxfp8|int8 显式指定，或把这一行贴回来补支持",
+            file=sys.stderr,
+        )
+        return 2, {"rank": rank, "status": "unknown-scheme", "scheme": scheme}
+    print(f"[repro] rank {rank}: scheme={scheme}（按 dump 的 q dtype 判定；可用 --scheme 覆盖）")
+
     # Per rank: that rank's own weight shard when its ``w`` dump exists (rank 0
     # only, by design), otherwise the same-shaped random weight.
     wpath, wpayload = _latest(args.dir, "w", args.layer, 1, rank)
@@ -303,6 +356,17 @@ def _reproduce_rank(args, device: torch.device, rank: int, quiet: bool = False) 
                 f"[repro] weight(rank {rank}): {weight_format} → NZ 已重放"
                 f"（customize_dtype={weight.dtype}）"
             )
+    elif args.random_weight and scheme != "mxfp8":
+        # ``_random_weight`` builds an fp8+e8m0 weight, which only matches the MXFP8
+        # scheme; for int8 the weight dtype/shape would have to be derived from the
+        # layer's own tensor.  Refuse instead of feeding the kernel a wrong layout.
+        print(
+            f"[repro] rank {rank}: --random-weight 目前只实现 mxfp8（fp8+e8m0）方案，"
+            f"本层是 {scheme}；请用真实 w dump（带 `qin:<层>` 的轮次会写 rank 0 的 "
+            "w_cpbal*_layer0_rank0_*.pt）",
+            file=sys.stderr,
+        )
+        return 2, {"rank": rank, "status": "random-weight-unsupported", "scheme": scheme}
     elif args.random_weight:
         # No w dump (it is only written for rank 0): a same-shaped random weight
         # still answers "does this op care about the row order", and it needs no
@@ -326,8 +390,8 @@ def _reproduce_rank(args, device: torch.device, rank: int, quiet: bool = False) 
         summary["weight_format"] = weight_format
 
     try:
-        out_b = _run_op(args, sides[0]["q"], sides[0]["s"], weight, weight_scale, device)
-        out_c = _run_op(args, sides[1]["q"], sides[1]["s"], weight, weight_scale, device)
+        out_b = _run_op(args, sides[0]["q"], sides[0]["s"], weight, weight_scale, device, scheme)
+        out_c = _run_op(args, sides[1]["q"], sides[1]["s"], weight, weight_scale, device, scheme)
     except Exception as exc:  # noqa: BLE001 - report, never mask an unsupported call
         print(f"[repro] rank {rank}: 重跑 GEMM 失败: {type(exc).__name__}: {exc}", file=sys.stderr)
         print(
@@ -425,6 +489,13 @@ def main(argv: list[str] | None = None) -> int:
         action="store_true",
         help="run the comparison for every TP rank that has dumps in --dir and print a summary "
         "table (the activation dumps are per rank; only rank 0 also has a w dump)",
+    )
+    parser.add_argument(
+        "--scheme",
+        default="auto",
+        choices=("auto", "mxfp8", "int8"),
+        help="quantized-GEMM call shape: auto (from the dump's q dtype), mxfp8 "
+        "(fp8+e8m0, A5 W8A8_MXFP8) or int8 (int8 + per-token fp32 scale, W8A8_DYNAMIC)",
     )
     parser.add_argument(
         "--tp-size",

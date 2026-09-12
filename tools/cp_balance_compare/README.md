@@ -43,9 +43,9 @@
 | `run_cp_diag.sh` | 一轮 A/B 的标准入口（模式见 §四） | 是（`check` 除外） |
 | `run_single.py` | 单配置手工调试：起一个 server + 用与 A/B 相同的请求体发一次推理，落盘 payload/response 供 curl 复现 | 是 |
 | `check_zigzag_dumps.py` | CPU 侧判读 dump（`kv` / `topk` / `act`，见 §五） | 否 |
-| `repro_row_order.py` | 离线复现"同一 token 的行换个位置结果就变"：读一轮的 `dnq`/`guq` dump（+ 同层 `w` 权重 dump）重跑 `npu_quant_matmul`，比较两种行序下同一 token 的输出。`--all-ranks` 扫全部有 dump 的 TP rank（`w` 只有 rank 0，其余 rank 自动用同形状随机权重并打印 `w=random`），`--tp-size N` 做覆盖检查——**缺 rank 会显式告警，判词不会写成 N/N**；`--device`（默认 `npu:0`）决定算子跑在哪张卡 | 否（`--run-op` 需要 NPU） |
+| `repro_row_order.py` | 离线复现"同一 token 的行换个位置结果就变"：读一轮的 `dnq`/`guq` dump（+ 同层 `w` 权重 dump）重跑量化 GEMM，比较两种行序下同一 token 的输出。**按 dump 的 `q` dtype 自动选调用形状**（`--scheme auto\|mxfp8\|int8`）：`int8`（A3 / W8A8_DYNAMIC：int8 激活 + 每 token fp32 scale）或 `mxfp8`（A5：fp8 + e8m0 MX scale）。`--all-ranks` 扫全部有 dump 的 TP rank（`w` 只有 rank 0，其余 rank 需要 `--random-weight`，而它只支持 mxfp8），`--tp-size N` 做覆盖检查——**缺 rank 会显式告警，判词不会写成 N/N**；`--device`（默认 `npu:0`）决定算子跑在哪张卡 | 否（`--run-op` 需要 NPU） |
 | `compare_cp_rounds.py` | 把多轮 `summary.json` 并排，回答"改了某个变量后 `C−B` 是否回到噪声级" | 否 |
-| `mock_vllm_server.py` / `selftest_mock.py` | 假 server + CPU 自测（57 项：协议解析、指纹/payload、dump 判读、复现器设备/全 rank/NZ 重放、HCCL 确定性接线、站点档案切换、w dump 的 NZ 兜底、launcher 静态检查、端到端）。逐项打印 `[run]`/`[ok] … (耗时)`，单项 90s 超时（Linux 下 SIGALRM + faulthandler 打印卡住的栈），失败不中止整轮；支持 `--list`、`--only <子串>`、`--skip launcher,preflight`、`--test-timeout N`。**每次 `bash` 启动 >2s 的机器**（重 `BASH_ENV`/慢挂载）会自动跳过 4 个起 launcher 的用例并说明原因（要强制跑用 `--only`） | 否 |
+| `mock_vllm_server.py` / `selftest_mock.py` | 假 server + CPU 自测（58 项：协议解析、指纹/payload、dump 判读、复现器设备/全 rank/NZ 重放/方案分派、HCCL 确定性接线、站点档案切换、w dump 的 NZ 兜底、launcher 静态检查、端到端）。逐项打印 `[run]`/`[ok] … (耗时)`，单项 90s 超时（Linux 下 SIGALRM + faulthandler 打印卡住的栈），失败不中止整轮；支持 `--list`、`--only <子串>`、`--skip launcher,preflight`、`--test-timeout N`。**每次 `bash` 启动 >2s 的机器**（重 `BASH_ENV`/慢挂载）会自动跳过 4 个起 launcher 的用例并说明原因（要强制跑用 `--only`） | 否 |
 | `selfcheck.py` | 环境体检（解释器/依赖/import 来源/NPU/端口/磁盘/残留进程）+ **不依赖 git 的版本指纹**（`--fingerprint`：关键文件 sha256 + 修复标记 + 用例数，末行 `[fp] …` 贴回来即可对齐版本）+ 跑一遍自测 + `--collect` 收整轮证据。**不做**配置门与命令预演——那两件事由 `ab_cp_compare.py --preflight` 与 `run_cp_diag.sh <mode> --dry-run` 负责（每轮都会跑，不会腐化） | 否 |
 | `prepare_env.sh` | 一次性 `source` 站点 rc + vendor 环境并 `export CP_AB_SKIP_SOURCE=1`，省掉每轮两次 source；**必须 source** | 否 |
 

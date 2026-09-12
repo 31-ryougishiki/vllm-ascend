@@ -75,6 +75,13 @@ dump: 16 个 rank 齐全（act/mlp 各 64、guq/dnq/topk 各 32、kv 64）且 **
 `mlp_out`，量级同阶（A3 p99≈0.39 nats vs A5≈0.56~0.58）。共性嫌疑仍落在
 **down_proj 的行并行 GEMM + 紧随的跨 rank 归约**（A3 上现在可以用真实 `w` dump 跑行序复现，
 不必再依赖 `--random-weight`）。
+
+**A3 的量化方案与 A5 不同（复现器已按方案分派）**：A3 层 0 的 `dn_q` 是
+`q=(2048,768) int8` + `s=(2048,) float32`（W8A8_DYNAMIC：int8 激活 + **每 token 一个 fp32 scale**
+→ `npu_quant_matmul(q, w, w_scale, pertoken_scale=s, output_dtype=bf16)`，见
+`w8a8_dynamic.py:114-121`）；A5 是 `q=(2048,1536) fp8` + `s=(2048,24,2) uint8`（MXFP8，需
+`scale_dtype`/`group_sizes=[1,1,32]`）。`repro_row_order.py --run-op` 现在按 dump 的 `q` dtype
+自动选形状（`--scheme auto|mxfp8|int8`），`--random-weight` 仍只支持 mxfp8。
 `differing=0/2048 max|d|=0.000e+00`；rank 0 在此前两轮同命令下同样 0。⚠️ 那轮 dump 目录里
 **没有 rank 0 的 `dnq`**，所以工具报的是 `7/7 … 覆盖不完整（缺 rank [0]）`（工具现在会显式告警，
 判词不再写成 N/N）。综合 ⇒ **GEMM 侧在全部 8 个 rank 上都排除**（rank≠0 用同形状随机权重），
@@ -275,7 +282,7 @@ python tools/cp_balance_compare/check_zigzag_dumps.py --dir "$DIR" \
 
 | 目的 | 命令 | 判据 |
 | --- | --- | --- |
-| CPU 自测（改完代码必跑） | `python tools/cp_balance_compare/selftest_mock.py` | 每项 `[run]`/`[ok] …(Ns)`，末行 `SELFTEST OK`（57 项）；卡住时最后一行 `[run]` 就是卡住的用例，90s 后自动超时并打栈；慢 bash 站点自动 `[skip]` 4 个 launcher 用例（`--only/--skip` 可覆盖） |
+| CPU 自测（改完代码必跑） | `python tools/cp_balance_compare/selftest_mock.py` | 每项 `[run]`/`[ok] …(Ns)`，末行 `SELFTEST OK`（58 项）；卡住时最后一行 `[run]` 就是卡住的用例，90s 后自动超时并打栈；慢 bash 站点自动 `[skip]` 4 个 launcher 用例（`--only/--skip` 可覆盖） |
 | 版本指纹（无 git） | `python tools/cp_balance_compare/selfcheck.py --fingerprint` | 末行 `[fp] <16 位>` + 文件摘要 + marker OK/MISSING |
 | 环境体检 | `python tools/cp_balance_compare/selfcheck.py` | `[verdict] READY`、无 FAIL |
 | 配置门（不加载模型） | `ab_cp_compare.py --preflight --launcher "bash tools/cp_balance_compare/launcher_glm52_w4a4c8_mxfp4.sh {port}" --cp-size <TP>` | 末行 `[preflight] all configs OK`；查 `[cp-ab]` 指纹 + additional_config + vllm/model/repo/vendor 路径。⚠️ 漏 `--launcher` 会用 `launcher_template.sh` 的占位路径 |
