@@ -1463,6 +1463,81 @@ def test_repro_row_order_run_op_uses_the_requested_device() -> None:
         shutil.rmtree(out, ignore_errors=True)
 
 
+def test_repro_row_order_all_ranks_covers_every_dumped_rank() -> None:
+    """``--all-ranks`` must sweep the ranks that actually have dumps.
+
+    The activation dumps are per rank (only ``w`` is rank 0), and the reduction
+    after the GEMM is a multi-rank op -- so "the GEMM is row-order independent on
+    rank 0" is not by itself a statement about the model.  This pins the sweep:
+    both ranks are discovered, each gets its own row permutation, and the summary
+    says which weight source each rank used.
+    """
+    import importlib.util
+    import types
+
+    import torch
+
+    path = HERE / "repro_row_order.py"
+    spec = importlib.util.spec_from_file_location("cp_ab_repro_row_order_all", path)
+    assert spec is not None and spec.loader is not None
+    module = importlib.util.module_from_spec(spec)
+    sys.modules["cp_ab_repro_row_order_all"] = module
+    spec.loader.exec_module(module)
+
+    stub = types.ModuleType("torch_npu")
+    stub.npu_format_cast = lambda tensor, fmt, **kwargs: tensor
+    stub.npu_quant_matmul = (
+        lambda q, weight, weight_scale, **kwargs: torch.ones(
+            q.shape[0], weight.shape[1], dtype=torch.bfloat16
+        )
+    )
+    stub.float8_e8m0fnu = None
+
+    out = _temp_dir("cp_ab_repro_all_")
+    previous = sys.modules.get("torch_npu")
+    sys.modules["torch_npu"] = stub
+    try:
+        # Two ranks, each with its own (different) layout permutation.
+        for rank, order_c in ((0, [0, 2, 1, 3]), (1, [1, 0, 3, 2])):
+            for cpbal, order in ((0, [0, 1, 2, 3]), (1, order_c)):
+                torch.save(
+                    {
+                        "kind": "qin",
+                        "op": "dn_q",
+                        "fused": False,
+                        "rows": 4,
+                        "positions_from": "gather_natural" if cpbal == 0 else "gather_zigzag",
+                        "positions": torch.tensor(order, dtype=torch.int64),
+                        "q": torch.zeros(4, 64, dtype=torch.uint8).view(torch.float8_e4m3fn),
+                        "s": torch.full((4, 1, 2), 127, dtype=torch.uint8),
+                        "in_dtype": "torch.bfloat16",
+                    },
+                    out / f"dnq_cpbal{cpbal}_layer0_rank{rank}_pid1_{2000 + cpbal * 10 + rank}.pt",
+                )
+        buffer = io.StringIO()
+        with redirect_stdout(buffer):
+            rc = module.main(
+                [
+                    "--dir", str(out), "--layer", "0", "--run-op", "--random-weight",
+                    "--n", "8", "--device", "meta", "--all-ranks",
+                ]
+            )
+        text = buffer.getvalue()
+        assert rc == 0, text
+        # Each rank gets its own permutation: rank 0 moves 2 of 4 rows, rank 1 all 4.
+        assert "行号发生变化=2" in text, text
+        assert "行号发生变化=4" in text, text
+        assert "rank  0:" in text and "rank  1:" in text, text
+        assert "w=random" in text, text
+        assert "2/2 rank 在该调用形状下与行序无关" in text, text
+    finally:
+        if previous is None:
+            sys.modules.pop("torch_npu", None)
+        else:
+            sys.modules["torch_npu"] = previous
+        shutil.rmtree(out, ignore_errors=True)
+
+
 def test_selfcheck_fingerprint_markers_match_the_code() -> None:
     """Every behaviour marker in ``selfcheck.fingerprint_lines`` must be present here.
 

@@ -46,7 +46,40 @@ in ─attn─▶ out ─norm─▶ mlp_in ─[量化]─▶ gu_q ─gate_up─�
 ① `npu_quant_matmul`（down_proj）与行序相关；② 紧随其后的 `tensor_model_parallel_reduce_scatter`。
 （本站 MXFP8 **不走**融合 mm+RS：`linear_op.py` 的 mmrs 分支只认 `AscendW8A8LinearMethod`。）
 
-**下一步（不需要再加载模型）**：
+**2026-09-12 这一步已跑完（offline repro，rank 0 + 随机权重）**：
+
+```
+[repro] device: npu:0 …
+[repro] 随机权重（同形状，nz=True, device=npu:0）: weight=(1536, 768) … scale=(24, 768, 2)
+[repro] 输出比较（逐 token，同一 weight、同一 token 值，只有行序不同）: differing=0/2048 max|d|=0.000e+00
+[repro] RESULT: 该 op 在这个调用形状下与行序无关 ⇒ 差异不在 matmul，往紧随其后的 … 归约查
+```
+
+⇒ **① 基本排除**（同一调用形状下行序无关），矛头转向 ② 归约。
+`mlp_out` 是 **reduce_scatter 之后**的 rank-local 张量（`dn_q` 是 all-gather 后的 2048 行、`gu_q` 是 rank-local），
+所以"GEMM 输入逐位相同 + GEMM 行序无关"留下的唯一去处就是那次跨 rank 归约本身。
+
+**rank 覆盖现状**（`differing=0` 目前只覆盖 rank 0，别直接外推）：
+
+| 数据 | 覆盖范围 |
+| --- | --- |
+| `act`/`mlp`/`qin`/`topk`/`kv` dump | **全 rank**：每个 rank 各写一份（文件名带 `rank<R>`）；判读 `act`/`qin` 时把同一 layout 的所有 rank 按 token 位置拼回整条序列再逐 token 比，`kv` 按 `(layer, rank)` 逐对，`topk` 跨排布比较先按 layout 池化所有 rank（zigzag 下 rank 间 token 集合不相交） |
+| `w`（权重 dump） | **只有 rank 0**（`_dump_weights` 里 rank≠0 直接 return） |
+| `repro_row_order.py` | 默认**单 rank**（`--rank`，默认 0）；`--all-ranks` 扫全部有 dump 的 rank，非 0 rank 用同形状随机权重（日志打 `w=random`） |
+
+**下一步（仍然不需要加载模型）**：
+
+```bash
+DIR=$(ls -dt /root/cp_probe/*/ | head -1)
+# 全 rank 扫一遍（8 个 rank；rank 0 若有 w dump 会自动优先用真实权重）
+python tools/cp_balance_compare/repro_row_order.py --dir "$DIR" --layer 0 \
+    --run-op --random-weight --n 768 --all-ranks
+```
+
+**判据**：`RESULT(all-ranks): 8/8 rank … 与行序无关` ⇒ matmul 侧彻底排除，转 ② 归约；
+任一 rank `differing>0` ⇒ 该 rank 上最小复现成立（交算子侧）；出现 NaN/全零 ⇒ 权重布局问题（试 `--no-nz`）。
+
+单 rank 手工调试（默认 rank 0，`--rank <R>` 换 rank）：
 
 ```bash
 DIR=$(ls -dt /root/cp_probe/*/ | head -1)
@@ -65,9 +98,9 @@ python tools/cp_balance_compare/repro_row_order.py --dir "$DIR" --layer 0 \
 现在设备由 `--device`（默认 `npu:0`）决定，权重与算子输入都会先搬过去；跑起来应先看到
 `[repro] device: npu:0（dump 是 CPU 加载的…）`。
 
-**判据**：`differing > 0` ⇒ matmul 行序相关 → 最小复现交算子侧 + 在模型里找"让 GEMM 见到相同行序"的绕法；
-`differing == 0` ⇒ 归约侧 → 把 row-parallel 归约换成 `all_reduce + slice`（或查 HCCL 算法/确定性）；
-输出 NaN/全零 ⇒ 权重布局不被接受（试 `--no-nz`，或用真实 `w` dump）。
+**后续分支**：8/8 rank 都行序无关 ⇒ 归约侧 → 把 row-parallel 归约换成 `all_reduce + slice` 做 A/B
+（或查 HCCL 算法/确定性开关），再用 `probe2` 看 `C−B` 是否回噪；输出 NaN/全零 ⇒ 权重布局不被接受
+（试 `--no-nz`，或用真实 `w` dump）。
 
 ## 2. 已确认 / 已排除（可直接引用）
 
@@ -85,8 +118,8 @@ pre-MLP norm/残差/跨 rank 归约错（`mlp_in` 相同）、**激活量化与�
 `w8a8_mxfp8.py` 的 `npu_dynamic_mx_quant` + `group_sizes=[1,1,32]` 是按行、每 32 个 K 元素一个 scale）、
 prev/next 两次调用形状（验证用的 `2call` 开关已随结论删除，见 README §七）。
 
-**仍开放**：down_proj 的 GEMM 与随后归约（§1 的下一步）；MoE 层（≥3，需 `--enable-return-routed-experts`）；
-`MIN_TOKENS` 边界（与本问题无关）。
+**仍开放**：**那次跨 rank 归约**（`tensor_model_parallel_reduce_scatter`；GEMM 已在 rank 0 + 随机权重下排除，
+`--all-ranks` 扫完即可定论）；MoE 层（≥3，需 `--enable-return-routed-experts`）；`MIN_TOKENS` 边界（与本问题无关）。
 
 ## 3. 环境与关键事实
 
@@ -181,7 +214,7 @@ python tools/cp_balance_compare/check_zigzag_dumps.py --dir "$DIR" \
 
 | 目的 | 命令 | 判据 |
 | --- | --- | --- |
-| CPU 自测（改完代码必跑） | `python tools/cp_balance_compare/selftest_mock.py` | 每项 `[run]`/`[ok] …(Ns)`，末行 `SELFTEST OK`（52 项）；卡住时最后一行 `[run]` 就是卡住的用例，90s 后自动超时并打栈；慢 bash 站点自动 `[skip]` 4 个 launcher 用例（`--only/--skip` 可覆盖） |
+| CPU 自测（改完代码必跑） | `python tools/cp_balance_compare/selftest_mock.py` | 每项 `[run]`/`[ok] …(Ns)`，末行 `SELFTEST OK`（53 项）；卡住时最后一行 `[run]` 就是卡住的用例，90s 后自动超时并打栈；慢 bash 站点自动 `[skip]` 4 个 launcher 用例（`--only/--skip` 可覆盖） |
 | 版本指纹（无 git） | `python tools/cp_balance_compare/selfcheck.py --fingerprint` | 末行 `[fp] <16 位>` + 文件摘要 + marker OK/MISSING |
 | 环境体检 | `python tools/cp_balance_compare/selfcheck.py` | `[verdict] READY`、无 FAIL |
 | 配置门（不加载模型） | `ab_cp_compare.py --preflight` | 末行 `[preflight] all configs OK` |
@@ -189,7 +222,7 @@ python tools/cp_balance_compare/check_zigzag_dumps.py --dir "$DIR" \
 | 一轮 A/B + C 重复 | `… run_cp_diag.sh probe2` | 三件套 + `[noise] C2 vs C` |
 | 判读激活剖面 | `check_zigzag_dumps.py --dir <dir> --kind act --summary-only --block-size 128` | `FIRST DIVERGENCE (act): layer L op=…` + layer 0 八行 + 判词 |
 | 判读索引表 / 全层 KV | `… --kind topk --summary-only` / `export DUMP_DIR=/root/cp_dump; run_cp_diag.sh sweep` → `… --kind kv --summary-only` | `[topk/cross] RESULT: …` / `FIRST DIVERGENCE (fp/value\|fp/bytes): layer L` |
-| **行序复现** | `repro_row_order.py --dir <dir> --layer 0 [--run-op [--random-weight] [--no-nz]]` | 数据模式：token→行号置换；`--run-op`：`differing>0` ⇒ 行序相关，最小复现成立 |
+| **行序复现** | `repro_row_order.py --dir <dir> --layer 0 [--run-op [--random-weight] [--no-nz]] [--all-ranks]` | 数据模式：token→行号置换；`--run-op`：`differing>0` ⇒ 行序相关，最小复现成立；`--all-ranks` 出逐 rank 汇总 |
 | 单配置手工调试 | `run_single.py [--config C]` | `[http] <- 200` + `[result]` |
 | 收整轮证据 | `selfcheck.py --collect --out-root /dev/shm/cp_ab_sweep` | 一个文件含 HEAD/摘要/dump 清单/指标/日志关键行 |
 
