@@ -323,6 +323,10 @@ slot；payload 里带 `rows`/`positions_from` 可审计。
 **协作约定（务必遵守）**
 
 1. **代码只在本仓库改、改完立刻 commit**：轮次靠 `git rev-parse HEAD` 对齐版本；未提交的改动会让"这轮结果对应哪份代码"无法追溯。**提交后确认 origin 跟上**：`git rev-parse --short HEAD origin/glm52_cp_balance_v3` 两行相同才算同步就绪；不同就 `git push origin glm52_cp_balance_v3`（本会话观察：多数提交会被自动 push，最新一两次是手动推的，所以**每次都查一下**）。
+   ⚠️ **离线站点常常没有 git / 无法 `git pull`**：那边改用**文件内容指纹**对齐版本——
+   `python tools/cp_balance_compare/selfcheck.py --fingerprint`，末行 `[fp] <16 位>` 贴回来与本机对比即可；
+   同一命令还会列出 11 个关键文件的 sha256 与 9 个"修复标记"（OK/MISSING），
+   所以"这台机器有没有某个修复"不用猜（`selftest_mock.py` 有用例保证 marker 与实际代码一致）。
 2. **每一步都要有判据**：脚本必须打印"期望看到什么"；不给判据的命令视为未完成。
 3. **一次只给一步**：上一步结果确认后再给下一步，不预先罗列后续步骤。
 4. **远端执行 = 用户的手**：我给命令 + 判据；用户跑完把 `log.log`（或屏幕输出）贴回来。**新的打点代码必须先同步再跑**，同步后建议先 `python tools/cp_balance_compare/selftest_mock.py`（末行 `SELFTEST OK`）。
@@ -333,7 +337,8 @@ slot；payload 里带 `rows`/`positions_from` 可审计。
 
 | 目的 | 命令 | 判据 |
 | --- | --- | --- |
-| CPU 自测（改完代码必跑） | `python tools/cp_balance_compare/selftest_mock.py` | 末行 `SELFTEST OK`（45 项） |
+| GPU 自测（改完代码必跑） | `python tools/cp_balance_compare/selftest_mock.py` | 每项 `[run] …` / `[ok] … (Ns)`；末行 `SELFTEST OK`（51 项）。**卡住时**最后一行 `[run]` 就是卡住的用例名字，90s 后自动超时并打印栈；可 `--only`/`--skip launcher,preflight` 复跑 |
+| **版本指纹（离线站点无 git）** | `python tools/cp_balance_compare/selfcheck.py --fingerprint` | 末行 `[fp] <16 位>` + 关键文件 sha256 + 修复标记 OK/MISSING |
 | 首跑/换机器自检 | `python tools/cp_balance_compare/selfcheck.py` | `[verdict] READY`，无 FAIL |
 | 不加载模型校验 env/指纹 | `ab_cp_compare.py --preflight` | `[preflight] all configs OK` |
 | 省掉每轮 source | `source tools/cp_balance_compare/prepare_env.sh` | 打印两段 source 耗时 + `CP_AB_SKIP_SOURCE=1` |

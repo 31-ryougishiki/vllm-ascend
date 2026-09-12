@@ -65,6 +65,34 @@ DEFAULT_OUT_ROOT = "/dev/shm/cp_ab"
 
 PASS, WARN, FAIL, INFO = "PASS", "WARN", "FAIL", "INFO"
 
+# Files whose content is the version: the site copy is often synced by hand (no
+# git on the box), so a content digest is the only reliable "which code is this".
+KEY_FILES = (
+    "tools/cp_balance_compare/ab_cp_compare.py",
+    "tools/cp_balance_compare/check_zigzag_dumps.py",
+    "tools/cp_balance_compare/run_cp_diag.sh",
+    "tools/cp_balance_compare/selftest_mock.py",
+    "tools/cp_balance_compare/repro_row_order.py",
+    "tools/cp_balance_compare/launcher_glm52_w4a4c8_mxfp4.sh",
+    "vllm_ascend/attention/sfa_v1.py",
+    "vllm_ascend/worker/model_runner_v1.py",
+    "vllm_ascend/layers/cp_zigzag.py",
+    "vllm_ascend/envs.py",
+    "vllm_ascend/ascend_forward_context.py",
+)
+# Behaviour markers: a digest says "different", a marker says "which fix is here".
+MARKERS = (
+    ("dump kind qin", "vllm_ascend/attention/sfa_v1.py", '"qin"'),
+    ("采样点位置键共用", "vllm_ascend/worker/model_runner_v1.py", "_cp_balance_dump_positions"),
+    ("MLP dump kind 显式", "vllm_ascend/worker/model_runner_v1.py", '"mlpin"'),
+    ("权重打点 w", "vllm_ascend/worker/model_runner_v1.py", "def _dump_weights"),
+    ("旧名兼容 gugu_out", "tools/cp_balance_compare/check_zigzag_dumps.py", "gugu_out"),
+    ("父目录/子目录提示", "tools/cp_balance_compare/check_zigzag_dumps.py", "_newer_subdir"),
+    ("probe 每轮独立目录", "tools/cp_balance_compare/run_cp_diag.sh", "cp_probe/$(date"),
+    ("probe2 模式", "tools/cp_balance_compare/run_cp_diag.sh", "probe2"),
+    ("未定义名静态检查", "tools/cp_balance_compare/selftest_mock.py", "loads undefined name"),
+)
+
 class Report:
     """Check results, mirrored to stdout and (optionally) to a log file."""
 
@@ -156,6 +184,46 @@ def check_interpreter(report: Report) -> None:
             "当前解释器里没有 torch",
             "只在 CPU 侧判读 dump 时需要（check_zigzag_dumps.py），driver 本身不需要",
         )
+
+
+def fingerprint_lines(repo_root: Path) -> tuple[list[str], str]:
+    """``(lines, digest)`` for a git-free version fingerprint.
+
+    The offline site is synced by hand and often cannot run ``git``, so "which code
+    is this box running" has to come from the files themselves: a sha256 per key
+    file plus a few behaviour markers (a digest only says *different*, a marker says
+    *which fix is present*).  The combined ``[fp]`` line is what gets pasted back.
+    """
+    import hashlib
+
+    lines: list[str] = []
+    combined = hashlib.sha256()
+    for relative in KEY_FILES:
+        path = repo_root / relative
+        if not path.is_file():
+            lines.append(f"[file] {relative:<52} MISSING")
+            combined.update(f"{relative}:MISSING".encode())
+            continue
+        digest = hashlib.sha256(path.read_bytes()).hexdigest()[:12]
+        combined.update(f"{relative}:{digest}".encode())
+        lines.append(f"[file] {relative:<52} {digest}")
+    for label, relative, needle in MARKERS:
+        path = repo_root / relative
+        present = path.is_file() and needle in path.read_text(encoding="utf-8", errors="replace")
+        lines.append(f"[mark] {label:<28} {'OK' if present else 'MISSING'}")
+        combined.update(f"{label}:{present}".encode())
+    selftest = repo_root / "tools/cp_balance_compare/selftest_mock.py"
+    count = 0
+    if selftest.is_file():
+        count = sum(
+            1 for line in selftest.read_text(encoding="utf-8", errors="replace").splitlines()
+            if line.startswith("def test_")
+        )
+    lines.append(f"[mark] {'selftest 用例数':<28} {count}")
+    combined.update(f"tests:{count}".encode())
+    digest = combined.hexdigest()[:16]
+    lines.append(f"[fp] {digest}    <- 远端把这行贴回来即可对齐版本（不需要 git）")
+    return lines, digest
 
 
 def check_repo_state(report: Report) -> None:
@@ -464,6 +532,11 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--report", default="", help="log file; default /dev/shm/cp_balance_selfcheck_<ts>.log")
     parser.add_argument("--skip-selftest", action="store_true", help="skip the mock-server self test")
     parser.add_argument("--collect", action="store_true", help="collect the evidence of finished rounds")
+    parser.add_argument(
+        "--fingerprint",
+        action="store_true",
+        help="print the git-free version fingerprint (file digests + fix markers) and exit",
+    )
     return parser.parse_args(argv)
 
 
@@ -484,6 +557,10 @@ def main(argv: list[str] | None = None) -> int:
         pass
     args = parse_args(argv)
     repo_root = Path(args.repo_root).resolve()
+    if args.fingerprint:
+        for line in fingerprint_lines(repo_root)[0]:
+            print(line)
+        return 0
     report = Report(_report_path(args.report))
     if report.path is not None:
         print(f"[selfcheck] 报告写入 {report.path}")
@@ -491,6 +568,9 @@ def main(argv: list[str] | None = None) -> int:
     report.say(f"cp_balance selfcheck @ {time.strftime('%Y-%m-%d %H:%M:%S')}")
     report.say(f"repo_root = {repo_root}")
     report.say(f"base_port = {args.base_port}  dump_dir = {args.dump_dir}  out_root = {args.out_root}")
+    # Version, git-free: the offline box is synced by hand and may not have git.
+    for line in fingerprint_lines(repo_root)[0]:
+        report.say(line)
 
     if not (HERE / "ab_cp_compare.py").is_file():
         report.item(FAIL, "工具目录", f"{HERE} 里没有 ab_cp_compare.py", "从仓库根目录运行本脚本")

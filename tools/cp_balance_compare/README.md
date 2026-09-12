@@ -43,8 +43,8 @@
 | `check_zigzag_dumps.py` | CPU 侧判读 dump（`kv` / `topk` / `act`，见 §五） | 否 |
 | `repro_row_order.py` | 离线复现"同一 token 的行换个位置结果就变"：读一轮的 `dnq`/`guq` dump（+ 同层 `w` 权重 dump）重跑 `npu_quant_matmul`，比较两种行序下同一 token 的输出 | 否（`--run-op` 需要 NPU） |
 | `compare_cp_rounds.py` | 把多轮 `summary.json` 并排，回答"改了某个变量后 `C−B` 是否回到噪声级" | 否 |
-| `mock_vllm_server.py` / `selftest_mock.py` | 假 server + CPU 自测（45 项：协议解析、指纹/payload、dump 判读、launcher 静态检查、端到端） | 否 |
-| `selfcheck.py` | 环境体检（解释器/依赖/import 来源/NPU/端口/磁盘/残留进程）+ 跑一遍自测 + `--collect` 收整轮证据。**不做**配置门与命令预演——那两件事由 `ab_cp_compare.py --preflight` 与 `run_cp_diag.sh <mode> --dry-run` 负责（每轮都会跑，不会腐化） | 否 |
+| `mock_vllm_server.py` / `selftest_mock.py` | 假 server + CPU 自测（51 项：协议解析、指纹/payload、dump 判读、launcher 静态检查、端到端）。逐项打印 `[run]`/`[ok] … (耗时)`，单项 90s 超时（Linux 下 SIGALRM + faulthandler 打印卡住的栈），失败不中止整轮；支持 `--list`、`--only <子串>`、`--skip launcher,preflight`、`--test-timeout N` | 否 |
+| `selfcheck.py` | 环境体检（解释器/依赖/import 来源/NPU/端口/磁盘/残留进程）+ **不依赖 git 的版本指纹**（`--fingerprint`：关键文件 sha256 + 修复标记 + 用例数，末行 `[fp] …` 贴回来即可对齐版本）+ 跑一遍自测 + `--collect` 收整轮证据。**不做**配置门与命令预演——那两件事由 `ab_cp_compare.py --preflight` 与 `run_cp_diag.sh <mode> --dry-run` 负责（每轮都会跑，不会腐化） | 否 |
 | `prepare_env.sh` | 一次性 `source` 站点 rc + vendor 环境并 `export CP_AB_SKIP_SOURCE=1`，省掉每轮两次 source；**必须 source** | 否 |
 
 ## 四、一轮 NPU 轮次怎么跑

@@ -28,6 +28,7 @@ import importlib.util
 import io
 import json
 import shutil
+import signal
 import subprocess
 import sys
 from contextlib import redirect_stderr, redirect_stdout
@@ -1380,6 +1381,31 @@ def test_repro_row_order_reports_the_permutation() -> None:
         shutil.rmtree(out, ignore_errors=True)
 
 
+def test_selfcheck_fingerprint_markers_match_the_code() -> None:
+    """Every behaviour marker in ``selfcheck.fingerprint_lines`` must be present here.
+
+    The markers are the git-free answer to "which fix is on this box"; a needle that
+    rots (the string it looks for changed) reports ``MISSING`` on the site and reads
+    like a missing fix.  This keeps the two in sync -- it caught two wrong needles
+    the first time it ran.
+    """
+    import importlib.util
+
+    path = HERE / "selfcheck.py"
+    spec = importlib.util.spec_from_file_location("cp_ab_selfcheck_fp", path)
+    assert spec is not None and spec.loader is not None
+    module = importlib.util.module_from_spec(spec)
+    sys.modules["cp_ab_selfcheck_fp"] = module
+    spec.loader.exec_module(module)
+
+    lines, digest = module.fingerprint_lines(HERE.parent.parent)
+    missing = [line for line in lines if line.startswith("[mark]") and "MISSING" in line]
+    absent_files = [line for line in lines if line.startswith("[file]") and "MISSING" in line]
+    assert not absent_files, "\n".join(absent_files)
+    assert not missing, "\n".join(missing)
+    assert len(digest) == 16, digest
+
+
 def test_load_prompts_file() -> None:
     out = Path(_temp_dir("cp_ab_pf_"))
     try:
@@ -2073,27 +2099,110 @@ def test_end_to_end_against_mock() -> None:
         shutil.rmtree(out, ignore_errors=True)
 
 
-def main() -> int:
-    """Run every ``test_*`` in this module; print per-test time and the slowest.
+def main(argv: list[str] | None = None) -> int:
+    """Run every ``test_*`` here, one line before and one after each test.
 
-    The CPU self test is the only regression gate on a box without an NPU, so it
-    has to stay cheap enough to run after every change; the timing line makes a
-    newly expensive test visible instead of felt as "the selftest is slow".
+    Remote debugging needs two things this runner used to lack: a ``[run]`` line
+    *before* a test (so a hang names itself) and a per-test timeout (so a hang ends
+    the test, not the session).  On Linux the timeout is a ``SIGALRM`` and
+    ``faulthandler`` dumps the stuck stack while it waits; failures no longer stop
+    the suite, they are reported at the end, and ``SELFTEST OK`` is only printed
+    when everything passed.
     """
+    import argparse
+    import faulthandler
     import time
 
-    tests = [value for name, value in sorted(globals().items()) if name.startswith("test_") and callable(value)]
+    parser = argparse.ArgumentParser(description="cp_balance CPU self test")
+    parser.add_argument("--only", default="", help="run only tests whose name contains this")
+    parser.add_argument(
+        "--skip",
+        default="",
+        help="skip tests whose name contains any of these (comma separated) "
+        "e.g. --skip launcher,preflight to avoid the tests that spawn a launcher",
+    )
+    parser.add_argument("--list", action="store_true", help="list the tests and exit")
+    parser.add_argument(
+        "--test-timeout",
+        type=float,
+        default=90.0,
+        help="seconds per test (0 = no limit; SIGALRM on Linux)",
+    )
+    args = parser.parse_args(argv)
+
+    tests = [
+        (name, value)
+        for name, value in sorted(globals().items())
+        if name.startswith("test_") and callable(value)
+    ]
+    if args.only:
+        tests = [(name, value) for name, value in tests if args.only in name]
+    skip = [item.strip() for item in args.skip.split(",") if item.strip()]
+    if skip:
+        tests = [(name, value) for name, value in tests if not any(item in name for item in skip)]
+    if args.list:
+        for name, _value in tests:
+            print(name)
+        return 0
+    if not tests:
+        print(f"[selftest] no test matches --only={args.only!r}", file=sys.stderr)
+        return 2
+
+    timed_out: list[str] = []
+    failed: list[str] = []
+
+    class _TestTimeout(Exception):
+        pass
+
+    def _on_alarm(signum, frame):  # noqa: ANN001 - signal handler signature
+        raise _TestTimeout(f"exceeded {args.test_timeout:.0f}s")
+
+    can_alarm = hasattr(signal, "SIGALRM") and args.test_timeout > 0
+    if can_alarm:
+        signal.signal(signal.SIGALRM, _on_alarm)
+        faulthandler.dump_traceback_later(args.test_timeout, repeat=True)
+
     timings: list[tuple[float, str]] = []
     started = time.perf_counter()
-    for test in tests:
-        begin = time.perf_counter()
-        test()
-        elapsed = time.perf_counter() - begin
-        timings.append((elapsed, test.__name__))
-        print(f"[ok] {test.__name__}")
+    try:
+        for name, test in tests:
+            print(f"[run] {name}", flush=True)
+            begin = time.perf_counter()
+            if can_alarm:
+                signal.setitimer(signal.ITIMER_REAL, args.test_timeout)
+            try:
+                test()
+                outcome = "ok"
+            except _TestTimeout:
+                outcome = "timeout"
+                timed_out.append(name)
+                print(f"       ↑ 上面最后一段栈就是卡住的位置（{args.test_timeout:.0f}s 未返回）", flush=True)
+            except Exception as exc:  # noqa: BLE001 - report every failure, keep going
+                outcome = "fail"
+                failed.append(f"{name}: {type(exc).__name__}: {exc}")
+            finally:
+                if can_alarm:
+                    signal.setitimer(signal.ITIMER_REAL, 0.0)
+            elapsed = time.perf_counter() - begin
+            timings.append((elapsed, name))
+            if outcome == "ok":
+                print(f"[ok] {name} ({elapsed:.2f}s)", flush=True)
+            else:
+                print(f"[{outcome}] {name} ({elapsed:.2f}s)", flush=True)
+    finally:
+        if can_alarm:
+            faulthandler.cancel_dump_traceback_later()
+
     total = time.perf_counter() - started
     slowest = ", ".join(f"{name}={secs:.1f}s" for secs, name in sorted(timings, reverse=True)[:5])
     print(f"[time] {len(tests)} tests in {total:.1f}s; slowest: {slowest}")
+    for line in failed:
+        print(f"[failed] {line}")
+    for name in timed_out:
+        print(f"[timed out] {name} (>{args.test_timeout:.0f}s)")
+    if failed or timed_out:
+        print(f"SELFTEST FAILED ({len(failed)} failed, {len(timed_out)} timed out)")
+        return 1
     print("SELFTEST OK")
     return 0
 
