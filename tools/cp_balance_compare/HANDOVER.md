@@ -93,6 +93,23 @@ dump: 16 个 rank 齐全（act/mlp 各 64、guq/dnq/topk 各 32、kv 64）且 **
 A3 侧可由已有 `w` dump 直接读出真形状：`gate_up [6144, 1536] = [hidden, 2I/tp]` ⇒ hidden=6144、
 I=12288、`dn_q` 的 K=I/tp=768 ⇒ down_proj 权重应为 `[768, 6144]`。
 
+**2026-09-12 A3：真实形状下的复现（免费，无需加载模型）**——在 `[K=768, N=6144]`、int8、
+每 token fp32 scale 的**模型真实形状**上重跑两种行序：
+
+```
+[repro] 随机权重（int8, device=npu:0）: weight=(768, 6144) torch.int8 | scale=(6144,) torch.float32
+[repro] rank 0: 输出比较（逐 token，同一 weight、同一 token 值，只有行序不同）: differing=0/2048 max|d|=0.000e+00
+```
+
+⇒ **GEMM 侧（int8/W4A8C8、真实形状）也排除**；A5 侧同样的复核还欠一次（它之前那次跑在 N=768 上，
+用 `--run-op --random-weight --n 6144` 即可免费补做）。同一轮还验证了 op 过滤生效：
+`w_cpbal0/1_layer0_rank0` 都只有 `op=['gu_q']`，复现器按预期打印"需要 op=dn_q"而不是让内核报 K 不匹配。
+
+**2026-09-12 A5 侧：全 rank 扫描与真实形状（`--all-ranks`，无需加载模型）**：rank **1..7** 全部
+`differing=0/2048 max|d|=0.000e+00`；rank 0 在此前两轮同命令下同样 0。⚠️ 那轮 dump 目录里
+**没有 rank 0 的 `dnq`**，所以工具报的是 `7/7 … 覆盖不完整（缺 rank [0]）`（工具现在会显式告警，
+判词不再写成 N/N）。⇒ 8 个 rank 上 GEMM 均排除（rank≠0 用随机权重）。
+
 **2026-09-12 A3 上试 `HCCL_DET=true`（一轮 probe）—— 无效果，且两轮数字逐位相同**：
 
 ```
@@ -104,35 +121,20 @@ change vs ref: +0.0% / +0.0% / +0.0%     act 表也逐行相同（layer 0 mlp_ou
 两个结论：
 * **`true` 不是这个问题的正确旋钮**。`HCCL_DETERMINISTIC=true` 保证的是"同输入多次执行同结果"
   （可复现），而我们**早就有**这个性质（`C2−C=0`，且这两轮跨配置跑出的指标逐位相同 ⇒ A3 的噪声地板也是 0）。
-  要消掉 B/C 之间的差异需要的是**保序**（`strict`：归约顺序逐 bit 一致），这才可能让"同一 token 的不同行位置"得到同一位序的结果。
-  之前把 `true` 排在候选首位是判断失误，**正确顺序是 `strict` → 实现层 A/B**。
-* 两轮逐位相同也顺带证明：**方法学可靠**（"配置没生效"会立刻以数字完全相同暴露出来），且 0.391 是确定性的排布效应、不是噪声。
+  要消掉 B/C 差异需要的是**保序**（`strict`：归约顺序逐 bit 一致），这才可能让"同一 token 处于不同行位置"
+  得到同一位序的结果。之前把 `true` 排在候选首位是判断失误 —— **正确顺序是 `strict` → 实现层 A/B**。
+* 两轮逐位相同也证明**方法学可靠**（"配置没生效"会立刻以数字完全相同暴露），且 0.391 是确定性的排布效应。
 
-**下一步（按优先级）**：① 先把 `w` dump 数清楚（`ls "$DIR"/w_cpbal*.pt | wc -l`：4 = 两个 op 都写了、修复已同步）并用**真实权重**跑一次
-`--run-op`（免费，补上"GEMM 行序无关"的最后一个保留：之前用的是随机权重）；② A3 上试 `HCCL_DET=strict`
-（A3 的 CANN 与 A5 不同，A5 死于 AICPU kernel，A3 未必）；③ 都不行则走实现层 `all_reduce + slice` 的 A/B，
-或把这条 ReduceScatter 做成 16 进程离线最小复现交算子侧。⚠️ 每次都要留下配置生效证据（`[run_cp_diag] hccl_det=…`
-与 `[cp-ab-hccl] …`），否则"没生效"与"没效果"无法区分。
-**2026-09-12 A3：真实形状下的复现（免费，无需加载模型）**——在 `[K=768, N=6144]`、int8、
-每 token fp32 scale 的**模型真实形状**上重跑两种行序：
-
-```
-[repro] 随机权重（int8, device=npu:0）: weight=(768, 6144) torch.int8 | scale=(6144,) torch.float32
-[repro] rank 0: 输出比较（逐 token，同一 weight、同一 token 值，只有行序不同）: differing=0/2048 max|d|=0.000e+00
-```
-
-⇒ **GEMM 侧（int8/W4A8C8、真实形状）也排除**；A5 侧同样的复核还欠一次（它之前那次跑在 N=768 上，
-用 `--run-op --random-weight --n 6144` 即可免费补做）。⇒ 两个站点、两套量化、真实形状下都排除 GEMM，
-**跨 rank 归约成为唯一剩余嫌疑**。（同一轮还验证了 op 过滤生效：`w_cpbal0/1_layer0_rank0` 都只有
-`op=['gu_q']`，复现器按预期打印"需要 op=dn_q"而不是让内核报 K 不匹配。）
-`differing=0/2048 max|d|=0.000e+00`；rank 0 在此前两轮同命令下同样 0。⚠️ 那轮 dump 目录里
-**没有 rank 0 的 `dnq`**，所以工具报的是 `7/7 … 覆盖不完整（缺 rank [0]）`（工具现在会显式告警，
-判词不再写成 N/N）。综合 ⇒ **GEMM 侧在全部 8 个 rank 上都排除**（rank≠0 用同形状随机权重），
-根因锁定在那次跨 rank 归约。
+**下一步（按优先级）**：① 用**真实权重**跑一次 `--run-op`（免费，补上"GEMM 行序无关"的最后一个保留：
+之前用的是随机权重；先 `ls "$DIR"/w_cpbal*.pt | wc -l` 确认是 4 = 两个 op 都写了、修复已同步）；
+② A3 上试 `HCCL_DET=strict`（A3 的 CANN 与 A5 不同，A5 死于 AICPU kernel，A3 未必）；
+③ 都不行则走实现层 `all_reduce + slice` 的 A/B，或把这条 ReduceScatter 做成 16 进程离线最小复现交算子侧。
+⚠️ 每次都要留下配置生效证据（`[run_cp_diag] hccl_det=…` 与 `[cp-ab-hccl] …`），否则"没生效"与"没效果"无法区分。
 `mlp_out` 是 **reduce_scatter 之后**的 rank-local 张量（`dn_q` 是 all-gather 后的 2048 行、`gu_q` 是 rank-local），
 所以"GEMM 输入逐位相同 + GEMM 行序无关"留下的唯一去处就是那次跨 rank 归约本身。
 
-**rank 覆盖现状**（`differing=0` 目前只覆盖 rank 0，别直接外推）：
+**rank 覆盖现状**（A5：`--all-ranks` 已扫过 1..7，rank 0 另有两次单跑；A3（16 卡）：目前只有 rank 0，
+`--all-ranks --tp-size 16` 还没扫 —— TP=16 的权重分片形状不同，严格来说要补一次）：
 
 | 数据 | 覆盖范围 |
 | --- | --- |
