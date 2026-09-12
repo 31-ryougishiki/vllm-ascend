@@ -1538,6 +1538,108 @@ def test_repro_row_order_all_ranks_covers_every_dumped_rank() -> None:
         shutil.rmtree(out, ignore_errors=True)
 
 
+def test_cp_balance_weight_dump_survives_an_internal_format() -> None:
+    """The ``w`` dump must not kill inference on an NZ-format weight.
+
+    Site 2026-09-12: the first round that ever asked for ``qin:`` died *inside the
+    model forward* -- ``weight.detach().to("cpu")`` on an FRACTAL_NZ tensor raises
+    "copy_ do not support internal format".  Two properties have to hold from now
+    on: the copy degrades to the ND fallback (warn once, never raise), and the dump
+    records ``weight_format`` so the reproducer can replay the NZ cast.
+    """
+    source = (
+        HERE.parent.parent / "vllm_ascend" / "worker" / "model_runner_v1.py"
+    ).read_text(encoding="utf-8")
+    assert '"weight": weight.detach().to("cpu")' not in source, "the NZ-unsafe copy is back"
+    assert "_weight_to_cpu" in source, source
+    assert "ACL_FORMAT_FRACTAL_ND" in source, source
+    assert '"weight_format"' in source, source
+    assert 'return None, "unavailable"' in source, "the fallback must not raise"
+    # The site verifies the fix without git through this marker.
+    assert "w dump NZ 兜底" in (HERE / "selfcheck.py").read_text(encoding="utf-8")
+
+
+def test_repro_row_order_replays_the_nz_cast_for_an_nd_weight_dump() -> None:
+    """A ``weight_format="ND"`` dump must be re-cast to NZ before the op.
+
+    The in-model dump cannot copy an internal-format weight to the host, so it
+    writes the ND view; the reproduction is only faithful if it puts the NZ layout
+    back (the same ``npu_format_cast`` the layer's weight loading made).
+    """
+    import importlib.util
+    import types
+
+    import torch
+
+    path = HERE / "repro_row_order.py"
+    spec = importlib.util.spec_from_file_location("cp_ab_repro_row_order_nz", path)
+    assert spec is not None and spec.loader is not None
+    module = importlib.util.module_from_spec(spec)
+    sys.modules["cp_ab_repro_row_order_nz"] = module
+    spec.loader.exec_module(module)
+
+    casts: list[tuple[int, object]] = []
+    stub = types.ModuleType("torch_npu")
+
+    def _format_cast(tensor, fmt, **kwargs):  # noqa: ANN001 - mimics the vendor op
+        if fmt == module.ACL_FORMAT_FRACTAL_NZ:
+            casts.append((fmt, kwargs.get("customize_dtype")))
+            return tensor
+        return tensor
+
+    stub.npu_format_cast = _format_cast
+    stub.npu_quant_matmul = (
+        lambda q, weight, weight_scale, **kwargs: torch.ones(
+            q.shape[0], weight.shape[1], dtype=torch.bfloat16
+        )
+    )
+    stub.float8_e8m0fnu = None
+
+    out = _temp_dir("cp_ab_repro_nz_")
+    previous = sys.modules.get("torch_npu")
+    sys.modules["torch_npu"] = stub
+    try:
+        for cpbal in (0, 1):
+            torch.save(
+                {
+                    "kind": "qin", "op": "dn_q", "fused": False, "rows": 4,
+                    "positions_from": "gather_natural" if cpbal == 0 else "gather_zigzag",
+                    "positions": torch.arange(4, dtype=torch.int64),
+                    "q": torch.zeros(4, 64, dtype=torch.uint8).view(torch.float8_e4m3fn),
+                    "s": torch.full((4, 1, 2), 127, dtype=torch.uint8),
+                    "in_dtype": "torch.bfloat16",
+                },
+                out / f"dnq_cpbal{cpbal}_layer0_rank0_pid1_{1000 + cpbal}.pt",
+            )
+        # An ND weight dump (what _dump_weights writes when the copy had to fall back).
+        torch.save(
+            {
+                "kind": "w", "op": "dn_q", "layer_idx": 0,
+                "weight": torch.zeros(64, 8, dtype=torch.uint8).view(torch.float8_e4m3fn),
+                "weight_scale": torch.full((1, 8, 2), 127, dtype=torch.uint8),
+                "weight_dtype": "torch.float8_e4m3fn",
+                "weight_format": "ND",
+            },
+            out / "w_cpbal1_layer0_rank0_pid1_1500.pt",
+        )
+        buffer = io.StringIO()
+        with redirect_stdout(buffer):
+            rc = module.main(
+                ["--dir", str(out), "--layer", "0", "--run-op", "--device", "meta"]
+            )
+        text = buffer.getvalue()
+        assert rc == 0, text
+        assert "format=ND" in text, text
+        assert "ND → NZ 已重放" in text, text
+        assert casts == [(module.ACL_FORMAT_FRACTAL_NZ, torch.float8_e4m3fn)], casts
+    finally:
+        if previous is None:
+            sys.modules.pop("torch_npu", None)
+        else:
+            sys.modules["torch_npu"] = previous
+        shutil.rmtree(out, ignore_errors=True)
+
+
 def test_selfcheck_fingerprint_markers_match_the_code() -> None:
     """Every behaviour marker in ``selfcheck.fingerprint_lines`` must be present here.
 

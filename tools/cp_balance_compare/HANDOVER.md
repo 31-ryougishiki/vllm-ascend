@@ -90,13 +90,18 @@ python tools/cp_balance_compare/repro_row_order.py --dir "$DIR" --layer 0 \
     --run-op --random-weight --n 768 [--no-nz]     # --n = down_proj 输出维 = hidden/TP
 ```
 
-⚠️ 2026-09-12 站点两连败（都是**工具侧**问题，不是模型发现；两条都已修，见 §9）：
+⚠️ 2026-09-12 站点三连败（都是**工具侧**问题，不是模型发现；三条都已修，见 §9）：
 ① `--random-weight` 曾 `RuntimeError: Ascend config is not initialized`（复现器 import 了
 `vllm_ascend.utils.maybe_trans_nz`）；② 改用 `npu_format_cast` 后变成
 `NotImplementedError: ... 'npu::npu_format_cast' with arguments from the 'CPU' backend`
 —— 因为 dump 是 `map_location="cpu"` 加载的，`q.device` 恒为 CPU。
 现在设备由 `--device`（默认 `npu:0`）决定，权重与算子输入都会先搬过去；跑起来应先看到
 `[repro] device: npu:0（dump 是 CPU 加载的…）`。
+③ `qin:` 轮在**模型 forward 内部**崩：`_dump_weights` 里 `weight.detach().to("cpu")` 撞上
+NZ 内部格式（`RuntimeError: ... copy_ do not support internal format`）——这才是"有 `dnq` 却没有
+`w`"的真因（`w` 打点是 bf1fa116a 加的，而带 `qin` 的轮次都在它之前）。现在权重走 `_weight_to_cpu`：
+先试直拷，失败则 `npu_format_cast(..., FRACTAL_ND)` 再拷，并把 `weight_format` 写进 payload；
+复现器读到 `ND` 会重放 NZ cast（`w=w->ND` 会打在汇总行里）。**打点永不阻断推理**。
 
 **后续分支**（8/8 rank 都行序无关 ⇒ 归约侧；两步走，先便宜的后贵的）：
 
@@ -235,7 +240,7 @@ python tools/cp_balance_compare/check_zigzag_dumps.py --dir "$DIR" \
 
 | 目的 | 命令 | 判据 |
 | --- | --- | --- |
-| CPU 自测（改完代码必跑） | `python tools/cp_balance_compare/selftest_mock.py` | 每项 `[run]`/`[ok] …(Ns)`，末行 `SELFTEST OK`（54 项）；卡住时最后一行 `[run]` 就是卡住的用例，90s 后自动超时并打栈；慢 bash 站点自动 `[skip]` 4 个 launcher 用例（`--only/--skip` 可覆盖） |
+| CPU 自测（改完代码必跑） | `python tools/cp_balance_compare/selftest_mock.py` | 每项 `[run]`/`[ok] …(Ns)`，末行 `SELFTEST OK`（56 项）；卡住时最后一行 `[run]` 就是卡住的用例，90s 后自动超时并打栈；慢 bash 站点自动 `[skip]` 4 个 launcher 用例（`--only/--skip` 可覆盖） |
 | 版本指纹（无 git） | `python tools/cp_balance_compare/selfcheck.py --fingerprint` | 末行 `[fp] <16 位>` + 文件摘要 + marker OK/MISSING |
 | 环境体检 | `python tools/cp_balance_compare/selfcheck.py` | `[verdict] READY`、无 FAIL |
 | 配置门（不加载模型） | `ab_cp_compare.py --preflight` | 末行 `[preflight] all configs OK` |
@@ -244,7 +249,8 @@ python tools/cp_balance_compare/check_zigzag_dumps.py --dir "$DIR" \
 | **归约确定性轮** | `export HCCL_DET=strict; unset DUMP_DIR; bash tools/cp_balance_compare/run_cp_diag.sh probe` | 轮次目录 `r_probe_det`；日志有 `[cp-ab-hccl] … HCCL_DETERMINISTIC=strict LCCL_DETERMINISTIC=1`；与 `r_probe` 并排看是否回噪（README §七） |
 | 判读激活剖面 | `check_zigzag_dumps.py --dir <dir> --kind act --summary-only --block-size 128` | `FIRST DIVERGENCE (act): layer L op=…` + layer 0 八行 + 判词 |
 | 判读索引表 / 全层 KV | `… --kind topk --summary-only` / `export DUMP_DIR=/root/cp_dump; run_cp_diag.sh sweep` → `… --kind kv --summary-only` | `[topk/cross] RESULT: …` / `FIRST DIVERGENCE (fp/value\|fp/bytes): layer L` |
-| **行序复现** | `repro_row_order.py --dir <dir> --layer 0 [--run-op [--random-weight] [--no-nz]] [--all-ranks]` | 数据模式：token→行号置换；`--run-op`：`differing>0` ⇒ 行序相关，最小复现成立；`--all-ranks` 出逐 rank 汇总 |
+| **行序复现** | `repro_row_order.py --dir <dir> --layer 0 [--run-op [--random-weight] [--no-nz]] [--all-ranks]` | 数据模式：token→行号置换；`--run-op`：`differing>0` ⇒ 行序相关，最小复现成立；`--all-ranks` 出逐 rank 汇总；权重来源打在 `w=w\|random`（`w->ND` = 该 dump 走了 ND 兜底、已在复现器里重放 NZ） |
+
 | 单配置手工调试 | `run_single.py [--config C]` | `[http] <- 200` + `[result]` |
 | 收整轮证据 | `selfcheck.py --collect --out-root /dev/shm/cp_ab_sweep` | 一个文件含 HEAD/摘要/dump 清单/指标/日志关键行 |
 

@@ -283,10 +283,26 @@ def _reproduce_rank(args, device: torch.device, rank: int, quiet: bool = False) 
     if wpayload is not None:
         weight = wpayload.get("weight")
         weight_scale = wpayload.get("weight_scale")
+        weight_format = str(wpayload.get("weight_format", "as-is"))
         print(
             f"[repro] weight(rank {rank}): {os.path.basename(wpath)} {tuple(weight.shape)} "
-            f"{weight.dtype} | scale={None if weight_scale is None else tuple(weight_scale.shape)}"
+            f"{weight.dtype} | scale={None if weight_scale is None else tuple(weight_scale.shape)} "
+            f"| format={weight_format}"
         )
+        if args.nz and weight_format not in ("as-is", "NZ"):
+            # The in-model dump had to undo the load-time NZ cast to get the weight
+            # off the NPU ("copy_ do not support internal format"); put it back so the
+            # op still sees the layout the kernel consumed.  Same call the layer's
+            # process_weights_after_loading made (see vllm_ascend.utils.maybe_trans_nz).
+            import torch_npu
+
+            weight = torch_npu.npu_format_cast(
+                weight.to(device), ACL_FORMAT_FRACTAL_NZ, customize_dtype=weight.dtype
+            )
+            print(
+                f"[repro] weight(rank {rank}): {weight_format} → NZ 已重放"
+                f"（customize_dtype={weight.dtype}）"
+            )
     elif args.random_weight:
         # No w dump (it is only written for rank 0): a same-shaped random weight
         # still answers "does this op care about the row order", and it needs no
@@ -306,6 +322,8 @@ def _reproduce_rank(args, device: torch.device, rank: int, quiet: bool = False) 
         )
         return 2, {"rank": rank, "status": "no-weight"}
     summary["weight"] = source
+    if source == "w":
+        summary["weight_format"] = weight_format
 
     try:
         out_b = _run_op(args, sides[0]["q"], sides[0]["s"], weight, weight_scale, device)
@@ -454,7 +472,8 @@ def main(argv: list[str] | None = None) -> int:
                 print(
                     f"[repro]   rank {summary['rank']:>2}: {summary['status']:<9} "
                     f"differing={summary['differing']}/{summary['compared']} "
-                    f"max|d|={summary['max_abs']:.3e} w={summary.get('weight', '?')} "
+                    f"max|d|={summary['max_abs']:.3e} w={summary.get('weight', '?')}"
+                    f"{'' if 'weight_format' not in summary else '->' + summary['weight_format']} "
                     f"positions_from={summary.get('positions_from')}"
                 )
             else:

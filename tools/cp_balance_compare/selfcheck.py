@@ -96,6 +96,10 @@ MARKERS = (
     # here" from "the file is merely different" and re-runs a round that dies on
     # the same device error.
     ("repro 运行设备显式", "tools/cp_balance_compare/repro_row_order.py", "_resolve_device"),
+    # The w dump used to crash the whole forward on an NZ-format weight
+    # ("copy_ do not support internal format"); the fix is the ND fallback plus the
+    # weight_format field the reproducer reads back.
+    ("w dump NZ 兜底", "vllm_ascend/worker/model_runner_v1.py", "_weight_to_cpu"),
 )
 
 class Report:

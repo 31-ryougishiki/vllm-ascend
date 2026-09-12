@@ -3958,6 +3958,54 @@ class NPUModelRunner(GPUModelRunner):
 
         installed = []
         weights_done: set[int] = set()
+        weight_copy_warned: set[str] = set()
+
+        def _weight_to_cpu(tensor: "torch.Tensor", what: str) -> tuple["torch.Tensor | None", str]:
+            """``(cpu_tensor, format)`` for a weight/scale; NZ-safe and never raising.
+
+            ``.to("cpu")`` on a tensor that still carries an internal format
+            (``ACL_FORMAT_FRACTAL_NZ`` after ``process_weights_after_loading``) fails
+            on this device with "Current device only support aclnn operator, and
+            current operator ... copy_ do not support internal format" -- and because
+            this runs inside ``quant_method.apply``, that killed the whole model
+            forward on the site (2026-09-12, the first round that ever asked for
+            ``qin:``).  A diagnostic tap must not be able to do that.
+
+            Casting back to ND is lossless for the values, and the dump records
+            ``weight_format`` so the offline reproducer can re-apply the same NZ cast
+            before calling the op -- i.e. the kernel still sees the layout the model
+            used.
+            """
+            cleaned = tensor.detach()
+            try:
+                return cleaned.to("cpu"), "as-is"
+            except Exception as exc:  # noqa: BLE001 - fall back, never propagate
+                note = f"{what}: device->host copy failed ({type(exc).__name__}: {exc})"
+                try:
+                    import torch_npu
+
+                    from vllm_ascend.utils import ACL_FORMAT_FRACTAL_ND
+
+                    nd = torch_npu.npu_format_cast(cleaned, ACL_FORMAT_FRACTAL_ND)
+                    if note not in weight_copy_warned:
+                        weight_copy_warned.add(note)
+                        logger.warning(
+                            "[CP_BALANCE][dump] %s; dumped as ND instead (the reproducer "
+                            "re-applies the NZ cast, so the op still sees the same layout)",
+                            note,
+                        )
+                    return nd.to("cpu"), "ND"
+                except Exception as exc2:  # noqa: BLE001 - pragma: no cover
+                    if note not in weight_copy_warned:
+                        weight_copy_warned.add(note)
+                        logger.warning(
+                            "[CP_BALANCE][dump] %s, and the ND fallback failed too (%s: %s); "
+                            "no w dump for this layer",
+                            note,
+                            type(exc2).__name__,
+                            exc2,
+                        )
+                    return None, "unavailable"
 
         def _dump_weights(layer, layer_idx: int, op: str, name: str) -> None:
             """Save the GEMM's own weight/scale once per layer (rank 0 only).
@@ -3968,6 +4016,9 @@ class NPUModelRunner(GPUModelRunner):
             Rank 0's shard is enough to reproduce *its* partial, which is what the
             per-token comparison needs -- and keeping it to one rank keeps the
             round's dump size unchanged.
+
+            Fail-safe by construction: a weight that cannot leave the device is a
+            missing sample (warned once), never a dead inference.
             """
             if layer_idx in weights_done or getattr(_EXTRA_CTX, "in_profile_run", False):
                 return
@@ -3982,6 +4033,17 @@ class NPUModelRunner(GPUModelRunner):
             scale = getattr(layer, "weight_scale", None)
             if not torch.is_tensor(weight):
                 return
+            weight_cpu, weight_format = _weight_to_cpu(
+                weight, f"w layer={layer_idx} weight"
+            )
+            if weight_cpu is None:
+                # Better no file than one without its weight: the reproducer cannot
+                # reproduce anything from a payload whose weight is missing.
+                weights_done.add(layer_idx)
+                return
+            scale_cpu = None
+            if torch.is_tensor(scale):
+                scale_cpu, _ = _weight_to_cpu(scale, f"w layer={layer_idx} weight_scale")
             weights_done.add(layer_idx)
             _zigzag_dump(
                 {
@@ -3989,11 +4051,12 @@ class NPUModelRunner(GPUModelRunner):
                     "op": op,
                     "layer_name": name,
                     "layer_idx": layer_idx,
-                    "weight": weight.detach().to("cpu"),
-                    "weight_scale": scale.detach().to("cpu")
-                    if torch.is_tensor(scale)
-                    else None,
+                    "weight": weight_cpu,
+                    "weight_scale": scale_cpu,
                     "weight_dtype": str(weight.dtype),
+                    # "as-is" (the kernel's own layout, NZ included) or "ND" (the copy
+                    # had to undo the internal format; the reproducer re-applies it).
+                    "weight_format": weight_format,
                 },
                 layer_idx,
                 "w",
