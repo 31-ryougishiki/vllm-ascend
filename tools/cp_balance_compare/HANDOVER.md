@@ -194,6 +194,33 @@ PROMPT_LENS=2049,2048 bash tools/cp_balance_compare/run_cp_diag.sh probe
 两个旋钮都生效后若仍有差异 ⇒ 残余不在 HCCL 归约顺序（ragged/padding 形状走了非保序算法，或 MoE/MC2
 内部通信域不受该开关影响），再决定收窄到具体算子还是接受"非整除长度残留"。
 
+**2026-09-12 A3：`strict` + `PROMPT_LENS=2049,2048` 轮（让 dump 覆盖 2049）—— 结论未收口，两处方法论缺口**：
+
+```
+=== 确定性轮（strict，L2049 先）===
+single_L2048   99.17   0.178   0.481   DIFF        ← 上一轮 strict 同一 case 是 100.00 / 0 / OK
+single_L2049   94.92   0.262   0.703   first_div 1948 rank2/next
+single_L4096   (missing —— 本轮 PROMPT_LENS 没带 4096，预期)
+act（覆盖 L2049）：layer 0 全 0（含 mlp_out）；layer 1 只有 **1/2049 个 token**（1256）差 7.6e-06
+[act] PROVENANCE layer=0 op=dn_q: rows=2064(B) vs 2080(C)   ← 两边补齐长度不同！
+```
+
+* **仍是旧 launcher**：`[cp-ab-hccl]` 里 `LCCL_DETERMINISTIC=0` 且没有 `站点 rc 把 …` 的 NOTE
+  ⇒ 站点还没同步 `a8af7d312`/`ff13c30c3` 的 re-assert ⇒ **两个旋钮只生效了一个**。
+* **同一 case、同一配置、两轮 strict 的指标不一致**（L2048：0.0 ↔ 0.178）⇒ `probe` 轮**没有噪声地板**
+  （`noise floor: p99=-`），这些数字现在还不足以判定"残余多少"，必须先量 strict 下的运行间抖动。
+* **PROVENANCE 暴露的真差异**：B 对齐到 `tp`(16)、C 对齐到 `2*tp`(32)，所以 2049 这种非 32 整除的长度
+  两边**总行数不同**（2064 vs 2080；本地行 129 vs 130）。这解释了"32 整除的 L2048 在 strict 下逐位相同"，
+  也可能是 L2049 那 1 个 token 残余的来源（M 变 → GEMM/tiling 变）。它是**采样形状差异**，不是普通数值差。
+
+**下一步（一轮 `probe2` ≈30 分钟，一次补齐三个缺口：两个旋钮 + 噪声地板 + 对齐/非对齐对照）**：
+
+```bash
+export HCCL_DET=strict
+unset DUMP_DIR
+PROMPT_LENS=2049,2080 bash tools/cp_balance_compare/run_cp_diag.sh probe2   # C,B,C2
+```
+
 **rank 覆盖现状**（A5：`--all-ranks` 已扫过 1..7，rank 0 另有两次单跑；A3（16 卡）：目前只有 rank 0，
 `--all-ranks --tp-size 16` 还没扫 —— TP=16 的权重分片形状不同，严格来说要补一次）：
 
