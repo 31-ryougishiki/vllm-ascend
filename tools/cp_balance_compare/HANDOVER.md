@@ -20,45 +20,45 @@ in ──attention──▶ out ──pre-MLP norm──▶ mlp_in ══gate_up
 ⇒ 分歧**诞生在 layer 0 的 dense MLP 内部**（layer 0/1/2 是 dense MLP，`first_k_dense_replace=3`，
 **没有专家、没有路由**），再逐层放大（到 layer 77 时未量化的 rope 段已差到 7e-1）。
 
-### 0.1 `qin` 轮已跑（`log.log`，2026-09-12）：结论指向 **down_proj 的 GEMM**
+### 0.1 结论：分歧**只**诞生在 down_proj 的 GEMM（或紧随其后的归约）（`log.log`，2026-09-12）
 
-这一层的 dense MLP 是 **`W8A8_MXFP8`**（`quant_model_description.json`，见 §2.2），
-新增的 `qin:<层>` 打点记录了两个 MLP GEMM **实际吃到的量化输入**（fp8 + e8m0 scale）。
-本轮实测（layer 0）：
+layer 0 八行齐全（旧名 `gugu_out`/`dndn_in` 兼容后可重判），实测：
 
 ```
 in ─attn─▶ out ─norm─▶ mlp_in ─[量化]─▶ gu_q ─gate_up─▶ gu_out ─silu─▶ dn_in ─[量化]─▶ dn_q ─down_proj─▶ mlp_out
-   ✅0         ✅0          ✅0         ✅0        (缺失*)          (缺失)      ✅0                  ❌ 1664/2048, token≥256
+   ✅0         ✅0          ✅0         ✅0              ✅0             ✅0         ✅0                 ❌ 1664/2048, token≥256
 ```
 
-* **`gu_q` / `dn_q` 逐位相同**（各 2048 个 token 全等）⇒ 两个 GEMM 的**量化输入**在 B/C 下完全一致；
-  这也顺带证明"按行 MX 量化与排布无关"，以及 `qin` 的位置键（gather 序 → 自然 token）是对的。
-* `mlp_out` 仍差（`max|d|=9.766e-04`，`rel=7.52e-03`，首个分歧在 token 256 = 第 2 个 zigzag 块）。
-* **`gu_out`/`dn_in` 两行为空**：真因是文件 kind 拼错（`gugu_out_*.pt`/`dndn_in_*.pt`，
-  判读器不认识 ⇒ 静默丢弃），**已修且判读器已兼容旧名** ⇒ 同一目录重跑判读即可补齐这两格。
-* ⚠️ 这一轮把 dump 写进了共用的 `/root/cp_probe`，判读提示 `272 older dump(s) ignored`
-  且表里出现 layer 2（新 spec 已不打 layer 2）⇒ **该表可能混了上一轮的旧文件**；
-  判读器现在会打印"选中 dump 时间跨度"，`probe` 也改成每轮一个 `<时间戳>` 子目录。
+* `in/out/mlp_in/gu_q/gu_out/dn_in/dn_q` **全部 0 差异** ⇒ gate_up 的输出、silu 的输出、
+  down_proj 的 bf16 输入**与**它的 fp8+scale **都逐位相同**；没有"被量化吸收的前序差异"这回事。
+* `mlp_out` 差 1664/2048（token≥256，`max|d|=9.766e-04`，`rel=7.52e-03`；layer 1 起为继承+放大）。
+* **`C2 − C = {'p99': 0.0, 'max': 0.0}`** ⇒ C 路径确定 ⇒ 这是**确定性效应**，不是抖动。
+* `repro_row_order.py` 数据模式（不需要 NPU）：两侧 `rows=2048`、
+  `positions_from=gather_natural`(B)/`gather_zigzag`(C)、`q=(2048,1536)`、`s=(2048,24,2)`，
+  **1920/2048 个 token 换了行号**（例：token 256(slot 384) → `row_B=128 row_C=256`）。
 
-⇒ **根因候选：`down_proj` 这个 GEMM（与其跨 rank 归约）——输入（fp8+scale）逐位相同却给出不同输出。**
-按逐行数学推理，只剩两种解释，**一轮即可分开**：
-① 内核与行序相关（同样的行、不同的排列给出不同结果）；② 内核不可复现（同输入跑两次也不同）。
-**下一步**：`bash tools/cp_balance_compare/run_cp_diag.sh probe2`（= `--configs C,B --repeat-a`，
-即 C/B/C2 三次加载 ≈30 分钟）——一次拿到两样东西：layer 0 六行齐全的 B/C 剖面（含刚修好的
-`gu_out`/`dn_in`）与 `[noise] C2 vs C`。判据：`C2−C` 为 0 ⇒ 内核**与行序相关**（做离线行置换实验）；
-非 0 ⇒ 内核**不可复现**（查 MC2/mmrs 融合与确定性开关）。
+⇒ 输入（含权重）逐位相同、每个 token 的值相同，只有**行序**不同 ⇒ 只剩两个可能：
+① `npu_quant_matmul` 与行序相关（同为确定函数，但依赖行位置）；② 紧随其后的
+`tensor_model_parallel_reduce_scatter`（本站 MXFP8 不走融合 mm+RS，见 §2.4）。
+**下一步（不需要再加载模型）**：
 
+```bash
+# 优先用同层 w dump（qin:<层> 从 bf1fa116a 起还会写 rank0 的 weight/weight_scale）
+python tools/cp_balance_compare/repro_row_order.py --dir <轮次目录> --layer 0 --run-op
+# 旧轮次没有 w dump 时，用同形状随机权重（不必再跑一轮）：
+python tools/cp_balance_compare/repro_row_order.py --dir <轮次目录> --layer 0 \
+    --run-op --random-weight --n 768        # --n = down_proj 输出维（hidden/TP）
 ```
-in ─attn─▶ out ─norm─▶ mlp_in ─[量化]─▶ gu_q ─gate_up─▶ gu_out ─silu─▶ dn_in ─[量化]─▶ dn_q ─down_proj─▶ mlp_out
-   ✅相同        ✅相同          ✅相同      ❓        ❓              ❓        ❓             ❌ token≥256 不同
-```
+
+判据：`differing > 0` ⇒ matmul 行序相关，最小复现成立；`differing == 0` ⇒ 差异在归约侧，
+下一步查 `reduce_scatter`（换 all_reduce+slice / 查 HCCL 算法与确定性）。
 
 | 观察 | 根因 |
 | --- | --- |
 | `mlp_in` 相同、**`gu_q` 不同** | **激活量化这一步**：同一批 bf16 行量化出不同 fp8/scale（MX 量化不是逐 token 独立，或融合内核按 tile 共享状态） |
-| `gu_q` 相同、**`gu_out` 不同** | **`npu_quant_matmul` 这个 GEMM 内核**：输入逐位相同 ⇒ 只能查 tiling/workspace 与确定性（同配置重跑一次即可判定） |
+| `gu_q` 相同、**`gu_out` 不同** | **`npu_quant_matmul` 这个 GEMM 内核**：输入逐位相同 ⇒ 只能查 tiling/workspace 与行序/确定性 |
 | `gu_out` 相同、**`dn_q` 不同** | silu 之后的**量化** |
-| `dn_q` 相同、**`mlp_out` 不同** | **down_proj 这个 GEMM**（含跨 rank 归约） |
+| `dn_in`/`dn_q` 相同、**`mlp_out` 不同** | **down_proj 的 GEMM 或紧随其后的 `reduce_scatter`**（本轮实测落在这里，见 §0.1） |
 
 已排除：indexer 选点错、KV 重排/写错、元数据契约错、**attention 数值错**、pre-MLP norm/残差/归约错、
 合并 2B 调用形状（T1，验证用的 `2call` 开关已随结论一并删除）、

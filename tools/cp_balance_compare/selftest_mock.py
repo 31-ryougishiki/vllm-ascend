@@ -1374,7 +1374,7 @@ def test_repro_row_order_reports_the_permutation() -> None:
         text = buffer.getvalue()
         assert rc == 0, text
         assert "行号发生变化=2" in text, text
-        assert "token 1: row_B=1 row_C=2" in text, text
+        assert "token 1 (slot 1): row_B=1 row_C=2" in text, text
         assert "gather_zigzag" in text, text
     finally:
         shutil.rmtree(out, ignore_errors=True)

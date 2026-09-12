@@ -90,6 +90,36 @@ def _row_map(payload: dict) -> dict[int, int]:
     return {int(pos): row for row, pos in enumerate(positions.tolist()) if int(pos) >= 0}
 
 
+def _random_weight(args, q):
+    """A same-shaped random fp8 weight, so the op can be re-run without a w dump.
+
+    Order sensitivity is a property of the *call shape* (tiling / accumulation), not
+    of the weight values, so a random weight of the right shape is enough to answer
+    "does this op care about the row order".  It is built here on the NPU device
+    with the same post-loading transform the layer uses (transpose + NZ), because
+    the kernel expects that layout -- a plain tensor would either fail or be read as
+    garbage.
+    """
+    import torch_npu
+
+    from vllm_ascend.device.mxfp_compat import FLOAT8_E8M0FNU_DTYPE
+    from vllm_ascend.utils import maybe_trans_nz
+
+    device = q.device
+    k = int(q.shape[1])
+    weight = torch.randn(k, args.n, device=device).to(torch.float8_e4m3fn)
+    weight = maybe_trans_nz(weight, customize_dtype=torch.float8_e4m3fn)
+    group = max(1, args.group_size)
+    scale = torch.full((k // group // 2, args.n, 2), 127, dtype=torch.uint8, device=device)
+    if FLOAT8_E8M0FNU_DTYPE is not None:
+        scale = scale.view(FLOAT8_E8M0FNU_DTYPE)
+    print(
+        f"[repro] 随机权重（同形状）: weight={tuple(weight.shape)} {weight.dtype} | "
+        f"scale={tuple(scale.shape)} {scale.dtype}"
+    )
+    return weight, scale
+
+
 def _run_op(args, q, scale, weight, weight_scale):
     import torch_npu
 
@@ -117,6 +147,17 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--kind", default="dnq", choices=("dnq", "guq", "gugu_out", "dndn_in"))
     parser.add_argument("--rank", type=int, default=0, help="TP rank whose weight shard to use")
     parser.add_argument("--run-op", action="store_true", help="re-run the GEMM (needs the w dump)")
+    parser.add_argument(
+        "--random-weight",
+        action="store_true",
+        help="with --run-op and no w dump: build a same-shaped random fp8 weight instead",
+    )
+    parser.add_argument(
+        "--n",
+        type=int,
+        default=768,
+        help="output dim of the GEMM for --random-weight (down_proj: hidden_size / TP)",
+    )
     parser.add_argument("--group-size", type=int, default=32, help="MX group size (W8A8_MXFP8: 32)")
     parser.add_argument("--token", type=int, default=None, help="report this token's row in both layouts")
     args = parser.parse_args(argv)
@@ -138,38 +179,62 @@ def main(argv: list[str] | None = None) -> int:
     rows_b, rows_c = _row_map(sides[0]), _row_map(sides[1])
     common = sorted(set(rows_b) & set(rows_c))
     moved = [tok for tok in common if rows_b[tok] != rows_c[tok]]
+    # ``positions`` are KV-cache slots, not token indices: a request whose block
+    # table starts at block 1 has slot = token + 128 (HANDOVER §6.4).  Both layouts
+    # share the request's block table, so a common base turns them into natural
+    # token indices and makes the printed numbers mean what they say.
+    base = min(common) if common else 0
     print(
-        f"[repro] compared tokens={len(common)} | 行号发生变化={len(moved)}"
-        f"（B 与 C 的 token→行号映射不同，正是本脚本要复现的东西）"
+        f"[repro] compared tokens={len(common)} (slot base={base}，下面按 slot-base 打印 token 序号) "
+        f"| 行号发生变化={len(moved)}（B 与 C 的 token→行号映射不同，正是本脚本要复现的东西）"
     )
     for token in moved[:5]:
-        print(f"[repro]   token {token}: row_B={rows_b[token]} row_C={rows_c[token]}")
-    if args.token is not None:
         print(
-            f"[repro] token {args.token}: row_B={rows_b.get(args.token)} row_C={rows_c.get(args.token)}"
+            f"[repro]   token {token - base} (slot {token}): "
+            f"row_B={rows_b[token]} row_C={rows_c[token]}"
+        )
+    if args.token is not None:
+        slot = args.token + base
+        print(
+            f"[repro] token {args.token} (slot {slot}): "
+            f"row_B={rows_b.get(slot)} row_C={rows_c.get(slot)}"
         )
 
     if not args.run_op:
-        print("[repro] 只看数据到此为止；加 --run-op 在 NPU 上重跑这个 GEMM（需要 w dump）")
+        print(
+            "[repro] 只看数据到此为止；加 --run-op 在 NPU 上重跑这个 GEMM"
+            "（优先用同层 w dump；没有就 --random-weight + --n <输出维>）"
+        )
         return 0
 
     wpath, wpayload = _latest(args.dir, "w", args.layer, 1, args.rank)
     if wpayload is None:
         wpath, wpayload = _latest(args.dir, "w", args.layer, 0, args.rank)
-    if wpayload is None:
+    weight_scale = None
+    if wpayload is not None:
+        weight = wpayload.get("weight")
+        weight_scale = wpayload.get("weight_scale")
+        print(
+            f"[repro] weight: {os.path.basename(wpath)} {tuple(weight.shape)} {weight.dtype} | "
+            f"scale={None if weight_scale is None else tuple(weight_scale.shape)}"
+        )
+    elif args.random_weight:
+        # No w dump (it is only written from bf1fa116a on): a same-shaped random
+        # weight still answers "does this op care about the row order", and it needs
+        # no extra round.
+        try:
+            weight, weight_scale = _random_weight(args, sides[1]["q"])
+        except Exception as exc:  # noqa: BLE001
+            print(f"[repro] 随机权重构造失败: {type(exc).__name__}: {exc}", file=sys.stderr)
+            return 2
+    else:
         print(
             "[repro] 找不到 w dump（该层的 weight/weight_scale）。"
-            "请用含 qin:<层> 的 spec 再跑一轮（rank 0 会多写一个 w_*.pt），"
-            "或在离线复现里改用同形状的随机权重。",
+            "用含 qin:<层> 的 spec 再跑一轮（rank 0 会多写一个 w_*.pt），"
+            "或加 --random-weight --n <down_proj 输出维> 用同形状随机权重直接试。",
             file=sys.stderr,
         )
         return 2
-    weight = wpayload.get("weight")
-    weight_scale = wpayload.get("weight_scale")
-    print(
-        f"[repro] weight: {os.path.basename(wpath)} {tuple(weight.shape)} {weight.dtype} | "
-        f"scale={None if weight_scale is None else tuple(weight_scale.shape)}"
-    )
 
     try:
         out_b = _run_op(args, sides[0]["q"], sides[0]["s"], weight, weight_scale)
@@ -196,12 +261,18 @@ def main(argv: list[str] | None = None) -> int:
         for index in where:
             token = tokens[index]
             print(
-                f"[repro]   token {token}: row_B={rows_b[token]} row_C={rows_c[token]} "
-                f"max|d|={float(per_token[index]):.3e}"
+                f"[repro]   token {token - base} (slot {token}): "
+                f"row_B={rows_b[token]} row_C={rows_c[token]} max|d|={float(per_token[index]):.3e}"
             )
-        print("[repro] RESULT: 行序相关（同一个 token 的行换位置后结果就变）⇒ 最小复现成立")
+        print(
+            "[repro] RESULT: 该 op 与行序相关（同一个 token 的行换个位置结果就变）⇒ 最小复现成立；"
+            "接下来在模型里避免这种行序（或报给算子侧）"
+        )
     else:
-        print("[repro] RESULT: 该 op 在这个调用形状下与行序无关 ⇒ 差异不在 matmul，往归约/后续算子查")
+        print(
+            "[repro] RESULT: 该 op 在这个调用形状下与行序无关 ⇒ 差异不在 matmul，"
+            "往紧随其后的 tensor_model_parallel_reduce_scatter / LSE 归约查"
+        )
     return 1 if differing else 0
 
 
