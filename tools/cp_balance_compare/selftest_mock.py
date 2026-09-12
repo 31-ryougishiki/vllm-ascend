@@ -530,6 +530,28 @@ def test_check_zigzag_kv_skips_truncated_dumps() -> None:
         shutil.rmtree(out, ignore_errors=True)
 
 
+def test_cp_balance_code_path_logic_suite() -> None:
+    """The CPU-only replacement for another remote operator-hunt round.
+
+    The remote dumps can tell *where* two layouts first differ, but not why a
+    collective is not token-order invariant.  This suite models the reduction
+    ownership permutation offline and asserts the fixed-order helper is wired
+    where the precision divergence is born; it finishes in milliseconds and
+    needs no NPU.
+    """
+    proc = subprocess.run(
+        [sys.executable, str(HERE / "selftest_cp_logic.py")],
+        capture_output=True,
+        text=True,
+        timeout=120,
+    )
+    if proc.stdout:
+        print(proc.stdout.rstrip())
+    if proc.stderr:
+        print(proc.stderr.rstrip(), file=sys.stderr)
+    assert proc.returncode == 0, "cp_balance code-path logic suite failed"
+
+
 def test_cp_balance_modules_use_only_defined_names() -> None:
     """Every name a function loads must be definable: local, closure, module, builtin.
 

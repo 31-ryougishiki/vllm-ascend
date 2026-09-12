@@ -1,5 +1,45 @@
 # cp_balance 精度问题 —— 交接说明
 
+> ## 2026-09-13 最新结论（先读这一节，遇到与下文冲突以本节为准）
+>
+> **根因**：v3 把整个模型边界改成 zigzag 局部序后，down_proj 之后的
+> `tensor_model_parallel_reduce_scatter` 的 token **归属 rank（Chunk owner）**
+> 也随之改变。HCCL ReduceScatter 的累加顺序是 owner 的一部分，因此即使每个 rank
+> 的逐 token partial（量化、GEMM 已逐位验证相同）完全一致，同一个 token 换一个
+> owner 也可能被舍入成不同的 bf16。`HCCL_DETERMINISTIC=strict` 能让 L2048 逐位
+> 相同，正是这条机制的对照实验；它不是某个算子算错。
+>
+> **为什么大量 A/B 轮次定位不到**：所有逐 token 算子都行序无关，dump 只能看到
+> 在 reduce 之后先不等；继续换层、换站点、换量化只会得到同一形状的结论。每个
+> NPU 轮还叠加了进程级和通信算法级噪声，以及 ragged 长度下 B/C padded M 不同
+> （旧实现按 `2*cp_size` 补，连续基线按 `cp_size` 补）的第二个变量，于是轮次之间
+> 互相矛盾。
+>
+> **修复**（本提交）：
+> 1. zigzag 补长改为与连续切片相同的 `cp_size` 对齐（每序列仍是 `2*cp_size`
+>    块，remainder 由 max-flow 分给各 rank，本地行数仍然相等）B/C 的 M 相同，
+>    不再污染 GEMM/SFA 的 tiling 对照。
+> 2. DSA-CP 的 TP reduce-scatter 改用 `all_to_all_single` +
+>    `fixed_order_rank_sum`（公共 helper 在 `distributed/utils.py`）：按 source
+>    rank `0..cp_size-1` 固定顺序求和，token 结果只由 token 自身决定，与它落在哪个
+>    rank chunk 无关。`SequenceRowParallelOp`（dense down_proj）、`MLPRowParallelOp`
+>    以及 MoE finalize 的 `maybe_pad_and_reduce` 都走同一条路径。
+>
+>  固定顺序归约对 **B 和 C 同时生效**（这是为了两边逐位一致），所以旧轮次
+> `summary.json` 里的 B 基线不能再和新轮的 C 直接比；新提交下要重新跑一轮 B/C。
+>
+> **新测试方法（先跑，替代再扫一轮模型）**：
+>
+> ```bash
+> python tools/cp_balance_compare/selftest_cp_logic.py       # 秒级，CPU，无需 NPU
+> python tools/cp_balance_compare/selftest_mock.py           # 全量 CPU 自测（含上一行）
+> ```
+>
+> 判据：`[logic] PASS ... owner-ordered diffs>0 ... fixed-order diffs=0 ...` 和
+> `[logic] PASS source wiring: ...`，以及 `SELFTEST OK`。CPU 自测通过后再跑 NPU
+> 只做一次端到端确认，不再为了找坏算子扫层/扫 rank。下文各节是历史证据链
+> 与工具说明，其中下一步类文字均已被本节取代。
+
 > **接手先做三件事**：① 读 §1（现状与结论）与 §2（已排除什么）；② 跑一次
 > `python tools/cp_balance_compare/selftest_mock.py`，末行 `SELFTEST OK`；③ 与对方对齐版本——
 > 远端跑 `python tools/cp_balance_compare/selfcheck.py --fingerprint`，末行 `[fp]` 必须与本机一致（见 §6.1）。
@@ -416,7 +456,7 @@ python tools/cp_balance_compare/check_zigzag_dumps.py --dir "$DIR" \
 
 | 目的 | 命令 | 判据 |
 | --- | --- | --- |
-| CPU 自测（改完代码必跑） | `python tools/cp_balance_compare/selftest_mock.py` | 每项 `[run]`/`[ok] …(Ns)`，末行 `SELFTEST OK`（60 项）；卡住时最后一行 `[run]` 就是卡住的用例，90s 后自动超时并打栈；慢 bash 站点自动 `[skip]` 4 个 launcher 用例（`--only/--skip` 可覆盖） |
+| CPU 自测（改完代码必跑） | `python tools/cp_balance_compare/selftest_mock.py` | 每项 `[run]`/`[ok] …(Ns)`，末行 `SELFTEST OK`（61 项）；卡住时最后一行 `[run]` 就是卡住的用例，90s 后自动超时并打栈；慢 bash 站点自动 `[skip]` 4 个 launcher 用例（`--only/--skip` 可覆盖） |
 | 版本指纹（无 git） | `python tools/cp_balance_compare/selfcheck.py --fingerprint` | 末行 `[fp] <16 位>` + 文件摘要 + marker OK/MISSING |
 | 环境体检 | `python tools/cp_balance_compare/selfcheck.py` | `[verdict] READY`、无 FAIL |
 | 配置门（不加载模型） | `ab_cp_compare.py --preflight --launcher "bash tools/cp_balance_compare/launcher_glm52_w4a4c8_mxfp4.sh {port}" --cp-size <TP>` | 末行 `[preflight] all configs OK`；查 `[cp-ab]` 指纹 + additional_config + vllm/model/repo/vendor 路径。⚠️ 漏 `--launcher` 会用 `launcher_template.sh` 的占位路径 |

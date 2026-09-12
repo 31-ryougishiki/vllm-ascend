@@ -80,7 +80,7 @@ env_variables: dict[str, Callable[[], Any]] = {
     # Whether to enable zigzag CP balance for DSA prefill (multi-request and
     # radix-cache prefix are supported; every sequence's extend length must be
     # >= 2 * tp_size and the SP-padded token count must be a multiple of
-    # 2 * tp_size; actual prompt length may be non-divisible). Set to 0 to
+    # tp_size; actual prompt length may be non-divisible). Set to 0 to
     # force the original continuous-slice attention path.
     "VLLM_ASCEND_CP_BALANCE": lambda: bool(int(os.getenv("VLLM_ASCEND_CP_BALANCE", "1"))),
     # Minimum number of prefill tokens required before zigzag CP balance is

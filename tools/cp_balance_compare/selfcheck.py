@@ -72,6 +72,7 @@ KEY_FILES = (
     "tools/cp_balance_compare/check_zigzag_dumps.py",
     "tools/cp_balance_compare/run_cp_diag.sh",
     "tools/cp_balance_compare/selftest_mock.py",
+    "tools/cp_balance_compare/selftest_cp_logic.py",
     "tools/cp_balance_compare/repro_row_order.py",
     "tools/cp_balance_compare/launcher_glm52_w4a4c8_mxfp4.sh",
     # Site profiles: switching nodes is an env var, so the *file* has to be part
@@ -80,6 +81,9 @@ KEY_FILES = (
     "vllm_ascend/attention/sfa_v1.py",
     "vllm_ascend/worker/model_runner_v1.py",
     "vllm_ascend/layers/cp_zigzag.py",
+    "vllm_ascend/ops/linear_op.py",
+    "vllm_ascend/ops/register_custom_ops.py",
+    "vllm_ascend/distributed/utils.py",
     "vllm_ascend/envs.py",
     "vllm_ascend/ascend_forward_context.py",
 )
@@ -94,6 +98,14 @@ MARKERS = (
     ("probe 每轮独立目录", "tools/cp_balance_compare/run_cp_diag.sh", "cp_probe/$(date"),
     ("probe2 模式", "tools/cp_balance_compare/run_cp_diag.sh", "probe2"),
     ("未定义名静态检查", "tools/cp_balance_compare/selftest_mock.py", "loads undefined name"),
+    # The precision divergence is born in the row-parallel reduce: cp_balance
+    # moves token rows between the reduce-scatter owners.  These two markers
+    # prove the alignment fix and the fixed-order reduction are in the tree.
+    ("zigzag cp_size 对齐", "vllm_ascend/layers/cp_zigzag.py", "num_tokens_pad % cp_size"),
+    ("固定顺序 reduce", "vllm_ascend/ops/linear_op.py", "fixed_order_reduce_scatter"),
+    ("公共固定顺序 reduce", "vllm_ascend/distributed/utils.py", "def fixed_order_reduce_scatter"),
+    ("MoE 固定顺序 reduce", "vllm_ascend/ops/register_custom_ops.py", "_fixed_order_dsa_cp_reduce_scatter"),
+    ("CPU 代码路径自测", "tools/cp_balance_compare/selftest_cp_logic.py", "owner-ordered diffs"),
     # The reproducer loads dumps on the CPU, so --run-op MUST place its tensors
     # explicitly; without this marker the site cannot tell "the CPU-backend fix is
     # here" from "the file is merely different" and re-runs a round that dies on

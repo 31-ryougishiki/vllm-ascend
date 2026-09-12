@@ -17,6 +17,41 @@
 两条路径 kernel/模型/权重完全相同，**只有 token 排布不同** ⇒ `C−B` 就是 cp_balance 的账；`B2−B`（实测 0.0）给出它必须打败的噪声地板。
 "关 DSA-CP 的 A 锚点"已下线：它走不同代码路径，driver 直接拒绝。
 
+## 一.五、先跑 CPU 代码路径自测（不需要模型 / 不需要 NPU）
+
+远程轮次只能回答"第一个不等的采样点在哪"。这次追到 layer 0 的 `mlp_out`
+后已经证明：**每个逐 token 算子（attention/norm/量化/GEMM）的输入都逐位相同，
+第一个不等发生在 down_proj 之后的 `tensor_model_parallel_reduce_scatter`**。
+继续按"哪个算子算错"去加载模型，是在错误的问题空间里试错。
+
+CPU 代码路径自测会把这条链算清楚，几毫秒完成：
+
+```bash
+python tools/cp_balance_compare/selftest_cp_logic.py
+```
+
+判据：每行 `[logic] PASS`，最后一行 `[logic] PASS source wiring: ...`。
+它做三件事：
+
+1. 用真实 `build_zigzag_plan` 检查 `zigzag_index` / `gather_index` / `inv_gather_index`
+   / 每 rank 行数，并确认 B、C 的 padded M 都只按 `cp_size` 对齐（不再多 pad 一次 `2*cp_size`）；
+2. 用 bf16 模拟 B/C 的 reduce owner 置换：owner 相关的归约顺序会产生不同结果
+   （`owner-ordered diffs > 0`），而按 source-rank 固定顺序求和为 0 差异
+   （`fixed-order diffs == 0`）这正是 `HCCL_DETERMINISTIC=strict` 能压掉 L2048 的原因；
+3. 静态检查修复确实接在 DSA-CP 的 TP reduce 路径上（`SequenceRowParallelOp`、
+   `MLPRowParallelOp`、MoE 的 `maybe_pad_and_reduce`；公共 helper 为
+   `distributed/utils.py::fixed_order_reduce_scatter`）。
+
+>  固定顺序归约对 B/C 同时生效（保证同一 token 的累加顺序一致），因此旧轮次 B 的
+> 数字不能和新轮 C 直接比较；修复后要用同一提交重新跑一轮 B/C。
+
+`selftest_mock.py` 已把上述自测包成 `test_cp_balance_code_path_logic_suite`，
+所以日常只跑 `python tools/cp_balance_compare/selftest_mock.py` 即可，**不要**再用
+A/B 轮次去代替它。
+
+> 只有 CPU 自测通过后，才需要为了验证真实 kernel / 通信库行为跑 NPU 轮；每轮只在一个
+> 明确修复点上确认，不再扫层、不再逐 token 到处找"第一个坏算子"。
+
 ## 二、工作流程
 
 ```
@@ -45,7 +80,8 @@
 | `check_zigzag_dumps.py` | CPU 侧判读 dump（`kv` / `topk` / `act`，见 §五） | 否 |
 | `repro_row_order.py` | 离线复现"同一 token 的行换个位置结果就变"：读一轮的 `dnq`/`guq` dump（+ 同层**同 op** 的 `w` 权重 dump，按 `op` 选）重跑量化 GEMM，比较两种行序下同一 token 的输出。**按 dump 的 `q` dtype 自动选调用形状**（`--scheme auto\|mxfp8\|int8`）：`int8`（A3 / W8A8_DYNAMIC：int8 激活 + 每 token fp32 scale）或 `mxfp8`（A5：fp8 + e8m0 MX scale）。⚠️ `--random-weight` 时 `--n` 是**该层输出维**（行并行 down_proj = hidden_size = 6144，**不是** hidden/tp）且必须显式给出。`--all-ranks` 扫全部有 dump 的 TP rank（`w` 只有 rank 0），`--tp-size N` 做覆盖检查——缺 rank 会显式告警；`--device`（默认 `npu:0`）决定算子跑在哪张卡 | 否（`--run-op` 需要 NPU） |
 | `compare_cp_rounds.py` | 把多轮 `summary.json` 并排，回答"改了某个变量后 `C−B` 是否回到噪声级" | 否 |
-| `mock_vllm_server.py` / `selftest_mock.py` | 假 server + CPU 自测（60 项：协议解析、指纹/payload、dump 判读、复现器设备/全 rank/NZ 重放/方案分派/按 op 取权重、HCCL 确定性接线、站点档案切换、站点 rc 覆盖后的 env re-assert、w dump 的 NZ 兜底、launcher 静态检查、端到端）。逐项打印 `[run]`/`[ok] … (耗时)`，单项 90s 超时（Linux 下 SIGALRM + faulthandler 打印卡住的栈），失败不中止整轮；支持 `--list`、`--only <子串>`、`--skip launcher,preflight`、`--test-timeout N`。**每次 `bash` 启动 >2s 的机器**（重 `BASH_ENV`/慢挂载）会自动跳过 4 个起 launcher 的用例并说明原因（要强制跑用 `--only`） | 否 |
+| `selftest_cp_logic.py` | **CPU 代码路径自测（先跑这个）**：真实 `build_zigzag_plan` 不变量、B/C padded M 对齐、reduce owner 置换 + bf16 定序求和证明、修复接线静态检查 | 否 |
+| `mock_vllm_server.py` / `selftest_mock.py` | 假 server + CPU 自测（61 项：协议解析、指纹/payload、dump 判读、复现器设备/全 rank/NZ 重放/方案分派/按 op 取权重、HCCL 确定性接线、站点档案切换、站点 rc 覆盖后的 env re-assert、w dump 的 NZ 兜底、launcher 静态检查、端到端）。逐项打印 `[run]`/`[ok] … (耗时)`，单项 90s 超时（Linux 下 SIGALRM + faulthandler 打印卡住的栈），失败不中止整轮；支持 `--list`、`--only <子串>`、`--skip launcher,preflight`、`--test-timeout N`。**每次 `bash` 启动 >2s 的机器**（重 `BASH_ENV`/慢挂载）会自动跳过 4 个起 launcher 的用例并说明原因（要强制跑用 `--only`） | 否 |
 | `selfcheck.py` | 环境体检（解释器/依赖/import 来源/NPU/端口/磁盘/残留进程）+ **不依赖 git 的版本指纹**（`--fingerprint`：关键文件 sha256 + 修复标记 + 用例数，末行 `[fp] …` 贴回来即可对齐版本）+ 跑一遍自测 + `--collect` 收整轮证据。**不做**配置门与命令预演——那两件事由 `ab_cp_compare.py --preflight` 与 `run_cp_diag.sh <mode> --dry-run` 负责（每轮都会跑，不会腐化） | 否 |
 | `prepare_env.sh` | 一次性 `source` 站点 rc + vendor 环境并 `export CP_AB_SKIP_SOURCE=1`，省掉每轮两次 source；**必须 source** | 否 |
 

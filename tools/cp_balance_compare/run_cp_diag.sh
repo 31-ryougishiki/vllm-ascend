@@ -10,6 +10,9 @@
 #   bash tools/cp_balance_compare/run_cp_diag.sh list       # 只打印将要执行的命令
 #   加 --no-repeat 可跳过 B2（等价于 REPEAT_A=0）
 #
+# 真跑前会先执行 CPU code-path gate（tools/cp_balance_compare/selftest_cp_logic.py）：
+# 布局/对齐/固定顺序归约任一不通过就直接退出 4，不再花 20+ 分钟加载模型。
+#
 # 可覆盖的环境变量：
 #   LAUNCHER     默认 bash tools/cp_balance_compare/launcher_glm52_w4a4c8_mxfp4.sh {port}
 #   CP_AB_SITE   站点档案（sites.sh）：its = A3 7.246.78.75/16 卡（默认）；share = 141.61.133.104/8 卡。
@@ -290,6 +293,16 @@ if [[ "${dry_run}" == true ]]; then
   printf '  # 与另一轮并排比较（把 <round1>/<round2> 换成 $OUT_ROOT 下的目录名）：\n'
   printf '  python %q <round1>=%s/<round1> <round2>=%s/<round2>\n' "${comparer}" "${out_root}" "${out_root}"
   exit 0
+fi
+
+# CPU code-path gate: a mismatch in the zigzag plan / padding alignment / fixed
+# reduction wiring can never be found by another model load, so fail before
+# spending 20+ minutes on the NPU.  ``selftest_cp_logic.py`` runs in
+# milliseconds and prints one [logic] line per checked property.
+if ! python tools/cp_balance_compare/selftest_cp_logic.py; then
+  echo "[run_cp_diag] ERROR: CPU code-path gate failed; a remote A/B round cannot fix a layout/reduction mismatch." >&2
+  echo "[run_cp_diag]        先把上面的 selftest_cp_logic.py 输出贴回来，不要继续加载模型。" >&2
+  exit 4
 fi
 
 # 一轮 = 2~3 次模型加载，先把已有 dump 归档，避免和上一轮混淆

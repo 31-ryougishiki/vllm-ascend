@@ -575,7 +575,7 @@ class DSACPContext:
     zigzag_index: torch.Tensor | None = None
     zigzag_gather_index: torch.Tensor | None = None
     inv_gather_index: torch.Tensor | None = None
-    # Real (non-padding) rows when num_tokens was SP-padded to 2 * cp_size.
+    # Real (non-padding) rows when num_tokens was SP-padded to cp_size.
     # zigzag_actual_gather_index[i] is the natural slot of the i-th real row
     # in gather order; zigzag_actual_rows[i] is that row's position in the
     # all-gathered tensor.  Without padding, actual_gather_index aliases
@@ -676,11 +676,12 @@ def _build_zigzag_meta(
 ) -> dict[str, Any]:
     """Build device-side zigzag metadata for a multi-request prefill batch.
 
-    Every sequence is split into ``2 * cp_size`` blocks independently.  The
-    block sizes are balanced so each rank owns exactly ``num_tokens / cp_size``
-    local tokens, which keeps all FlashComm collectives equal-shaped.  For the
-    legacy single-request aligned case the layout is identical to SGLang's
-    head/tail zigzag pairing.
+    Every sequence is split into ``2 * cp_size`` blocks independently (a
+    head/tail pair per rank).  The block sizes are balanced so each rank owns
+    exactly ``num_tokens / cp_size`` local tokens, which keeps all FlashComm
+    collectives equal-shaped.  The padded length only has to be a multiple of
+    ``cp_size``; for uniform single-request lengths this is the same SGLang
+    head/tail layout.
 
     ``query_lens`` are the per-request scheduled token counts; ``prefix_lens``
     are radix-cache / chunked-prefill prefix lengths that get added to the
@@ -1044,8 +1045,8 @@ class AscendSFAMetadataBuilder(MLACommonMetadataBuilder[AscendSFAMetadata]):
             # path cos/sin can then be generated directly for the rank-local
             # [prev_block, next_block] positions instead of materializing the
             # full padded table and gathering from it.  The same predicate
-            # drives the model runner's 2 * tp padding, so the two sides
-            # cannot disagree.  SFA C8 is no longer a hard requirement: both
+            # drives the model runner's padding, so the two sides cannot
+            # disagree.  SFA C8 is no longer a hard requirement: both
             # C8 and non-C8 DSA-CP KV/indexer writers use the reordered slot
             # mapping below.
             zigzag = None

@@ -5,8 +5,11 @@ These helpers mirror SGLang's NPU legacy DSA-CP flow at the model boundary:
 * the full natural-order embedding/positions tensor is sharded once into the
   rank-local ``[prev_blocks_of_all_seqs, next_blocks_of_all_seqs]`` layout;
 * all FlashComm collectives keep the same local order because they are
-  rank-concatenating all-gather / reduce-scatter pairs (token order inside a
-  GEMM/norm/MoE token-wise pass is irrelevant);
+  rank-concatenating all-gather / reduce-scatter pairs.  The reduce-scatter
+  below (``linear_op.SequenceRowParallelOp``) must sum per-token partials in a
+  fixed source-rank order: under a ring HCCL ReduceScatter the rounding is a
+  property of the owner chunk, and zigzag CP deliberately changes which rank
+  owns a token;
 * the local output is gathered once at the model boundary and reranged back
   to natural token order for logits.
 
@@ -53,6 +56,33 @@ def get_zigzag_cp_context():
         return _EXTRA_CTX.zigzag_cp_context
     except Exception:
         return None
+
+
+def fixed_order_rank_sum(parts: Sequence[torch.Tensor]) -> torch.Tensor:
+    """Sum one tensor per TP source rank in a fixed, layout-independent order.
+
+    FlashComm row-parallel reductions return the reduced chunk owned by the
+    local rank.  On HCCL the accumulation order inside ``ReduceScatter`` is a
+    property of the *owner chunk*, so permuting token rows between ranks (which
+    is exactly what zigzag CP balance does) changes the rounding of an
+    otherwise per-token identical result.  This helper is the local half of the
+    fix: sum the same per-token partials in source-rank order for every owner,
+    never in an owner-dependent order.
+
+    The row order of every tensor in ``parts`` must be identical.  A clone is
+    accumulated so the caller's buffers stay intact.
+    """
+    if not parts:
+        raise ValueError("fixed_order_rank_sum requires at least one part")
+    result = parts[0].clone()
+    for source_rank, part in enumerate(parts[1:], start=1):
+        if part.shape != result.shape:
+            raise ValueError(
+                "fixed_order_rank_sum shape mismatch at source rank "
+                f"{source_rank}: {tuple(part.shape)} != {tuple(result.shape)}"
+            )
+        result.add_(part)
+    return result
 
 
 def zigzag_reorder_moe_aux(x: torch.Tensor, ctx=None) -> torch.Tensor:
@@ -237,10 +267,10 @@ def _allocate_remainder_extras(
     of the SGLang zigzag layout.
 
     A tiny aggregate max-flow produces pair capacities and the rows are then
-    decomposed deterministically.  If the aggregate flow were ever
-    infeasible (the total number of extra blocks is always divisible by
-    ``cp_size`` for a ``2 * cp_size`` aligned batch), the caller falls back
-    to an exact per-row flow.
+    decomposed deterministically.  When the padded batch length is a multiple
+    of ``cp_size`` the total number of extra blocks is divisible by
+    ``cp_size``; if an individual sequence makes the aggregate flow
+    infeasible, the caller falls back to an exact per-row flow.
     """
     total_extra = sum(remainders)
     if total_extra % cp_size != 0:
@@ -419,10 +449,17 @@ def build_zigzag_plan(
     if cp_size <= 1:
         raise ValueError("zigzag plan requires cp_size > 1")
     segment_num = 2 * cp_size
-    if num_tokens_pad % segment_num != 0:
+    # Balanced local rows only need ``num_tokens_pad % cp_size == 0``.  The
+    # extra head/tail blocks are distributed by ``_allocate_remainder_extras``,
+    # so a batch whose real length is aligned to ``cp_size`` (exactly what the
+    # continuous-slice path already pads to) can stay on the zigzag path
+    # without changing the collective shape between B and C.  Requiring
+    # ``2 * cp_size`` here forced an extra 32-token pad that made the two
+    # layouts feed different M to every FlashComm GEMM / SFA call.
+    if num_tokens_pad % cp_size != 0:
         raise ValueError(
-            f"zigzag padded length must be a multiple of 2 * cp_size = "
-            f"{segment_num}, got {num_tokens_pad}"
+            f"zigzag padded length must be a multiple of cp_size = "
+            f"{cp_size}, got {num_tokens_pad}"
         )
     if num_actual_tokens is None:
         num_actual_tokens = sum(query_lens)
@@ -588,10 +625,11 @@ def can_enable_zigzag_for_batch(
 ) -> bool:
     """The single source of truth for whether a batch may use zigzag CP.
 
-    Both ``NPUModelRunner._pad_for_sequence_parallelism`` and
-    ``AscendSFAMetadataBuilder`` must call this predicate so the SP padding
-    alignment (``tp_size`` vs ``2 * tp_size``) and the attention layout can
-    never disagree.
+    ``AscendSFAMetadataBuilder`` calls this predicate before switching a batch
+    to the zigzag layout.  The model runner only pads to ``cp_size`` (the same
+    alignment the continuous path uses); the per-sequence head/tail remainder
+    distribution keeps every rank's local row count equal, so the two sides
+    stay consistent without a second padding rule.
 
     SGLang guards every sequence with ``extend_len >= 2 * cp_size``; we keep
     that guard for multi-request batches as well.
@@ -637,7 +675,11 @@ def can_enable_zigzag_for_batch(
         return False
     if num_actual_tokens < ascend_envs.VLLM_ASCEND_CP_BALANCE_MIN_TOKENS:
         return False
-    if num_tokens_pad % (2 * cp_size) != 0:
+    # ``cp_size`` alignment is enough: every rank still owns exactly
+    # ``num_tokens_pad / cp_size`` rows because the remainder extras are
+    # distributed per rank.  Keeping the same alignment as the continuous
+    # path is what prevents an M-shape difference between B and C.
+    if num_tokens_pad % cp_size != 0:
         return False
 
     if is_prefilling is None:

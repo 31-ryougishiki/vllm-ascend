@@ -74,7 +74,7 @@ def test_can_zigzag_supports_multi_request_pure_prefill():
         )
         # One sequence shorter than 2 * cp_size falls back, mirroring SGLang.
         assert not _can_zigzag(
-            states[0], 16, 16, 2, [12, 4], [0, 0], num_actual_tokens=16
+            states[0], 16, 16, 2, [13, 3], [0, 0], num_actual_tokens=16
         )
         # Decode / mixed batches never enable zigzag.
         assert not _can_zigzag(
@@ -150,13 +150,18 @@ def test_can_zigzag_supports_prefix_hit_and_non_divisible_prompt():
             [True, True],
             num_actual_tokens=12,
         )
-        # actual 18 tokens, SP-padded to 20 = 2 * cp_size * 5.
+        # actual 18 tokens already sits on a cp_size (2) boundary, so it is
+        # eligible without the old 2 * cp_size-only pad.
         assert _can_zigzag(
             states[0], 20, 20, 2, [18], [0], [True], num_actual_tokens=18
         )
-        # Padded length itself must stay 2 * cp_size aligned.
-        assert not _can_zigzag(
+        assert _can_zigzag(
             states[0], 18, 18, 2, [18], [0], num_actual_tokens=18
+        )
+        # Padded length itself still has to be cp_size aligned (19 cannot be
+        # balanced across two ranks).
+        assert not _can_zigzag(
+            states[0], 19, 19, 2, [19], [0], num_actual_tokens=19
         )
         # Negative prefix is invalid metadata.
         assert not _can_zigzag(
@@ -189,6 +194,37 @@ def test_build_zigzag_meta_matches_sglang_zigzag_layout():
     torch.testing.assert_close(
         rank0["actual_seq_lengths_key_zigzag"],
         torch.tensor([4, 16], dtype=torch.int32),
+    )
+
+
+def test_build_zigzag_meta_accepts_cp_size_aligned_non_2cp_padding():
+    # The continuous path pads to cp_size.  A 2 * cp_size-only requirement
+    # would make B and C feed different M to every FlashComm GEMM/SFA call for
+    # prompts like this; the remainder distribution can still balance the
+    # local rows.
+    metas = [
+        _build_zigzag_meta(18, 2, rank, [18], [0], torch.device("cpu"))
+        for rank in range(2)
+    ]
+    for rank, meta in enumerate(metas):
+        assert meta["zigzag_index"].shape[0] == 9
+        assert meta["total_q_prev_tokens"] + meta["total_q_next_tokens"] == 9
+    # The padded length is only cp_size aligned (18 % 4 != 0).
+    torch.testing.assert_close(
+        metas[0]["zigzag_index"],
+        torch.tensor([0, 1, 2, 3, 4, 14, 15, 16, 17]),
+    )
+    torch.testing.assert_close(
+        metas[1]["zigzag_index"],
+        torch.tensor([5, 6, 7, 8, 9, 10, 11, 12, 13]),
+    )
+    torch.testing.assert_close(
+        metas[0]["zigzag_gather_index"],
+        torch.tensor([0, 1, 2, 3, 4, 14, 15, 16, 17, 5, 6, 7, 8, 9, 10, 11, 12, 13]),
+    )
+    torch.testing.assert_close(
+        metas[0]["zigzag_gather_index"][metas[0]["inv_gather_index"]],
+        torch.arange(18),
     )
 
 
@@ -272,7 +308,7 @@ def test_build_zigzag_meta_balances_uneven_remainders():
     query_lens = [37, 19, 17, 22, 14, 34, 31, 10]
     cp_size = 4
     segment_num = 2 * cp_size
-    num_tokens_pad = 184  # sum(query_lens), already 2 * cp aligned
+    num_tokens_pad = 184  # sum(query_lens), already cp_size aligned
     metas = [
         _build_zigzag_meta(
             num_tokens_pad,
