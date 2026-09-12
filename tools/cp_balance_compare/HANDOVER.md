@@ -34,8 +34,8 @@ in ─attn─▶ out ─norm─▶ mlp_in ─[量化]─▶ gu_q ─gate_up─�
 * **`gu_q` / `dn_q` 逐位相同**（各 2048 个 token 全等）⇒ 两个 GEMM 的**量化输入**在 B/C 下完全一致；
   这也顺带证明"按行 MX 量化与排布无关"，以及 `qin` 的位置键（gather 序 → 自然 token）是对的。
 * `mlp_out` 仍差（`max|d|=9.766e-04`，`rel=7.52e-03`，首个分歧在 token 256 = 第 2 个 zigzag 块）。
-* **`gu_out`/`dn_in` 两行为空**：不是 spec 问题，是旧 `_positions` 只认 rank 本地行、把 all-gather 后的
-  2048 行采样静默跳过（**已修**，见 §5.1 的告警说明）。
+* **`gu_out`/`dn_in` 两行为空**：真因是文件 kind 拼错（`gugu_out_*.pt`/`dndn_in_*.pt`，
+  判读器不认识 ⇒ 静默丢弃），**已修且判读器已兼容旧名** ⇒ 同一目录重跑判读即可补齐这两格。
 * ⚠️ 这一轮把 dump 写进了共用的 `/root/cp_probe`，判读提示 `272 older dump(s) ignored`
   且表里出现 layer 2（新 spec 已不打 layer 2）⇒ **该表可能混了上一轮的旧文件**；
   判读器现在会打印"选中 dump 时间跨度"，`probe` 也改成每轮一个 `<时间戳>` 子目录。
@@ -128,7 +128,8 @@ KV 写 slot 映射、attention/indexer 调用形状、模型边界 gather/rerang
 | MoE aux 重排（`input_ids`/`mc2_mask`） | `ascend_forward_context.set_ascend_forward_context` + `cp_zigzag.zigzag_reorder_moe_aux` |
 | MLP 边界打点（**在本仓库内**可行的挂钩方式；模型代码在 site-packages 里） | `vllm_ascend/worker/model_runner_v1.py::_install_cp_balance_mlp_dumps`（按模块名 `layers.<L>.mlp[.gate_up_proj\|.down_proj]` 挂 forward hook） |
 | 量化输入打点（`qin:<层>`：两个 MLP GEMM 实际吃到的 fp8 + e8m0 scale） | `vllm_ascend/worker/model_runner_v1.py::_install_cp_balance_quant_dumps`（按层包住 `AscendLinearMethod.apply`：元组走融合分支直接 dump，否则在该次 `apply` 内拦截 `npu_dynamic_mx_quant`/`npu_dynamic_quant`） |
-| 采样点位置键（两种布局共用） | `vllm_ascend/worker/model_runner_v1.py::_cp_balance_dump_positions`：rank 本地行用 `slot_mapping_cp`；all-gather 后的行按 `zigzag_gather_index`（C）或自然序（B）取自然 slot mapping。**旧版只认本地行 ⇒ `gu_out`/`dn_in` 被静默跳过** |
+| 采样点位置键（两种布局共用） | `vllm_ascend/worker/model_runner_v1.py::_cp_balance_dump_positions`：rank 本地行用 `slot_mapping_cp`；all-gather 后的行按 `zigzag_gather_index`（C）或自然序（B）取自然 slot mapping。**旧版只认本地行 ⇒ gather 行的采样会被跳过** | 
+| dump 文件 kind | MLP hook 的 `trace_targets` 显式携带（`mlpin`/`mlpout`/`guout`/`dnin`）。**旧版用 `kind_prefix + op` 拼出 `gugu_out`/`dndn_in`，判读器不认识 ⇒ 两轮静默丢行**；判读器现兼容旧名，且对任何解析不了的文件名告警一次 |
 | ⚠️ 误导项 | `vllm_ascend/patch/worker/patch_deepseek_v2.py` 里的 `_zigzag_layer_forward` / `_patched_forward` **对本模型不生效**：它 patch 的是 `DeepseekV2DecoderLayer/Model`，而本模型用 `DeepseekV32DecoderLayer/Model`（无继承关系） |
 
 ## 3. 已确认的事实（带数字，可直接引用）
@@ -254,11 +255,15 @@ python tools/cp_balance_compare/check_zigzag_dumps.py --dir /root/cp_probe/<时�
 | `dn_q` | **silu 之后的量化** | 激活量化实现与融合 |
 | `mlp_out`（且 `dn_q` 相同） | **`down_proj` 的 GEMM**（含跨 rank 归约）：输入逐位相同却给出不同输出 | 离线行置换实验 + `--configs C,C2` 确定性对照 |
 
-⚠️ **`gu_out`/`dn_in` 曾经两轮都缺**：它们是 all-gather 后的 2048 行张量，而旧的 `_positions`
-只认 rank 本地行（`slot_mapping_cp` 只有 256 项）⇒ 采样被静默跳过。现已统一为
-`_cp_balance_dump_positions`（本地行用 `slot_mapping_cp`，gather 行按 `[r0_prev, r0_next, …]`
-或自然序取自然 slot），payload 里带 `rows`/`positions_from` 可审计。所以本轮起 layer 0
-应当**八行齐全**（除非该点输入是融合量化元组 → `dn_in` 由 `dn_q` 顶替）。
+⚠️ **`gu_out`/`dn_in` 曾经两轮都缺，真因是文件 kind 拼错**：MLP hook 用
+`kind_prefix + op` 生成文件名，而这两个 op 名自带前缀 ⇒ 写出来的是
+**`gugu_out_*.pt` / `dndn_in_*.pt`**，判读器的文件名正则不认识 ⇒ **静默丢弃**
+（既无告警也不进表）。现已：① hook 显式携带文件 kind（`guout`/`dnin`）；
+② 判读器**兼容旧名**，所以已经写出的旧 dump 不必重跑即可判读；
+③ 目录里任何 `*.pt` 只要名字解析不了就**告警一次**，不再静默。
+位置键（`_cp_balance_dump_positions`）是同期修的另一个隐患：rank 本地行用
+`slot_mapping_cp`，all-gather 后的 2048 行按 `zigzag_gather_index`(C)/自然序(B) 取自然
+slot；payload 里带 `rows`/`positions_from` 可审计。
 
 判读器会自己把相邻行合起来给结论：`gu_out` 先不等时，若同层 `gu_q` 也不等就指向量化，
 若 `gu_q` 逐位相同就明确指向 GEMM 内核；spec 没写 `qin:` 时会写明"本层未打点 qin，无法区分"。

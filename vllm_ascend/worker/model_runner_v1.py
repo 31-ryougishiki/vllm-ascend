@@ -3685,41 +3685,45 @@ class NPUModelRunner(GPUModelRunner):
             }
             _zigzag_dump(payload, layer_idx, kind, dump_dir)
 
-        def _make_hook(layer_idx: int, name: str, ops: tuple[tuple[str, str], ...], kind_prefix: str):
-            """One hook per traced module: ``ops`` maps (suffix, op) to a file kind.
+        def _make_hook(layer_idx: int, name: str, ops: tuple[tuple[str, str, str], ...]):
+            """One hook per traced module: ``ops`` is ``(which, op name, file kind)``.
 
             The MLP itself gives ``mlp_in``/``mlp_out``; its two GEMMs split the
             inside into three steps, because the MLP is *per token* math and yet
             its output differs while its input is bit-identical::
 
                 mlp_in --gate_up_proj--> gu_out --act(+quant)--> dn_in --down_proj--> mlp_out
+
+            The file kind is spelled out instead of being derived: concatenating a
+            prefix with the op name produced ``gugu_out``/``dndn_in``, which the
+            reader's file-name pattern does not know, so both samples were written
+            and then silently ignored for two rounds.
             """
 
             def hook(module, args, output):  # noqa: ANN001 - torch hook signature
                 if isinstance(output, tuple):
                     output = output[0] if output else None
-                for suffix, op in ops:
-                    if suffix == "in":
+                for which, op, kind in ops:
+                    if which == "in":
                         if args:
-                            _summarise(name, layer_idx, op, f"{kind_prefix}{op}", args[0])
-                    else:
-                        if output is not None:
-                            _summarise(name, layer_idx, op, f"{kind_prefix}{op}", output)
+                            _summarise(name, layer_idx, op, kind, args[0])
+                    elif output is not None:
+                        _summarise(name, layer_idx, op, kind, output)
 
             return hook
 
-        # (module suffix, [(which, op name)], file-kind prefix)
+        # (module suffix, [(which, op name, dump file kind)])
         trace_targets = (
-            (".mlp", (("in", "in"), ("out", "out")), "mlp"),
-            (".mlp.gate_up_proj", (("out", "gu_out"),), "gu"),
-            (".mlp.down_proj", (("in", "dn_in"),), "dn"),
+            (".mlp", (("in", "mlp_in", "mlpin"), ("out", "mlp_out", "mlpout"))),
+            (".mlp.gate_up_proj", (("out", "gu_out", "guout"),)),
+            (".mlp.down_proj", (("in", "dn_in", "dnin"),)),
         )
         installed = []
         for name, module in self.model.named_modules():
             for layer_idx in layers:
-                for suffix, ops, kind_prefix in trace_targets:
+                for suffix, ops in trace_targets:
                     if name.endswith(f"layers.{layer_idx}{suffix}"):
-                        module.register_forward_hook(_make_hook(layer_idx, name, ops, kind_prefix))
+                        module.register_forward_hook(_make_hook(layer_idx, name, ops))
                         installed.append((layer_idx, name))
         if installed:
             logger.info(

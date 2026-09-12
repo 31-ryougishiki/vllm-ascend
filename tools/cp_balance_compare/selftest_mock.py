@@ -1287,6 +1287,52 @@ def test_check_zigzag_act_points_at_the_round_subdir() -> None:
         shutil.rmtree(out, ignore_errors=True)
 
 
+def test_check_zigzag_act_reads_legacy_dump_names() -> None:
+    """Dumps written under the doubled-prefix names must still be judged.
+
+    ``"gu" + "gu_out"`` produced ``gugu_out_*.pt`` / ``dndn_in_*.pt``: the files
+    existed, the reader's name pattern did not know them, and both sampling points
+    silently vanished from the table for two rounds.  Aliasing the legacy names
+    means an existing round can be judged without re-collecting it -- and an
+    unknown kind must be *reported*, never dropped in silence.
+    """
+    if checker is None:
+        print("[skip] torch not available (check_zigzag_dumps needs it)")
+        return
+    import argparse
+
+    import torch
+
+    out = _temp_dir("cp_ab_legacy_")
+    try:
+        torch.manual_seed(67)
+        base = torch.rand(4, 2).add(0.5).to(torch.bfloat16)
+        shifted = base.clone()
+        shifted[2:] = (shifted[2:].float() + 0.5).to(torch.bfloat16)
+        positions = torch.tensor(list(range(4)), dtype=torch.int32)
+        for cpbal, data in ((0, base), (1, shifted)):
+            for kind in ("gugu_out", "dndn_in"):
+                torch.save(
+                    {"kind": "mlp", "positions": positions, "act": data.clone()},
+                    out / f"{kind}_cpbal{cpbal}_layer0_rank0_pid1_{1000 + cpbal}.pt",
+                )
+        torch.save(
+            {"kind": "mlp", "positions": positions, "act": base.clone()},
+            out / "whatisthis_cpbal0_layer0_rank0_pid1_1000.pt",
+        )
+        buffer, errors = io.StringIO(), io.StringIO()
+        with redirect_stdout(buffer), redirect_stderr(errors):
+            rc = checker.check_act(argparse.Namespace(dir=str(out), summary_only=True, block_size=4))
+        text, errs = buffer.getvalue(), errors.getvalue()
+        assert rc == 1, text + errs
+        ops = [line.split()[2] for line in text.splitlines() if line.startswith("[act]     0 ")]
+        assert ops == ["gu_out", "dn_in"], (ops, text)
+        assert "FIRST DIVERGENCE (act): layer 0 op=gu_out at token 2" in text, text
+        assert "无法解析" in errs and "whatisthis" in errs, errs
+    finally:
+        shutil.rmtree(out, ignore_errors=True)
+
+
 def test_load_prompts_file() -> None:
     out = Path(_temp_dir("cp_ab_pf_"))
     try:

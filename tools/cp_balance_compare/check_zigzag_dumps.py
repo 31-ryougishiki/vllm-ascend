@@ -66,7 +66,8 @@ except ImportError:  # pragma: no cover - the target host always has torch
     raise
 
 NAME_RE = re.compile(
-    r"(?P<kind>topk|kv|actin|actout|mlpin|mlpout|guq|guout|dnin|dnq)_cpbal(?P<cpbal>\d+)_layer(?P<layer>-?\d+)"
+    r"(?P<kind>topk|kv|actin|actout|mlpin|mlpout|gugu_out|dndn_in|guq|guout|dnin|dnq)"
+    r"_cpbal(?P<cpbal>\d+)_layer(?P<layer>-?\d+)"
     r"_rank(?P<rank>\d+)_pid(?P<pid>\d+)_(?P<ts>\d+)\.pt$"
 )
 
@@ -86,6 +87,11 @@ _KIND_GLOBS = {
         "dnin_*.pt",
         "dnq_*.pt",
         "mlpout_*.pt",
+        # Legacy names from the doubled-prefix bug (``"gu" + "gu_out"``): the dumps
+        # were written, never judged.  Kept readable so an existing round's data
+        # does not have to be re-collected.
+        "gugu_out_*.pt",
+        "dndn_in_*.pt",
     ),
 }
 # Row order inside one layer, i.e. the order the numbers flow: the layer input
@@ -114,6 +120,9 @@ _FILE_KIND_OP = {
     "dnin": "dn_in",
     "dnq": "dn_q",
     "mlpout": "mlp_out",
+    # Legacy (doubled-prefix) file names, read as the op they were meant to be.
+    "gugu_out": "gu_out",
+    "dndn_in": "dn_in",
 }
 
 
@@ -202,20 +211,46 @@ def _as_list(value) -> list[int]:
     return []
 
 
+_UNPARSED_SEEN: set[str] = set()
+
+
 def _iter_dumps(dump_dir: str, kind: str):
     """Yield ``(path, meta)`` for every dump of ``kind``.
 
-    ``act`` is one logical kind stored under two file kinds (``actin`` /
-    ``actout``), so it matches both; every other kind matches itself.
+    ``act`` is one logical kind stored under several file kinds (attention in/out,
+    the MLP boundary and the quantized GEMM inputs); every other kind matches
+    itself.  Finally the whole directory is swept once for ``*.pt`` files whose
+    name does not parse: a dump that the reader cannot name must be *reported*, not
+    dropped -- that silence is exactly how the ``gugu_out``/``dndn_in`` naming bug
+    (a doubled prefix) hid two sampling points for two rounds.
     """
     for pattern in _KIND_GLOBS.get(kind, (f"{kind}_*.pt",)):
         for path in sorted(glob.glob(os.path.join(dump_dir, pattern))):
-            match = NAME_RE.search(os.path.basename(path))
+            base = os.path.basename(path)
+            match = NAME_RE.search(base)
             if match is None:
+                _report_unparsed(base)
                 continue
             file_kind = match.group("kind")
             if file_kind == kind or (kind == "act" and file_kind in _FILE_KIND_OP):
                 yield path, match.groupdict()
+
+    for path in sorted(glob.glob(os.path.join(dump_dir, "*.pt"))):
+        base = os.path.basename(path)
+        if NAME_RE.search(base) is None:
+            _report_unparsed(base)
+
+
+def _report_unparsed(base: str) -> None:
+    """Warn once per unrecognised kind token (``<token>_cpbal…``)."""
+    token = base.split("_cpbal", 1)[0]
+    if token in _UNPARSED_SEEN:
+        return
+    _UNPARSED_SEEN.add(token)
+    print(
+        f"[dump] 跳过 {base}：文件名无法解析（kind={token!r} 未注册？）⇒ 这类采样点不会进表",
+        file=sys.stderr,
+    )
 
 
 def _latest_per_server(files, fields: tuple[str, ...] = ("layer", "rank", "cpbal")):
