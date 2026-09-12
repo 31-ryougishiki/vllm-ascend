@@ -426,6 +426,13 @@ def main(argv: list[str] | None = None) -> int:
         help="run the comparison for every TP rank that has dumps in --dir and print a summary "
         "table (the activation dumps are per rank; only rank 0 also has a w dump)",
     )
+    parser.add_argument(
+        "--tp-size",
+        type=int,
+        default=0,
+        help="expected number of TP ranks for the --all-ranks coverage check; 0 = infer it from "
+        "the dumps (highest rank + 1), which cannot see a missing *last* rank",
+    )
     args = parser.parse_args(argv)
 
     if not Path(args.dir).is_dir():
@@ -443,6 +450,23 @@ def main(argv: list[str] | None = None) -> int:
     else:
         ranks = [args.rank]
     quiet = args.all_ranks and len(ranks) > 1
+
+    # Coverage of an --all-ranks sweep: "7 identical" must never read as "all 8
+    # verified" when one rank simply has no dump (site 2026-09-12: rank 0 was
+    # absent from the round's directory and the summary said 7/7).
+    missing_ranks: list[int] = []
+    expected_ranks = 0
+    if args.all_ranks:
+        expected_ranks = args.tp_size or (max(ranks) + 1 if ranks else 0)
+        missing_ranks = [rank for rank in range(expected_ranks) if rank not in ranks]
+        if missing_ranks:
+            how = "--tp-size" if args.tp_size else "按最大 rank 推断"
+            print(
+                f"[repro] 注意: 期望 {expected_ranks} 个 rank（{how}），实际只有 {len(ranks)} 个有 dump；"
+                f"缺 rank {missing_ranks} —— 它们在 {args.dir} 里没有 {args.kind} layer={args.layer} 的"
+                f"两侧 dump（该 rank 可能没跑/失败）。用 --rank R 单独跑，或换一轮的 dump 目录。",
+                file=sys.stderr,
+            )
 
     device = None
     if args.run_op:
@@ -481,16 +505,27 @@ def main(argv: list[str] | None = None) -> int:
         if args.run_op:
             ok = [s for s in summaries if s.get("status") == "identical"]
             moved = [s for s in summaries if s.get("status") == "differs"]
+            covered = (
+                f"{len(summaries)}/{expected_ranks} rank"
+                if expected_ranks and missing_ranks
+                else f"{len(summaries)}/{len(summaries)} rank"
+            )
+            tail = (
+                f"；但 0..{expected_ranks - 1} 中缺 rank {missing_ranks} ⇒ 覆盖不完整，"
+                f"别当成 {expected_ranks}/{expected_ranks}"
+                if missing_ranks
+                else ""
+            )
             if moved:
                 print(
                     f"[repro] RESULT(all-ranks): {len(moved)}/{len(summaries)} rank 上该 op 与行序相关 "
-                    f"(ranks {[s['rank'] for s in moved]}) ⇒ 最小复现成立（在这些 rank 上）"
+                    f"(ranks {[s['rank'] for s in moved]}) ⇒ 最小复现成立（在这些 rank 上）{tail}"
                 )
             elif len(ok) == len(summaries):
                 print(
-                    f"[repro] RESULT(all-ranks): {len(ok)}/{len(summaries)} rank 在该调用形状下与行序无关 "
-                    "⇒ matmul 侧已排除（真实权重仅 rank 0 有，其余 rank 用随机权重）；"
-                    "差异只能出在紧随其后的 tensor_model_parallel_reduce_scatter / LSE 归约"
+                    f"[repro] RESULT(all-ranks): {covered} 在该调用形状下与行序无关 "
+                    f"⇒ matmul 侧已排除（真实权重仅 rank 0 有，其余 rank 用随机权重）；"
+                    f"差异只能出在紧随其后的 tensor_model_parallel_reduce_scatter / LSE 归约{tail}"
                 )
     return max(codes) if codes else 0
 

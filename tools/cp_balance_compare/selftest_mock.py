@@ -1515,21 +1515,28 @@ def test_repro_row_order_all_ranks_covers_every_dumped_rank() -> None:
                     out / f"dnq_cpbal{cpbal}_layer0_rank{rank}_pid1_{2000 + cpbal * 10 + rank}.pt",
                 )
         buffer = io.StringIO()
-        with redirect_stdout(buffer):
+        errors = io.StringIO()
+        with redirect_stdout(buffer), redirect_stderr(errors):
             rc = module.main(
                 [
                     "--dir", str(out), "--layer", "0", "--run-op", "--random-weight",
-                    "--n", "8", "--device", "meta", "--all-ranks",
+                    "--n", "8", "--device", "meta", "--all-ranks", "--tp-size", "3",
                 ]
             )
         text = buffer.getvalue()
+        err = errors.getvalue()
         assert rc == 0, text
         # Each rank gets its own permutation: rank 0 moves 2 of 4 rows, rank 1 all 4.
         assert "行号发生变化=2" in text, text
         assert "行号发生变化=4" in text, text
         assert "rank  0:" in text and "rank  1:" in text, text
         assert "w=random" in text, text
-        assert "2/2 rank 在该调用形状下与行序无关" in text, text
+        # --tp-size 3 with only ranks 0/1 present: the gap must be stated, and the
+        # verdict must not read as "3/3 verified" (site 2026-09-12: rank 0 was
+        # missing from a round and the summary said 7/7 without saying so).
+        assert "缺 rank [2]" in err, err
+        assert "2/3 rank" in text, text
+        assert "覆盖不完整" in text, text
     finally:
         if previous is None:
             sys.modules.pop("torch_npu", None)

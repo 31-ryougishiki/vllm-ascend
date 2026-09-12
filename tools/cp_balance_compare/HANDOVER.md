@@ -56,6 +56,12 @@ in ─attn─▶ out ─norm─▶ mlp_in ─[量化]─▶ gu_q ─gate_up─�
 ```
 
 ⇒ **① 基本排除**（同一调用形状下行序无关），矛头转向 ② 归约。
+
+**2026-09-12 全 rank 扫描（`--all-ranks`，无需加载模型）**：rank **1..7** 全部
+`differing=0/2048 max|d|=0.000e+00`；rank 0 在此前两轮同命令下同样 0。⚠️ 那轮 dump 目录里
+**没有 rank 0 的 `dnq`**，所以工具报的是 `7/7 … 覆盖不完整（缺 rank [0]）`（工具现在会显式告警，
+判词不再写成 N/N）。综合 ⇒ **GEMM 侧在全部 8 个 rank 上都排除**（rank≠0 用同形状随机权重），
+根因锁定在那次跨 rank 归约。
 `mlp_out` 是 **reduce_scatter 之后**的 rank-local 张量（`dn_q` 是 all-gather 后的 2048 行、`gu_q` 是 rank-local），
 所以"GEMM 输入逐位相同 + GEMM 行序无关"留下的唯一去处就是那次跨 rank 归约本身。
 
@@ -257,7 +263,7 @@ python tools/cp_balance_compare/check_zigzag_dumps.py --dir "$DIR" \
 | **归约确定性轮** | `export HCCL_DET=strict; unset DUMP_DIR; bash tools/cp_balance_compare/run_cp_diag.sh probe` | 轮次目录 `r_probe_det`；日志有 `[cp-ab-hccl] … HCCL_DETERMINISTIC=strict LCCL_DETERMINISTIC=1`；与 `r_probe` 并排看是否回噪（README §七） |
 | 判读激活剖面 | `check_zigzag_dumps.py --dir <dir> --kind act --summary-only --block-size 128` | `FIRST DIVERGENCE (act): layer L op=…` + layer 0 八行 + 判词 |
 | 判读索引表 / 全层 KV | `… --kind topk --summary-only` / `export DUMP_DIR=/root/cp_dump; run_cp_diag.sh sweep` → `… --kind kv --summary-only` | `[topk/cross] RESULT: …` / `FIRST DIVERGENCE (fp/value\|fp/bytes): layer L` |
-| **行序复现** | `repro_row_order.py --dir <dir> --layer 0 [--run-op [--random-weight] [--no-nz]] [--all-ranks]` | 数据模式：token→行号置换；`--run-op`：`differing>0` ⇒ 行序相关，最小复现成立；`--all-ranks` 出逐 rank 汇总；权重来源打在 `w=w\|random`（`w->ND` = 该 dump 走了 ND 兜底、已在复现器里重放 NZ） |
+| **行序复现** | `repro_row_order.py --dir <dir> --layer 0 [--run-op [--random-weight] [--no-nz]] [--all-ranks [--tp-size N]]` | 数据模式：token→行号置换；`--run-op`：`differing>0` ⇒ 行序相关，最小复现成立；`--all-ranks` 出逐 rank 汇总（缺 rank 会告警，判词写"覆盖不完整"）；权重来源打在 `w=w\|random`（`w->ND` = 该 dump 走了 ND 兜底、已在复现器里重放 NZ） |
 
 | 单配置手工调试 | `run_single.py [--config C]` | `[http] <- 200` + `[result]` |
 | 收整轮证据 | `selfcheck.py --collect --out-root /dev/shm/cp_ab_sweep` | 一个文件含 HEAD/摘要/dump 清单/指标/日志关键行 |
