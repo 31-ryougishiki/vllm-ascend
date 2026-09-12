@@ -1380,6 +1380,89 @@ def test_repro_row_order_reports_the_permutation() -> None:
         shutil.rmtree(out, ignore_errors=True)
 
 
+def test_repro_row_order_run_op_uses_the_requested_device() -> None:
+    """``--run-op`` must not use the device its inputs happen to be loaded on.
+
+    The reproducer loads every dump with ``map_location="cpu"``, so the first
+    version of ``--run-op`` built the random weight on ``q.device`` == CPU and
+    the site round died with ``npu::npu_format_cast ... arguments from the 'CPU'
+    backend`` -- a tool defect that reads like a model finding and cost a round.
+    The stub below records where the weight and the op inputs actually land, with
+    ``--device meta`` as a stand-in for "not the device the payload came from".
+    """
+    import importlib.util
+    import types
+
+    import torch
+
+    path = HERE / "repro_row_order.py"
+    spec = importlib.util.spec_from_file_location("cp_ab_repro_row_order_dev", path)
+    assert spec is not None and spec.loader is not None
+    module = importlib.util.module_from_spec(spec)
+    sys.modules["cp_ab_repro_row_order_dev"] = module
+    spec.loader.exec_module(module)
+
+    calls: dict[str, list[str]] = {"cast": [], "matmul": []}
+    stub = types.ModuleType("torch_npu")
+
+    def _format_cast(tensor, fmt, **kwargs):  # noqa: ANN001 - mimics the vendor op
+        calls["cast"].append(tensor.device.type)
+        return tensor
+
+    def _quant_matmul(q, weight, weight_scale, **kwargs):  # noqa: ANN001 - mimics the vendor op
+        scale = kwargs.get("pertoken_scale")
+        calls["matmul"].append(
+            f"{q.device.type}/{weight.device.type}/{getattr(scale, 'device', None)}"
+        )
+        # A finite, non-zero result: the tool refuses to judge a degenerate output.
+        return torch.ones(q.shape[0], weight.shape[1], dtype=torch.bfloat16)
+
+    stub.npu_format_cast = _format_cast
+    stub.npu_quant_matmul = _quant_matmul
+    stub.float8_e8m0fnu = None
+
+    out = _temp_dir("cp_ab_repro_dev_")
+    previous = sys.modules.get("torch_npu")
+    sys.modules["torch_npu"] = stub
+    try:
+        for cpbal in (0, 1):
+            torch.save(
+                {
+                    "kind": "qin",
+                    "op": "dn_q",
+                    "fused": False,
+                    "rows": 4,
+                    "positions_from": "gather_natural" if cpbal == 0 else "gather_zigzag",
+                    "positions": torch.arange(4, dtype=torch.int64),
+                    # K=64 with group=32: the MX scale packing needs K/group even.
+                    "q": torch.zeros(4, 64, dtype=torch.uint8).view(torch.float8_e4m3fn),
+                    "s": torch.full((4, 1, 2), 127, dtype=torch.uint8),
+                    "in_dtype": "torch.bfloat16",
+                },
+                out / f"dnq_cpbal{cpbal}_layer0_rank0_pid1_{1000 + cpbal}.pt",
+            )
+        buffer = io.StringIO()
+        with redirect_stdout(buffer):
+            rc = module.main(
+                [
+                    "--dir", str(out), "--layer", "0", "--run-op",
+                    "--random-weight", "--n", "8", "--device", "meta",
+                ]
+            )
+        text = buffer.getvalue()
+        assert rc == 0, text
+        assert "device: meta" in text, text
+        assert calls["cast"] == ["meta"], (text, calls)
+        assert calls["matmul"] == ["meta/meta/meta", "meta/meta/meta"], (text, calls)
+        assert "与行序无关" in text, text
+    finally:
+        if previous is None:
+            sys.modules.pop("torch_npu", None)
+        else:
+            sys.modules["torch_npu"] = previous
+        shutil.rmtree(out, ignore_errors=True)
+
+
 def test_selfcheck_fingerprint_markers_match_the_code() -> None:
     """Every behaviour marker in ``selfcheck.fingerprint_lines`` must be present here.
 
@@ -2153,6 +2236,15 @@ def main(argv: list[str] | None = None) -> int:
     import argparse
     import faulthandler
     import time
+
+    try:
+        # The verdict lines are Chinese and some assertion messages carry "⇒":
+        # a non-UTF-8 console (Windows GBK) used to raise here and replace the
+        # whole failure report with an encoding traceback.
+        sys.stdout.reconfigure(errors="replace")
+        sys.stderr.reconfigure(errors="replace")
+    except Exception:  # noqa: BLE001 - older/redirected streams may not support it
+        pass
 
     parser = argparse.ArgumentParser(description="cp_balance CPU self test")
     parser.add_argument("--only", default="", help="run only tests whose name contains this")

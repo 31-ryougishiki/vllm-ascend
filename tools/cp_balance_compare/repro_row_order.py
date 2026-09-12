@@ -24,6 +24,10 @@ Two modes:
   A non-empty ``max|d|`` between the two orders, for rows that carry the *same*
   token, is the minimal reproduction: same values, same weight, only the row order
   differs.  It is what a kernel/vendor report needs, and it needs no model load.
+
+  ``--run-op`` runs on ``--device`` (default ``npu:0``), *not* on ``q.device``: the
+  dumps are loaded with ``map_location="cpu"``, so anything derived from the
+  payload is a CPU tensor and the NPU ops reject it (see ``_resolve_device``).
 """
 
 from __future__ import annotations
@@ -93,6 +97,27 @@ def _row_map(payload: dict) -> dict[int, int]:
 ACL_FORMAT_FRACTAL_NZ = 29
 
 
+def _resolve_device(args) -> torch.device:
+    """The device the re-run GEMM must execute on.
+
+    It cannot be inferred from the payload: :func:`_latest` loads every dump with
+    ``map_location="cpu"`` (the checker half of the tool is CPU-only), so
+    ``q.device`` is *always* CPU.  Building the random weight there and calling
+    the op with it is what failed on the site with
+    ``npu::npu_format_cast ... arguments from the 'CPU' backend`` -- an offline
+    tool defect that reads like a model problem, so it gets an explicit knob and
+    a printed line instead of a device guess.
+    """
+    import torch_npu  # noqa: F401 - importing it registers the PrivateUse1 backend
+
+    return torch.device(args.device)
+
+
+def _to_device(value, device: torch.device):
+    """Move a tensor (or ``None``) to ``device``; anything else is passed through."""
+    return value.to(device) if torch.is_tensor(value) else value
+
+
 def _e8m0_dtype():
     """``torch_npu.float8_e8m0fnu`` if this build has it, else ``None``.
 
@@ -106,7 +131,7 @@ def _e8m0_dtype():
     return getattr(torch_npu, "float8_e8m0fnu", None)
 
 
-def _random_weight(args, q):
+def _random_weight(args, q, device: torch.device):
     """A same-shaped random fp8 weight, so the op can be re-run without a w dump.
 
     Order sensitivity is a property of the *call shape* (tiling / accumulation), not
@@ -115,10 +140,12 @@ def _random_weight(args, q):
     expects -- post-loading the layer keeps ``weight`` transposed to ``[K, N]`` and
     NZ-cast, and the scale packed as ``[K/group/2, N, 2]`` -- so the same cast is
     applied here (``npu_format_cast``, what ``maybe_trans_nz`` wraps).
+
+    ``device`` comes from ``--device``; ``q`` only supplies the K dimension (it was
+    loaded on the CPU, so its device would make the cast fail).
     """
     import torch_npu
 
-    device = q.device
     k = int(q.shape[1])
     group = max(1, args.group_size)
     if k % group or (k // group) % 2:
@@ -130,26 +157,35 @@ def _random_weight(args, q):
         )
     scale = torch.full((k // group // 2, args.n, 2), 127, dtype=torch.uint8, device=device)
     print(
-        f"[repro] 随机权重（同形状，nz={args.nz}）: weight={tuple(weight.shape)} {weight.dtype} | "
+        f"[repro] 随机权重（同形状，nz={args.nz}, device={device}）: "
+        f"weight={tuple(weight.shape)} {weight.dtype} | "
         f"scale={tuple(scale.shape)} {scale.dtype}"
     )
     return weight, scale
 
 
-def _run_op(args, q, scale, weight, weight_scale):
+def _run_op(args, q, scale, weight, weight_scale, device: torch.device):
+    """Run the layer's own quantized GEMM once, on ``device``, with these inputs.
+
+    Every input is moved to ``device`` first: the payload was loaded on the CPU
+    (``map_location="cpu"``), and ``npu_quant_matmul`` refuses CPU arguments.  The
+    result comes back to the CPU so the comparison below cannot depend on a device
+    sync.
+    """
     import torch_npu
 
-    return torch_npu.npu_quant_matmul(
-        q,
-        weight,
-        weight_scale,
+    output = torch_npu.npu_quant_matmul(
+        _to_device(q, device),
+        _to_device(weight, device),
+        _to_device(weight_scale, device),
         scale_dtype=_e8m0_dtype(),
-        pertoken_scale=scale,
+        pertoken_scale=_to_device(scale, device),
         pertoken_scale_dtype=_e8m0_dtype(),
         bias=None,
         output_dtype=torch.bfloat16,
         group_sizes=[1, 1, args.group_size],
     )
+    return output.to("cpu") if torch.is_tensor(output) else output
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -180,6 +216,12 @@ def main(argv: list[str] | None = None) -> int:
         "with VLLM_ASCEND_ENABLE_NZ=0)",
     )
     parser.add_argument("--group-size", type=int, default=32, help="MX group size (W8A8_MXFP8: 32)")
+    parser.add_argument(
+        "--device",
+        default="npu:0",
+        help="device the re-run GEMM runs on (default npu:0). The dumps are loaded on the "
+        "CPU, so the payload cannot supply it; use e.g. npu:3 when chip 0 is busy.",
+    )
     parser.add_argument("--token", type=int, default=None, help="report this token's row in both layouts")
     args = parser.parse_args(argv)
 
@@ -228,6 +270,14 @@ def main(argv: list[str] | None = None) -> int:
         )
         return 0
 
+    try:
+        device = _resolve_device(args)
+    except Exception as exc:  # noqa: BLE001 - a missing backend must not look like a result
+        print(f"[repro] 无法使用设备 {args.device}: {type(exc).__name__}: {exc}", file=sys.stderr)
+        print("[repro] 该步骤必须在装了 torch_npu 的 NPU 机器上跑；换设备用 --device npu:<id>", file=sys.stderr)
+        return 2
+    print(f"[repro] device: {device}（dump 是 CPU 加载的，权重与算子输入都会先搬到这个设备）")
+
     wpath, wpayload = _latest(args.dir, "w", args.layer, 1, args.rank)
     if wpayload is None:
         wpath, wpayload = _latest(args.dir, "w", args.layer, 0, args.rank)
@@ -244,7 +294,7 @@ def main(argv: list[str] | None = None) -> int:
         # weight still answers "does this op care about the row order", and it needs
         # no extra round.
         try:
-            weight, weight_scale = _random_weight(args, sides[1]["q"])
+            weight, weight_scale = _random_weight(args, sides[1]["q"], device)
         except Exception as exc:  # noqa: BLE001
             print(f"[repro] 随机权重构造失败: {type(exc).__name__}: {exc}", file=sys.stderr)
             return 2
@@ -258,11 +308,14 @@ def main(argv: list[str] | None = None) -> int:
         return 2
 
     try:
-        out_b = _run_op(args, sides[0]["q"], sides[0]["s"], weight, weight_scale)
-        out_c = _run_op(args, sides[1]["q"], sides[1]["s"], weight, weight_scale)
+        out_b = _run_op(args, sides[0]["q"], sides[0]["s"], weight, weight_scale, device)
+        out_c = _run_op(args, sides[1]["q"], sides[1]["s"], weight, weight_scale, device)
     except Exception as exc:  # noqa: BLE001 - report, never mask an unsupported call
         print(f"[repro] 重跑 GEMM 失败: {type(exc).__name__}: {exc}", file=sys.stderr)
-        print("[repro] 把这一行连同上面的 shape/ dtype 一起贴回来", file=sys.stderr)
+        print(
+            f"[repro] 把这一行连同上面的 shape/ dtype 一起贴回来（device={device}）",
+            file=sys.stderr,
+        )
         return 2
 
     tokens = common

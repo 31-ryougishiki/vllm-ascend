@@ -57,6 +57,14 @@ python tools/cp_balance_compare/repro_row_order.py --dir "$DIR" --layer 0 \
     --run-op --random-weight --n 768 [--no-nz]     # --n = down_proj 输出维 = hidden/TP
 ```
 
+⚠️ 2026-09-12 站点两连败（都是**工具侧**问题，不是模型发现；两条都已修，见 §9）：
+① `--random-weight` 曾 `RuntimeError: Ascend config is not initialized`（复现器 import 了
+`vllm_ascend.utils.maybe_trans_nz`）；② 改用 `npu_format_cast` 后变成
+`NotImplementedError: ... 'npu::npu_format_cast' with arguments from the 'CPU' backend`
+—— 因为 dump 是 `map_location="cpu"` 加载的，`q.device` 恒为 CPU。
+现在设备由 `--device`（默认 `npu:0`）决定，权重与算子输入都会先搬过去；跑起来应先看到
+`[repro] device: npu:0（dump 是 CPU 加载的…）`。
+
 **判据**：`differing > 0` ⇒ matmul 行序相关 → 最小复现交算子侧 + 在模型里找"让 GEMM 见到相同行序"的绕法；
 `differing == 0` ⇒ 归约侧 → 把 row-parallel 归约换成 `all_reduce + slice`（或查 HCCL 算法/确定性）；
 输出 NaN/全零 ⇒ 权重布局不被接受（试 `--no-nz`，或用真实 `w` dump）。
@@ -173,7 +181,7 @@ python tools/cp_balance_compare/check_zigzag_dumps.py --dir "$DIR" \
 
 | 目的 | 命令 | 判据 |
 | --- | --- | --- |
-| CPU 自测（改完代码必跑） | `python tools/cp_balance_compare/selftest_mock.py` | 每项 `[run]`/`[ok] …(Ns)`，末行 `SELFTEST OK`（51 项）；卡住时最后一行 `[run]` 就是卡住的用例，90s 后自动超时并打栈；慢 bash 站点自动 `[skip]` 4 个 launcher 用例（`--only/--skip` 可覆盖） |
+| CPU 自测（改完代码必跑） | `python tools/cp_balance_compare/selftest_mock.py` | 每项 `[run]`/`[ok] …(Ns)`，末行 `SELFTEST OK`（52 项）；卡住时最后一行 `[run]` 就是卡住的用例，90s 后自动超时并打栈；慢 bash 站点自动 `[skip]` 4 个 launcher 用例（`--only/--skip` 可覆盖） |
 | 版本指纹（无 git） | `python tools/cp_balance_compare/selfcheck.py --fingerprint` | 末行 `[fp] <16 位>` + 文件摘要 + marker OK/MISSING |
 | 环境体检 | `python tools/cp_balance_compare/selfcheck.py` | `[verdict] READY`、无 FAIL |
 | 配置门（不加载模型） | `ab_cp_compare.py --preflight` | 末行 `[preflight] all configs OK` |
@@ -223,6 +231,7 @@ python tools/cp_balance_compare/check_zigzag_dumps.py --dir "$DIR" \
 
 | commit | 内容 |
 | --- | --- |
+| `<本次>` | 复现器 `--run-op` 显式设备（`--device`，默认 `npu:0`）：dump 是 CPU 加载的，权重与算子输入必须先搬设备，否则 `npu_format_cast` / `npu_quant_matmul` 报 "'CPU' backend"（站点日志 09-12 的第二次失败）+ 对应 CPU 自测与指纹 marker |
 | `b7de04fe2` | 复现器离线可用（`npu_format_cast` 直连，不依赖 ascend config）+ 退化保护 + `--no-nz` |
 | `e6292ab0e` | 复现器 slot 归一化 + `--random-weight`（不必再跑一轮）；HANDOVER 记录"只差最后一个算子" |
 | `18cb6a7c2` | 指纹按 LF 归一化（跨平台可比）+ 慢 bash 站点自动跳过 launcher 用例 |

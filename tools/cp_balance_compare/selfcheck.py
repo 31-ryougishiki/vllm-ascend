@@ -91,6 +91,11 @@ MARKERS = (
     ("probe 每轮独立目录", "tools/cp_balance_compare/run_cp_diag.sh", "cp_probe/$(date"),
     ("probe2 模式", "tools/cp_balance_compare/run_cp_diag.sh", "probe2"),
     ("未定义名静态检查", "tools/cp_balance_compare/selftest_mock.py", "loads undefined name"),
+    # The reproducer loads dumps on the CPU, so --run-op MUST place its tensors
+    # explicitly; without this marker the site cannot tell "the CPU-backend fix is
+    # here" from "the file is merely different" and re-runs a round that dies on
+    # the same device error.
+    ("repro 运行设备显式", "tools/cp_balance_compare/repro_row_order.py", "_resolve_device"),
 )
 
 class Report:
