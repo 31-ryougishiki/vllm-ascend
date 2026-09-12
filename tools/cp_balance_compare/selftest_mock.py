@@ -2238,12 +2238,16 @@ def main(argv: list[str] | None = None) -> int:
     import time
 
     try:
-        # The verdict lines are Chinese and some assertion messages carry "⇒":
-        # a non-UTF-8 console (Windows GBK) used to raise here and replace the
-        # whole failure report with an encoding traceback.
-        sys.stdout.reconfigure(errors="replace")
-        sys.stderr.reconfigure(errors="replace")
-    except Exception:  # noqa: BLE001 - older/redirected streams may not support it
+        # The verdict lines are Chinese and some assertion messages carry "⇒".
+        # A legacy console (Windows GBK) either raises on them -- turning the whole
+        # failure report into an encoding traceback -- or prints mojibake; UTF-8
+        # sites are left exactly as they are.
+        for stream in (sys.stdout, sys.stderr):
+            if "utf" in (getattr(stream, "encoding", "") or "").lower():
+                stream.reconfigure(errors="replace")
+            else:
+                stream.reconfigure(encoding="utf-8", errors="replace")
+    except Exception:  # noqa: BLE001 - redirected/older streams may not support it
         pass
 
     parser = argparse.ArgumentParser(description="cp_balance CPU self test")

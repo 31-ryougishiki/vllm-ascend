@@ -560,8 +560,14 @@ def _report_path(requested: str) -> Path | None:
 
 def main(argv: list[str] | None = None) -> int:
     try:
-        sys.stdout.reconfigure(errors="replace")
-        sys.stderr.reconfigure(errors="replace")
+        # The marker labels are Chinese: a legacy console (Windows GBK) mangles
+        # them or raises.  `--fingerprint` output gets pasted back verbatim, so it
+        # has to be readable; UTF-8 streams are left untouched.
+        for stream in (sys.stdout, sys.stderr):
+            if "utf" in (getattr(stream, "encoding", "") or "").lower():
+                stream.reconfigure(errors="replace")
+            else:
+                stream.reconfigure(encoding="utf-8", errors="replace")
     except Exception:  # noqa: BLE001
         pass
     args = parse_args(argv)
