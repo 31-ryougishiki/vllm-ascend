@@ -235,15 +235,6 @@ class DSACPContext:
     zigzag_index: torch.Tensor | None = None
     zigzag_gather_index: torch.Tensor | None = None
     inv_gather_index: torch.Tensor | None = None
-    # Real (non-padding) rows when num_tokens was SP-padded to cp_size.
-    # zigzag_actual_gather_index[i] is the natural slot of the i-th real row
-    # in gather order; zigzag_actual_rows[i] is that row's position in the
-    # all-gathered tensor.  Without padding, actual_gather_index aliases
-    # zigzag_gather_index and actual_rows is None.  The cache writers now use
-    # the full padded gather with -1 slot skipping for every dtype; these two
-    # fields are retained for diagnostics and metadata-level checks.
-    zigzag_actual_gather_index: torch.Tensor | None = None
-    zigzag_actual_rows: torch.Tensor | None = None
     # Deprecated prev/next split point.  For the legacy single-request aligned
     # case it equals total_q_prev_tokens; the active paths use
     # total_q_prev_tokens / total_q_next_tokens instead.
@@ -409,19 +400,10 @@ def _build_zigzag_meta(
     zigzag_index = _int64_tensor(plan.zigzag_index)
     zigzag_gather_index = _int64_tensor(plan.zigzag_gather_index)
     inv_gather_index = _int64_tensor(plan.inv_gather_index)
-    if plan.num_actual_tokens == plan.num_tokens:
-        zigzag_actual_gather_index = zigzag_gather_index
-        zigzag_actual_rows = None
-    else:
-        zigzag_actual_gather_index = _int64_tensor(plan.actual_gather_index)
-        zigzag_actual_rows = _int64_tensor(plan.actual_rows)
-
     return {
         "zigzag_index": zigzag_index,
         "zigzag_gather_index": zigzag_gather_index,
         "inv_gather_index": inv_gather_index,
-        "zigzag_actual_gather_index": zigzag_actual_gather_index,
-        "zigzag_actual_rows": zigzag_actual_rows,
         "q_half": plan.total_q_prev_tokens,
         "total_q_prev_tokens": plan.total_q_prev_tokens,
         "total_q_next_tokens": plan.total_q_next_tokens,
@@ -848,12 +830,6 @@ class AscendSFAMetadataBuilder(MLACommonMetadataBuilder[AscendSFAMetadata]):
                 ),
                 inv_gather_index=(
                     zigzag["inv_gather_index"] if zigzag is not None else None
-                ),
-                zigzag_actual_gather_index=(
-                    zigzag["zigzag_actual_gather_index"] if zigzag is not None else None
-                ),
-                zigzag_actual_rows=(
-                    zigzag["zigzag_actual_rows"] if zigzag is not None else None
                 ),
                 q_half=zigzag["q_half"] if zigzag is not None else 0,
                 total_q_prev_tokens=(

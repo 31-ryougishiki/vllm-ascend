@@ -129,9 +129,6 @@ class ZigzagPlan:
     zigzag_gather_index: tuple[int, ...]
     # inv_gather_index[p] is the row of the gathered tensor holding token p.
     inv_gather_index: tuple[int, ...]
-    # Real (non-padding) rows in gather order and their gather positions.
-    actual_gather_index: tuple[int, ...]
-    actual_rows: tuple[int, ...]
     # Split point between prev and next tokens in the rank-local tensor.
     total_q_prev_tokens: int
     total_q_next_tokens: int
@@ -518,14 +515,6 @@ def build_zigzag_plan(
     for row, global_pos in enumerate(gather_positions):
         inv_positions[global_pos] = row
 
-    # Real rows in gather order and their positions in the gathered tensor.
-    actual_gather_positions = [
-        pos for pos in gather_positions if pos < num_actual_tokens
-    ]
-    actual_gather_rows = [
-        row for row, pos in enumerate(gather_positions) if pos < num_actual_tokens
-    ]
-
     q_len_prev_list = [block_sizes[s][cp_rank] for s in range(len(query_lens))]
     q_len_next_list = [block_sizes[s][next_block] for s in range(len(query_lens))]
     total_q_prev_tokens = sum(q_len_prev_list)
@@ -586,8 +575,6 @@ def build_zigzag_plan(
         zigzag_index=tuple(zigzag_index),
         zigzag_gather_index=tuple(gather_positions),
         inv_gather_index=tuple(inv_positions),
-        actual_gather_index=tuple(actual_gather_positions),
-        actual_rows=tuple(actual_gather_rows),
         total_q_prev_tokens=total_q_prev_tokens,
         total_q_next_tokens=total_q_next_tokens,
         q_len_prev_list=tuple(q_len_prev_list),

@@ -139,8 +139,6 @@ def _disable_zigzag_metadata_for_fallback(attn_metadata: Any) -> None:
         ctx.zigzag_index = None
         ctx.zigzag_gather_index = None
         ctx.inv_gather_index = None
-        ctx.zigzag_actual_gather_index = None
-        ctx.zigzag_actual_rows = None
         ctx.q_half = 0
         ctx.total_q_prev_tokens = 0
         ctx.total_q_next_tokens = 0
