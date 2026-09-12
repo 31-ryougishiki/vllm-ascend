@@ -337,7 +337,7 @@ slot；payload 里带 `rows`/`positions_from` 可审计。
 
 | 目的 | 命令 | 判据 |
 | --- | --- | --- |
-| GPU 自测（改完代码必跑） | `python tools/cp_balance_compare/selftest_mock.py` | 每项 `[run] …` / `[ok] … (Ns)`；末行 `SELFTEST OK`（51 项）。**卡住时**最后一行 `[run]` 就是卡住的用例名字，90s 后自动超时并打印栈；可 `--only`/`--skip launcher,preflight` 复跑 |
+| GPU 自测（改完代码必跑） | `python tools/cp_balance_compare/selftest_mock.py` | 每项 `[run] …` / `[ok] … (Ns)`；末行 `SELFTEST OK`（51 项）。**卡住时**最后一行 `[run]` 就是卡住的用例名字，90s 后自动超时并打印栈；可 `--only`/`--skip launcher,preflight` 复跑。站点 `bash` 启动很慢（本站实测 ≈22s/次）时，4 个起 launcher 的用例会自动 `[skip]` 并说明原因 |
 | **版本指纹（离线站点无 git）** | `python tools/cp_balance_compare/selfcheck.py --fingerprint` | 末行 `[fp] <16 位>` + 关键文件 sha256 + 修复标记 OK/MISSING |
 | 首跑/换机器自检 | `python tools/cp_balance_compare/selfcheck.py` | `[verdict] READY`，无 FAIL |
 | 不加载模型校验 env/指纹 | `ab_cp_compare.py --preflight` | `[preflight] all configs OK` |

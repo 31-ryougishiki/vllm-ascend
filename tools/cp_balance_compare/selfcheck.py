@@ -193,6 +193,10 @@ def fingerprint_lines(repo_root: Path) -> tuple[list[str], str]:
     is this box running" has to come from the files themselves: a sha256 per key
     file plus a few behaviour markers (a digest only says *different*, a marker says
     *which fix is present*).  The combined ``[fp]`` line is what gets pasted back.
+
+    Digests are taken over the **LF-normalised** bytes: the dev checkout is on
+    Windows (CRLF in the working copy) while the site is Linux, and a raw-byte hash
+    made the two report different fingerprints for identical content.
     """
     import hashlib
 
@@ -204,7 +208,7 @@ def fingerprint_lines(repo_root: Path) -> tuple[list[str], str]:
             lines.append(f"[file] {relative:<52} MISSING")
             combined.update(f"{relative}:MISSING".encode())
             continue
-        digest = hashlib.sha256(path.read_bytes()).hexdigest()[:12]
+        digest = hashlib.sha256(path.read_bytes().replace(b"\r\n", b"\n")).hexdigest()[:12]
         combined.update(f"{relative}:{digest}".encode())
         lines.append(f"[file] {relative:<52} {digest}")
     for label, relative, needle in MARKERS:

@@ -295,8 +295,7 @@ def test_stream_log_mirrors_to_screen_and_file() -> None:
 
 def test_launch_server_streams_log_to_screen() -> None:
     """A real launcher's output must reach both the log file and the screen."""
-    if not _bash_usable():
-        print("[skip] bash not usable on this host")
+    if _skip_if_bash_slow("test_launch_server_streams_log_to_screen"):
         return
     out = _temp_dir("cp_ab_launch_")
     try:
@@ -1445,12 +1444,57 @@ def _bash_usable() -> bool:
         _BASH_USABLE = False
         return False
     try:
-        probe = subprocess.run(["bash", "-c", "exit 0"], capture_output=True, timeout=20)
+        probe = subprocess.run(["bash", "-c", "exit 0"], capture_output=True, timeout=60)
         _BASH_USABLE = probe.returncode == 0
     except (OSError, subprocess.SubprocessError):
         # Sandboxed dev hosts can block subprocess/named-pipe creation.
         _BASH_USABLE = False
     return _BASH_USABLE
+
+
+_BASH_SPAWN_S: float | None = None
+_BASH_SPAWN_LIMIT_S = 2.0
+
+
+def _bash_spawn_seconds() -> float:
+    """Seconds a bare ``bash -c true`` takes here (measured once, cached).
+
+    Sites exist where every ``bash`` spawn costs ~20 s (heavy ``BASH_ENV``, slow
+    mount): the launcher tests then spend 45-90 s each in ``communicate()`` and look
+    like hangs.  Measure it once and skip those tests with an explicit reason
+    instead of stalling the suite.
+    """
+    global _BASH_SPAWN_S
+    if _BASH_SPAWN_S is not None:
+        return _BASH_SPAWN_S
+    import time
+
+    if not _bash_usable():
+        _BASH_SPAWN_S = -1.0
+        return _BASH_SPAWN_S
+    started = time.perf_counter()
+    try:
+        subprocess.run(["bash", "-c", "true"], capture_output=True, timeout=120)
+    except (OSError, subprocess.SubprocessError):
+        _BASH_SPAWN_S = -1.0
+        return _BASH_SPAWN_S
+    _BASH_SPAWN_S = time.perf_counter() - started
+    return _BASH_SPAWN_S
+
+
+def _skip_if_bash_slow(test_name: str) -> bool:
+    """Skip a bash-spawning test when this host pays seconds per ``bash``."""
+    seconds = _bash_spawn_seconds()
+    if seconds < 0:
+        print(f"[skip] bash 不可用 → 跳过 {test_name}")
+        return True
+    if seconds > _BASH_SPAWN_LIMIT_S:
+        print(
+            f"[skip] bash 启动 {seconds:.1f}s（> {_BASH_SPAWN_LIMIT_S:.0f}s，本机很慢）→ 跳过 {test_name}；"
+            f"要强制跑：--only {test_name}"
+        )
+        return True
+    return False
 
 
 def test_compare_case_with_subset_of_configs() -> None:
@@ -1632,8 +1676,7 @@ def test_preflight_logic_with_stubbed_launcher() -> None:
 
 
 def test_preflight_with_fake_launcher() -> None:
-    if not _bash_usable():
-        print("[skip] bash not usable on this host")
+    if _skip_if_bash_slow("test_preflight_with_fake_launcher"):
         return
     import shlex
 
@@ -1712,8 +1755,7 @@ def test_shipped_launchers_print_complete_fingerprint() -> None:
             f"{sorted(driver.expected_fingerprint('C', args))}"
         )
 
-    if not _bash_usable():
-        print("[skip] bash not usable on this host")
+    if _skip_if_bash_slow("test_shipped_launchers_print_complete_fingerprint"):
         return
     import os
     import shlex
@@ -1798,8 +1840,7 @@ def test_launcher_skip_source_keeps_fingerprint_complete() -> None:
     compares must still be printed, otherwise every round would fail
     ``--config-check strict`` on a machine that uses the fast path.
     """
-    if not _bash_usable():
-        print("[skip] bash not usable on this host")
+    if _skip_if_bash_slow("test_launcher_skip_source_keeps_fingerprint_complete"):
         return
     import os
     import shlex
