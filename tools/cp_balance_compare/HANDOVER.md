@@ -43,7 +43,10 @@ in ─attn─▶ out ─norm─▶ mlp_in ─[量化]─▶ gu_q ─gate_up─�
 ⇒ **根因候选：`down_proj` 这个 GEMM（与其跨 rank 归约）——输入（fp8+scale）逐位相同却给出不同输出。**
 按逐行数学推理，只剩两种解释，**一轮即可分开**：
 ① 内核与行序相关（同样的行、不同的排列给出不同结果）；② 内核不可复现（同输入跑两次也不同）。
-**下一步**：`--configs C,C2`（两次 C，≈20 分钟）量 `C2−C`——为 0 即①，非 0 即②。
+**下一步**：`bash tools/cp_balance_compare/run_cp_diag.sh probe2`（= `--configs C,B --repeat-a`，
+即 C/B/C2 三次加载 ≈30 分钟）——一次拿到两样东西：layer 0 六行齐全的 B/C 剖面（含刚修好的
+`gu_out`/`dn_in`）与 `[noise] C2 vs C`。判据：`C2−C` 为 0 ⇒ 内核**与行序相关**（做离线行置换实验）；
+非 0 ⇒ 内核**不可复现**（查 MC2/mmrs 融合与确定性开关）。
 
 ```
 in ─attn─▶ out ─norm─▶ mlp_in ─[量化]─▶ gu_q ─gate_up─▶ gu_out ─silu─▶ dn_in ─[量化]─▶ dn_q ─down_proj─▶ mlp_out

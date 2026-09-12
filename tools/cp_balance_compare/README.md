@@ -53,6 +53,7 @@
 | 模式 | 轮次目录 | 做什么 | 回答什么 |
 | --- | --- | --- | --- |
 | **`probe`** | `r_probe`（dump→`/root/cp_probe/<轮次时间戳>`） | B/C（无 B2）+ `act:0,1,mlp:0,1,qin:0,topk:0,kv:0,1` | **当前主用**：哪一步先不等（attention / pre-MLP / MLP 内部的量化 vs GEMM） |
+| **`probe2`** | `r_probe_c2`（dump→同 probe，每轮时间戳目录） | 同 probe，但 `--configs C,B --repeat-a` ⇒ **C, B, C2**（3 次加载 ≈30 分钟） | 上面那张表 **+ `[noise] C2 vs C`**：区分"内核与行序相关"（C2−C=0）与"内核不可复现"（C2−C≠0） |
 | `sweep` | `r_sweep` | B/C + `kv:all` 全层 KV dump | 第几层的 KV 先不等（→ 上一层输出进入） |
 | `baseline` | `r1_baseline` | B/C/B2 + `topk:6,kv:0,6` | 现状差异多大、落在哪个分片 |
 | `check` | — | 直接 `exec check_zigzag_dumps.py --dir <dump> --kind ${KIND:-both}`（`KIND=act` 自动加 `--summary-only`） | 判读（不需要 NPU） |

@@ -5,6 +5,7 @@
 #   bash tools/cp_balance_compare/run_cp_diag.sh baseline   # T0+T2+T3：基线 B/C/B2 + topk/KV dump
 #   bash tools/cp_balance_compare/run_cp_diag.sh sweep      # 多层扫描：B/C（无 B2）+ 全层 KV+FP dump
 #   bash tools/cp_balance_compare/run_cp_diag.sh probe      # op 级打点：B/C（无 B2）+ 逐层激活/量化输入剖面
+#   bash tools/cp_balance_compare/run_cp_diag.sh probe2     # probe + C 的重复跑（--configs C,B --repeat-a ⇒ C,B,C2）
 #   bash tools/cp_balance_compare/run_cp_diag.sh check      # CPU 侧判读已有 dump（不需要 NPU）
 #   bash tools/cp_balance_compare/run_cp_diag.sh list       # 只打印将要执行的命令
 #   加 --no-repeat 可跳过 B2（等价于 REPEAT_A=0）
@@ -72,6 +73,10 @@ dump_dir="${DUMP_DIR:-/dev/shm/cp_balance_dump}"
 
 round_name=""
 extra_env=()
+# Which configs the driver runs, in order.  ``--repeat-a`` repeats the *first*
+# one as <name>2 (that is how the noise floor is measured), so a C-determinism
+# round has to put C first: `--configs C,B --repeat-a` -> C, B, C2.
+configs="B,C"
 # True only when this round actually injects the DUMP env, so the "no dump was
 # produced" guard cannot fire a false alarm.
 dump_active=false
@@ -100,7 +105,7 @@ case "${mode}" in
       dump_active=true
     fi
     ;;
-  probe)
+  probe | probe2)
     # op 级全精度打点：attention 的输入（= 上一层的输出）与输出（= 本层 attention
     # 的贡献）各存一份，按**全局 token 位置**打点，所以 B/C 可以直接逐 token 比。
     # 判据见 README「激活剖面」：in 相同 + out 不同 => attention 内部先不等；
@@ -115,10 +120,20 @@ case "${mode}" in
     # → 必须落真实磁盘；**每轮一个独立子目录**（下面按时间戳生成），否则判读会把
     # 上一轮的旧文件按"最新一份"混进来 —— 不同轮次的 spec 不同，混了就等于把两次
     # 测量拼成一张表（现场发生过：新轮的 gu_q/dn_q 配旧轮的 mlp_out）。
-    round_name="r_probe"
-    repeat_a=0
+    #
+    # probe2 = probe + C 自身的重复跑（--configs C,B --repeat-a ⇒ C, B, C2，3 次加载）：
+    # 除 B/C 判读外，额外拿到 `[noise] C2 vs C` —— 用来区分"内核与行序相关"（C2−C=0）
+    # 与"内核不可复现"（C2−C≠0）。注意 C 与 C2 的 dump 同名 cpbal1，判读取最新一份。
     dump_spec="${DUMP_SPEC:-act:0,1,mlp:0,1,qin:0,topk:0,kv:0,1}"
     out_root="${OUT_ROOT:-/dev/shm/cp_ab_probe}"
+    if [[ "${mode}" == "probe2" ]]; then
+      round_name="r_probe_c2"
+      repeat_a=1
+      configs="C,B"
+    else
+      round_name="r_probe"
+      repeat_a=0
+    fi
     if [[ -z "${DUMP_DIR:-}" ]]; then
       dump_dir="/root/cp_probe/$(date +%m%d_%H%M%S)"
     else
@@ -160,7 +175,7 @@ fi
 out="${out_root}/${round_name}"
 cmd=(python "${driver}"
      --launcher "${launcher}"
-     --configs B,C
+     --configs "${configs}"
      --prompt-lens "${prompt_lens}"
      --cp-balance-min-tokens "${min_tokens}"
      --cp-size "${cp_size}"
@@ -180,10 +195,10 @@ echo "[run_cp_diag] mode=${mode} round=${round_name}"
 echo "[run_cp_diag] prompt_lens=${prompt_lens} min_tokens=${min_tokens} cp_size=${cp_size} repeat_a=${repeat_a} out=${out}"
 [[ -n "${dump_spec}" ]] && echo "[run_cp_diag] dump=${dump_spec} dir=${dump_dir}"
 
-# Which way this round's dumps are judged (probe = the activation profile).
+# Which way this round's dumps are judged (probe/probe2 = the activation profile).
 check_kind="both"
 check_extra=""
-if [[ "${mode}" == "probe" ]]; then
+if [[ "${mode}" == "probe" || "${mode}" == "probe2" ]]; then
   check_kind="act"
   # Keep the preview identical to the judged command in README/HANDOVER:
   # --block-size 128 is what turns "first differing token" into "which zigzag block".
