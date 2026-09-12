@@ -92,6 +92,19 @@ dump: 16 个 rank 齐全（act/mlp 各 64、guq/dnq/topk 各 32、kv 64）且 **
 "GEMM 与行序无关"跑在了**非模型真实形状**上（N=768），结论需在 N=6144 下复核（免费，一次 `--run-op`）。
 A3 侧可由已有 `w` dump 直接读出真形状：`gate_up [6144, 1536] = [hidden, 2I/tp]` ⇒ hidden=6144、
 I=12288、`dn_q` 的 K=I/tp=768 ⇒ down_proj 权重应为 `[768, 6144]`。
+
+**2026-09-12 A3：真实形状下的复现（免费，无需加载模型）**——在 `[K=768, N=6144]`、int8、
+每 token fp32 scale 的**模型真实形状**上重跑两种行序：
+
+```
+[repro] 随机权重（int8, device=npu:0）: weight=(768, 6144) torch.int8 | scale=(6144,) torch.float32
+[repro] rank 0: 输出比较（逐 token，同一 weight、同一 token 值，只有行序不同）: differing=0/2048 max|d|=0.000e+00
+```
+
+⇒ **GEMM 侧（int8/W4A8C8、真实形状）也排除**；A5 侧同样的复核还欠一次（它之前那次跑在 N=768 上，
+用 `--run-op --random-weight --n 6144` 即可免费补做）。⇒ 两个站点、两套量化、真实形状下都排除 GEMM，
+**跨 rank 归约成为唯一剩余嫌疑**。（同一轮还验证了 op 过滤生效：`w_cpbal0/1_layer0_rank0` 都只有
+`op=['gu_q']`，复现器按预期打印"需要 op=dn_q"而不是让内核报 K 不匹配。）
 `differing=0/2048 max|d|=0.000e+00`；rank 0 在此前两轮同命令下同样 0。⚠️ 那轮 dump 目录里
 **没有 rank 0 的 `dnq`**，所以工具报的是 `7/7 … 覆盖不完整（缺 rank [0]）`（工具现在会显式告警，
 判词不再写成 N/N）。综合 ⇒ **GEMM 侧在全部 8 个 rank 上都排除**（rank≠0 用同形状随机权重），
@@ -145,7 +158,7 @@ NZ 内部格式（`RuntimeError: ... copy_ do not support internal format`）—
 
 **后续分支**（8/8 rank 都行序无关 ⇒ 归约侧；两步走，先便宜的后贵的）：
 
-**第 1 步 — 开 HCCL 归约确定性（一轮 probe ≈20 分钟）**。这条归约就是
+**第 1 步 — 开 HCCL 归约确定性（一轮 probe ≈20 分钟；A3 的 CANN 与 A5 不同，值得在这台先试）**。这条归约就是
 `tensor_model_parallel_reduce_scatter` → vLLM `base_device_communicator.reduce_scatter` →
 `torch.distributed.reduce_scatter_tensor` → **HCCL ReduceScatter**，而 HCCL 本身有归约类算子的
 确定性与保序开关（官方说明见 [HCCL_DETERMINISTIC](https://gitcode.com/cann/hccl/blob/master/docs/user_guide/hccl_env/HCCL_DETERMINISTIC.md)：
@@ -192,8 +205,9 @@ pre-MLP norm/残差/跨 rank 归约错（`mlp_in` 相同）、**激活量化与�
 prev/next 两次调用形状（验证用的 `2call` 开关已随结论删除，见 README §七）、
 **"这是 A5/mxfp4 特有的算子问题"**（A3+W4A8C8 上同一形态复现，见 §1）。
 
-**仍开放**：**那次跨 rank 归约**（`tensor_model_parallel_reduce_scatter`；GEMM 已在 rank 0 + 随机权重下排除，
-`--all-ranks` 扫完即可定论）；MoE 层（≥3，需 `--enable-return-routed-experts`）；`MIN_TOKENS` 边界（与本问题无关）。
+**仍开放**：**那次跨 rank 归约**（`tensor_model_parallel_reduce_scatter`；GEMM 已在两个站点、
+真实形状下排除 —— A3 见 §1 的 `[768,6144]` 复现，A5 待用 `--n 6144` 补一遍）；
+MoE 层（≥3，需 `--enable-return-routed-experts`）；`MIN_TOKENS` 边界（与本问题无关）。
 
 ## 3. 环境与关键事实
 
