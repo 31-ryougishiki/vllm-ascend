@@ -41,6 +41,7 @@
 | `run_cp_diag.sh` | 一轮 A/B 的标准入口（模式见 §四） | 是（`check` 除外） |
 | `run_single.py` | 单配置手工调试：起一个 server + 用与 A/B 相同的请求体发一次推理，落盘 payload/response 供 curl 复现 | 是 |
 | `check_zigzag_dumps.py` | CPU 侧判读 dump（`kv` / `topk` / `act`，见 §五） | 否 |
+| `repro_row_order.py` | 离线复现"同一 token 的行换个位置结果就变"：读一轮的 `dnq`/`guq` dump（+ 同层 `w` 权重 dump）重跑 `npu_quant_matmul`，比较两种行序下同一 token 的输出 | 否（`--run-op` 需要 NPU） |
 | `compare_cp_rounds.py` | 把多轮 `summary.json` 并排，回答"改了某个变量后 `C−B` 是否回到噪声级" | 否 |
 | `mock_vllm_server.py` / `selftest_mock.py` | 假 server + CPU 自测（45 项：协议解析、指纹/payload、dump 判读、launcher 静态检查、端到端） | 否 |
 | `selfcheck.py` | 环境体检（解释器/依赖/import 来源/NPU/端口/磁盘/残留进程）+ 跑一遍自测 + `--collect` 收整轮证据。**不做**配置门与命令预演——那两件事由 `ab_cp_compare.py --preflight` 与 `run_cp_diag.sh <mode> --dry-run` 负责（每轮都会跑，不会腐化） | 否 |

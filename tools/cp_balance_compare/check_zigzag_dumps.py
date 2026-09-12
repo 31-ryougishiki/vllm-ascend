@@ -66,7 +66,7 @@ except ImportError:  # pragma: no cover - the target host always has torch
     raise
 
 NAME_RE = re.compile(
-    r"(?P<kind>topk|kv|actin|actout|mlpin|mlpout|gugu_out|dndn_in|guq|guout|dnin|dnq)"
+    r"(?P<kind>topk|kv|w|actin|actout|mlpin|mlpout|gugu_out|dndn_in|guq|guout|dnin|dnq)"
     r"_cpbal(?P<cpbal>\d+)_layer(?P<layer>-?\d+)"
     r"_rank(?P<rank>\d+)_pid(?P<pid>\d+)_(?P<ts>\d+)\.pt$"
 )
@@ -78,6 +78,9 @@ NAME_RE = re.compile(
 _KIND_GLOBS = {
     "topk": ("topk_*.pt",),
     "kv": ("kv_*.pt",),
+    # ``w`` = the GEMM's own weight/weight_scale (one dump per layer, rank 0):
+    # input for the offline row-order reproducer, never compared token-wise.
+    "w": ("w_*.pt",),
     "act": (
         "actin_*.pt",
         "actout_*.pt",

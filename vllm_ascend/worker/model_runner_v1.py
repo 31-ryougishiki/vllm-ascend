@@ -3932,6 +3932,7 @@ class NPUModelRunner(GPUModelRunner):
                         None,
                         True,
                     )
+                    _dump_weights(layer, layer_idx, op, name)
                     return orig_apply(layer, x, bias, *args, **kwargs)
                 slot: dict = {"captured": False, "quant": None, "scale": None}
                 capture["slot"] = slot
@@ -3950,11 +3951,55 @@ class NPUModelRunner(GPUModelRunner):
                     x if torch.is_tensor(x) and x.ndim == 2 else None,
                     False,
                 )
+                _dump_weights(layer, layer_idx, op, name)
                 return result
 
             return apply
 
         installed = []
+        weights_done: set[int] = set()
+
+        def _dump_weights(layer, layer_idx: int, op: str, name: str) -> None:
+            """Save the GEMM's own weight/scale once per layer (rank 0 only).
+
+            The offline row-order reproducer needs the exact tensors the kernel
+            consumed; reconstructing them from the checkpoint is not equivalent
+            (``process_weights_after_loading`` transposes and NZ-converts them).
+            Rank 0's shard is enough to reproduce *its* partial, which is what the
+            per-token comparison needs -- and keeping it to one rank keeps the
+            round's dump size unchanged.
+            """
+            if layer_idx in weights_done or getattr(_EXTRA_CTX, "in_profile_run", False):
+                return
+            try:
+                from vllm.distributed import get_tp_group
+
+                if get_tp_group().rank_in_group != 0:
+                    return
+            except Exception:
+                return
+            weight = getattr(layer, "weight", None)
+            scale = getattr(layer, "weight_scale", None)
+            if not torch.is_tensor(weight):
+                return
+            weights_done.add(layer_idx)
+            _zigzag_dump(
+                {
+                    "kind": "w",
+                    "op": op,
+                    "layer_name": name,
+                    "layer_idx": layer_idx,
+                    "weight": weight.detach().to("cpu"),
+                    "weight_scale": scale.detach().to("cpu")
+                    if torch.is_tensor(scale)
+                    else None,
+                    "weight_dtype": str(weight.dtype),
+                },
+                layer_idx,
+                "w",
+                dump_dir,
+            )
+
         for name, module in self.model.named_modules():
             op = None
             for layer_idx in layers:

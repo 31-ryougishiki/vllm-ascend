@@ -1333,6 +1333,53 @@ def test_check_zigzag_act_reads_legacy_dump_names() -> None:
         shutil.rmtree(out, ignore_errors=True)
 
 
+def test_repro_row_order_reports_the_permutation() -> None:
+    """The offline reproducer must map every token to its row in both layouts.
+
+    It runs on the NPU host against a round's dump; if its data path breaks (file
+    name parsing, provenance fields), the reproduction silently analyses nothing
+    and the round's evidence is wasted.
+    """
+    import importlib.util
+
+    import torch
+
+    path = HERE / "repro_row_order.py"
+    spec = importlib.util.spec_from_file_location("cp_ab_repro_row_order", path)
+    assert spec is not None and spec.loader is not None
+    module = importlib.util.module_from_spec(spec)
+    sys.modules["cp_ab_repro_row_order"] = module
+    spec.loader.exec_module(module)
+
+    out = _temp_dir("cp_ab_repro_")
+    try:
+        for cpbal, order, source in ((0, [0, 1, 2, 3], "gather_natural"), (1, [0, 2, 1, 3], "gather_zigzag")):
+            torch.save(
+                {
+                    "kind": "qin",
+                    "op": "dn_q",
+                    "fused": False,
+                    "rows": len(order),
+                    "positions_from": source,
+                    "positions": torch.tensor(order, dtype=torch.int64),
+                    "q": torch.zeros(len(order), 2, dtype=torch.uint8).view(torch.float8_e4m3fn),
+                    "s": torch.full((len(order), 1), 127, dtype=torch.uint8),
+                    "in_dtype": "torch.bfloat16",
+                },
+                out / f"dnq_cpbal{cpbal}_layer0_rank0_pid1_{1000 + cpbal}.pt",
+            )
+        buffer = io.StringIO()
+        with redirect_stdout(buffer):
+            rc = module.main(["--dir", str(out), "--layer", "0", "--kind", "dnq"])
+        text = buffer.getvalue()
+        assert rc == 0, text
+        assert "行号发生变化=2" in text, text
+        assert "token 1: row_B=1 row_C=2" in text, text
+        assert "gather_zigzag" in text, text
+    finally:
+        shutil.rmtree(out, ignore_errors=True)
+
+
 def test_load_prompts_file() -> None:
     out = Path(_temp_dir("cp_ab_pf_"))
     try:

@@ -343,6 +343,7 @@ slot；payload 里带 `rows`/`positions_from` 可审计。
 | 全层 KV 剖面 | `export DUMP_DIR=/root/cp_dump; run_cp_diag.sh sweep` → `… --kind kv --summary-only` | `FIRST DIVERGENCE (fp/value\|fp/bytes): layer L` |
 | 单配置手工调试 | `python tools/cp_balance_compare/run_single.py [--config C]` | `[http] <- 200` + `[result]` 行 |
 | 收整轮证据 | `python tools/cp_balance_compare/selfcheck.py --collect --out-root /dev/shm/cp_ab_sweep` | 一个文件含 HEAD/dump 清单/指标/日志关键行 |
+| **行序复现（当前这一步的下一刀）** | `python tools/cp_balance_compare/repro_row_order.py --dir <轮次目录> --layer 0 [--run-op]` | 不加 `--run-op`：打印两侧的 `rows`/`positions_from` 与 token→行号置换；加 `--run-op`（NPU，需同层 `w_*.pt`）重跑 GEMM：`differing>0` ⇒ 行序相关的最小复现成立 |
 
 ## 9. 关键提交（按时间倒序，只留里程碑）
 
