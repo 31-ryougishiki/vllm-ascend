@@ -90,31 +90,47 @@ def _row_map(payload: dict) -> dict[int, int]:
     return {int(pos): row for row, pos in enumerate(positions.tolist()) if int(pos) >= 0}
 
 
+ACL_FORMAT_FRACTAL_NZ = 29
+
+
+def _e8m0_dtype():
+    """``torch_npu.float8_e8m0fnu`` if this build has it, else ``None``.
+
+    Read straight off ``torch_npu`` on purpose: importing ``vllm_ascend`` here would
+    pull in the platform plugin (noisy) and, on the paths that touch
+    ``get_ascend_config()``, demand an ascend-config singleton that an offline
+    script has no way to initialize (that is exactly how the first attempt failed).
+    """
+    import torch_npu
+
+    return getattr(torch_npu, "float8_e8m0fnu", None)
+
+
 def _random_weight(args, q):
     """A same-shaped random fp8 weight, so the op can be re-run without a w dump.
 
     Order sensitivity is a property of the *call shape* (tiling / accumulation), not
-    of the weight values, so a random weight of the right shape is enough to answer
-    "does this op care about the row order".  It is built here on the NPU device
-    with the same post-loading transform the layer uses (transpose + NZ), because
-    the kernel expects that layout -- a plain tensor would either fail or be read as
-    garbage.
+    of the weight values, so a random weight of the right shape answers "does this
+    op care about the row order".  The layout still has to be the one the kernel
+    expects -- post-loading the layer keeps ``weight`` transposed to ``[K, N]`` and
+    NZ-cast, and the scale packed as ``[K/group/2, N, 2]`` -- so the same cast is
+    applied here (``npu_format_cast``, what ``maybe_trans_nz`` wraps).
     """
     import torch_npu
 
-    from vllm_ascend.device.mxfp_compat import FLOAT8_E8M0FNU_DTYPE
-    from vllm_ascend.utils import maybe_trans_nz
-
     device = q.device
     k = int(q.shape[1])
-    weight = torch.randn(k, args.n, device=device).to(torch.float8_e4m3fn)
-    weight = maybe_trans_nz(weight, customize_dtype=torch.float8_e4m3fn)
     group = max(1, args.group_size)
+    if k % group or (k // group) % 2:
+        raise ValueError(f"K={k} 不能被 group={group} 整除两次，MX scale 无法打包")
+    weight = torch.randn(k, args.n, device=device).to(torch.float8_e4m3fn)
+    if args.nz:
+        weight = torch_npu.npu_format_cast(
+            weight, ACL_FORMAT_FRACTAL_NZ, customize_dtype=torch.float8_e4m3fn
+        )
     scale = torch.full((k // group // 2, args.n, 2), 127, dtype=torch.uint8, device=device)
-    if FLOAT8_E8M0FNU_DTYPE is not None:
-        scale = scale.view(FLOAT8_E8M0FNU_DTYPE)
     print(
-        f"[repro] 随机权重（同形状）: weight={tuple(weight.shape)} {weight.dtype} | "
+        f"[repro] 随机权重（同形状，nz={args.nz}）: weight={tuple(weight.shape)} {weight.dtype} | "
         f"scale={tuple(scale.shape)} {scale.dtype}"
     )
     return weight, scale
@@ -123,15 +139,13 @@ def _random_weight(args, q):
 def _run_op(args, q, scale, weight, weight_scale):
     import torch_npu
 
-    from vllm_ascend.device.mxfp_compat import FLOAT8_E8M0FNU_DTYPE
-
     return torch_npu.npu_quant_matmul(
         q,
         weight,
         weight_scale,
-        scale_dtype=FLOAT8_E8M0FNU_DTYPE,
+        scale_dtype=_e8m0_dtype(),
         pertoken_scale=scale,
-        pertoken_scale_dtype=FLOAT8_E8M0FNU_DTYPE,
+        pertoken_scale_dtype=_e8m0_dtype(),
         bias=None,
         output_dtype=torch.bfloat16,
         group_sizes=[1, 1, args.group_size],
@@ -157,6 +171,13 @@ def main(argv: list[str] | None = None) -> int:
         type=int,
         default=768,
         help="output dim of the GEMM for --random-weight (down_proj: hidden_size / TP)",
+    )
+    parser.add_argument(
+        "--no-nz",
+        dest="nz",
+        action="store_false",
+        help="with --random-weight: skip the NZ format cast (use when the site runs "
+        "with VLLM_ASCEND_ENABLE_NZ=0)",
     )
     parser.add_argument("--group-size", type=int, default=32, help="MX group size (W8A8_MXFP8: 32)")
     parser.add_argument("--token", type=int, default=None, help="report this token's row in both layouts")
@@ -249,6 +270,16 @@ def main(argv: list[str] | None = None) -> int:
     idx_c = torch.tensor([rows_c[t] for t in tokens], dtype=torch.long)
     left = out_b.index_select(0, idx_b).float()
     right = out_c.index_select(0, idx_c).float()
+    # Sanity: a wrong weight layout can make the kernel return zeros/NaN, and an
+    # all-equal garbage output would look like "order independent" -- the opposite
+    # of the truth.  Refuse to draw a conclusion from a degenerate result.
+    if not torch.isfinite(left).all() or float(left.abs().max()) == 0.0:
+        print(
+            "[repro] 警告: 输出为 NaN/全零 ⇒ 权重布局或调用形状不被该内核接受，"
+            "本次结论不可信；试 --no-nz，或改用真实 w dump（带 qin:<层> 跑一轮）",
+            file=sys.stderr,
+        )
+        return 2
     delta = (left - right).abs()
     per_token = delta.max(dim=1).values
     differing = int((per_token > 0).sum())

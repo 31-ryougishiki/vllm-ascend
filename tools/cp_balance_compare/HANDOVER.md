@@ -45,9 +45,10 @@ in ─attn─▶ out ─norm─▶ mlp_in ─[量化]─▶ gu_q ─gate_up─�
 ```bash
 # 优先用同层 w dump（qin:<层> 从 bf1fa116a 起还会写 rank0 的 weight/weight_scale）
 python tools/cp_balance_compare/repro_row_order.py --dir <轮次目录> --layer 0 --run-op
-# 旧轮次没有 w dump 时，用同形状随机权重（不必再跑一轮）：
+# 旧轮次没有 w dump 时，用同形状随机权重（不必再跑一轮）；
+# 权重按层内同样的后处理构造（transpose + npu_format_cast NZ），站点若 VLLM_ASCEND_ENABLE_NZ=0 就加 --no-nz
 python tools/cp_balance_compare/repro_row_order.py --dir <轮次目录> --layer 0 \
-    --run-op --random-weight --n 768        # --n = down_proj 输出维（hidden/TP）
+    --run-op --random-weight --n 768 [--no-nz]   # --n = down_proj 输出维（hidden/TP）
 ```
 
 判据：`differing > 0` ⇒ matmul 行序相关，最小复现成立；`differing == 0` ⇒ 差异在归约侧，
