@@ -39,18 +39,19 @@
 | `ab_cp_compare.py` | 主 driver：顺序拉起 B/C/B2、发请求、算指标、写 `summary.json` | 是 |
 | `launcher_glm52_w4a4c8_mxfp4.sh` | 站点 launcher（TP=8），支持全部 cp_balance 环境覆盖、打印指纹、透传 `EXTRA_SERVE_ARGS` | 是 |
 | `launcher_template.sh` | launcher 参考实现（任何 launcher 必须遵守的两条规则：env 覆盖必须生效、必须打印指纹） | 是 |
+| `sites.sh` | **站点档案**：一台机器一份默认值（IP / repo / 权重 / PROFILER_DIR / TP_SIZE / 可见卡 / vendor env），`export CP_AB_SITE=its\|share` 即可切换。launcher 与 `run_cp_diag.sh` 都 source 它，所以 TP 与 `--cp-size` 永远一致；显式 `export` 单个变量仍然优先 | 否 |
 | `run_cp_diag.sh` | 一轮 A/B 的标准入口（模式见 §四） | 是（`check` 除外） |
 | `run_single.py` | 单配置手工调试：起一个 server + 用与 A/B 相同的请求体发一次推理，落盘 payload/response 供 curl 复现 | 是 |
 | `check_zigzag_dumps.py` | CPU 侧判读 dump（`kv` / `topk` / `act`，见 §五） | 否 |
 | `repro_row_order.py` | 离线复现"同一 token 的行换个位置结果就变"：读一轮的 `dnq`/`guq` dump（+ 同层 `w` 权重 dump）重跑 `npu_quant_matmul`，比较两种行序下同一 token 的输出。`--all-ranks` 扫全部有 dump 的 TP rank（`w` 只有 rank 0，其余 rank 自动用同形状随机权重并打印 `w=random`），`--tp-size N` 做覆盖检查——**缺 rank 会显式告警，判词不会写成 N/N**；`--device`（默认 `npu:0`）决定算子跑在哪张卡 | 否（`--run-op` 需要 NPU） |
 | `compare_cp_rounds.py` | 把多轮 `summary.json` 并排，回答"改了某个变量后 `C−B` 是否回到噪声级" | 否 |
-| `mock_vllm_server.py` / `selftest_mock.py` | 假 server + CPU 自测（56 项：协议解析、指纹/payload、dump 判读、复现器设备/全 rank/NZ 重放、HCCL 确定性接线、w dump 的 NZ 兜底、launcher 静态检查、端到端）。逐项打印 `[run]`/`[ok] … (耗时)`，单项 90s 超时（Linux 下 SIGALRM + faulthandler 打印卡住的栈），失败不中止整轮；支持 `--list`、`--only <子串>`、`--skip launcher,preflight`、`--test-timeout N`。**每次 `bash` 启动 >2s 的机器**（重 `BASH_ENV`/慢挂载）会自动跳过 4 个起 launcher 的用例并说明原因（要强制跑用 `--only`） | 否 |
+| `mock_vllm_server.py` / `selftest_mock.py` | 假 server + CPU 自测（57 项：协议解析、指纹/payload、dump 判读、复现器设备/全 rank/NZ 重放、HCCL 确定性接线、站点档案切换、w dump 的 NZ 兜底、launcher 静态检查、端到端）。逐项打印 `[run]`/`[ok] … (耗时)`，单项 90s 超时（Linux 下 SIGALRM + faulthandler 打印卡住的栈），失败不中止整轮；支持 `--list`、`--only <子串>`、`--skip launcher,preflight`、`--test-timeout N`。**每次 `bash` 启动 >2s 的机器**（重 `BASH_ENV`/慢挂载）会自动跳过 4 个起 launcher 的用例并说明原因（要强制跑用 `--only`） | 否 |
 | `selfcheck.py` | 环境体检（解释器/依赖/import 来源/NPU/端口/磁盘/残留进程）+ **不依赖 git 的版本指纹**（`--fingerprint`：关键文件 sha256 + 修复标记 + 用例数，末行 `[fp] …` 贴回来即可对齐版本）+ 跑一遍自测 + `--collect` 收整轮证据。**不做**配置门与命令预演——那两件事由 `ab_cp_compare.py --preflight` 与 `run_cp_diag.sh <mode> --dry-run` 负责（每轮都会跑，不会腐化） | 否 |
 | `prepare_env.sh` | 一次性 `source` 站点 rc + vendor 环境并 `export CP_AB_SKIP_SOURCE=1`，省掉每轮两次 source；**必须 source** | 否 |
 
 ## 四、一轮 NPU 轮次怎么跑
 
-`run_cp_diag.sh` 的模式（默认参数：`PROMPT_LENS=2048,2049,4096`、`MIN_TOKENS=2048`、`TP_SIZE=CP_SIZE=8`、`BASE_PORT=8034`）：
+`run_cp_diag.sh` 的模式（默认参数：`PROMPT_LENS=2048,2049,4096`、`MIN_TOKENS=2048`、`TP_SIZE=CP_SIZE=`站点档案给出（`its`=16、`share`=8）、`BASE_PORT=8034`）：
 
 | 模式 | 轮次目录 | 做什么 | 回答什么 |
 | --- | --- | --- | --- |
@@ -61,9 +62,11 @@
 | `check` | — | 直接 `exec check_zigzag_dumps.py --dir <dump> --kind ${KIND:-both}`（`KIND=act` 自动加 `--summary-only`） | 判读（不需要 NPU） |
 
 ```bash
+# 站点点错了整轮作废：先确认（也用于切换节点）
+export CP_AB_SITE=its                              # its=A3 7.246.78.76/16 卡（默认）；share=141.61.133.104/8 卡
 # 当前这一步（一轮 ≈ 20 分钟，2 次模型加载）
 unset DUMP_DIR                                     # ⚠️ 继承的 DUMP_DIR 会让 dump 改道（§九.1）
-bash tools/cp_balance_compare/run_cp_diag.sh probe --dry-run    # 先看 dir= 与 spec 对不对
+bash tools/cp_balance_compare/run_cp_diag.sh probe --dry-run    # 先看 site=/tp_size=/dir= 与 spec 对不对
 bash tools/cp_balance_compare/run_cp_diag.sh probe
 # 判读（--dir 用上一行 dry-run/运行输出里打印的那个，每轮都不同）
 python tools/cp_balance_compare/check_zigzag_dumps.py --dir /root/cp_probe/<时间戳> \
@@ -85,7 +88,7 @@ python tools/cp_balance_compare/check_zigzag_dumps.py --dir /root/cp_probe/<时�
 ⚠️ 若出现 `… skipped: no token positions for rows=2048 …`，说明该采样点既不是 rank 本地行、
 也不在补齐后的自然 slot mapping 覆盖范围内 → 该行会缺失（判读会打 `注意: … 缺 … 行`）。
 
-常用覆盖：`PROMPT_LENS`、`MIN_TOKENS`、`TP_SIZE`、`CP_SIZE`、`REPEAT_A=0`/`--no-repeat`（省一次加载）、`OUT_ROOT`、
+常用覆盖：`CP_AB_SITE`（站点档案，见 §三/§四）、`PROMPT_LENS`、`MIN_TOKENS`、`TP_SIZE`、`CP_SIZE`、`REPEAT_A=0`/`--no-repeat`（省一次加载）、`OUT_ROOT`、
 `DUMP_SPEC`（如 `act:0,1,2,3,mlp:0,1,2,3`、`kv:all`；置空=不 dump）、`DUMP_DIR`（**writer 与 checker 共用一个旋钮**）、`KIND`、`LAUNCHER`、
 `HCCL_DET`（集合通信确定性，见 §七）。
 launcher 还支持 `EXTRA_SERVE_ARGS="--enable-return-routed-experts"`（空格分隔，透传额外 `vllm serve` 参数；

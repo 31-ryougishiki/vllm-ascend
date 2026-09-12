@@ -12,10 +12,13 @@
 #
 # 可覆盖的环境变量：
 #   LAUNCHER     默认 bash tools/cp_balance_compare/launcher_glm52_w4a4c8_mxfp4.sh {port}
+#   CP_AB_SITE   站点档案（sites.sh）：its = A3 7.246.78.76/16 卡（默认）；share = 141.61.133.104/8 卡。
+#                它决定 IP/repo/权重/PROFILER_DIR/TP_SIZE/可见卡；TP_SIZE 与 CP_SIZE 由档案给出，
+#                显式 export 仍然优先。切换节点只改这一个变量。
 #   PROMPT_LENS  默认 2048,2049,4096        MIN_TOKENS 默认 2048
+#   TP_SIZE      默认取站点档案（its=16、share=8；覆盖它必须同时覆盖 CP_SIZE）
 #   REPEAT_A     默认 1（=0 跳过 B2 重复跑：少一次模型加载。噪声地板已确认是 0 时可用，
 #                此时 driver 的阈值仍是 max(0.05, 5×0)=0.05，各 case 指标不受影响）
-#   TP_SIZE      默认 8（launcher 的 tensor-parallel-size，同时决定 zigzag 的 cp_size）
 #   CP_SIZE      默认取 TP_SIZE（driver 的 --cp-size，必须等于 TP_SIZE）
 #   OUT_ROOT     默认 /dev/shm/cp_ab        BASE_PORT  默认 8034
 #   KIND         check 模式的判读类型（默认 both；probe 轮用 KIND=act）
@@ -70,6 +73,17 @@ mode="${mode:-baseline}"
 readonly script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 readonly repo_root="$(cd "${script_dir}/../.." && pwd)"
 cd "${repo_root}"
+
+# Site profile = single source of truth for node parameters (IP/repo/model/TP/
+# visible chips).  Applying it here is what makes `CP_SIZE` follow this site's
+# TP_SIZE instead of a hard-coded 8 -- a mismatch between the server's TP and the
+# driver's --cp-size invalidates the whole round.
+# shellcheck source=sites.sh
+source "${script_dir}/sites.sh"
+if ! cp_ab_site_apply "${CP_AB_SITE:-}"; then
+  echo "[run_cp_diag] 站点档案无效；先 export CP_AB_SITE=$(cp_ab_site_list | tr '\n' '|' | sed 's/|$//')" >&2
+  exit 2
+fi
 
 driver="tools/cp_balance_compare/ab_cp_compare.py"
 checker="tools/cp_balance_compare/check_zigzag_dumps.py"
@@ -251,6 +265,7 @@ if (( ${#extra_env[@]} )); then
 fi
 
 echo "[run_cp_diag] mode=${mode} round=${round_name}"
+echo "[run_cp_diag] site=${CP_AB_SITE_RESOLVED} ip=${LOCAL_IP} tp_size=${TP_SIZE} cp_size=${cp_size} visible=${ASCEND_RT_VISIBLE_DEVICES}"
 echo "[run_cp_diag] prompt_lens=${prompt_lens} min_tokens=${min_tokens} cp_size=${cp_size} repeat_a=${repeat_a} out=${out}"
 [[ -n "${dump_spec}" ]] && echo "[run_cp_diag] dump=${dump_spec} dir=${dump_dir}"
 if (( ${#hccl_det_env[@]} )); then

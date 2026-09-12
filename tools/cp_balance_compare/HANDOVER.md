@@ -164,8 +164,9 @@ prev/next 两次调用形状（验证用的 `2call` 开关已随结论删除，�
 
 | 项 | 值 |
 | --- | --- |
-| 站点 | `VLLM_ASCEND_REPO=/home/z30055003/vllm-ascend`、`MODEL_PATH=/mnt/share/weights/GLM-5.2-w4a4c8-mxfp4`、TP=**8**（=zigzag 的 `cp_size`，SP padding 到 `2*TP`） |
-| 通信 | launcher 固定 `HCCL_ALGO=level0:fullmesh`（现可覆盖）、`HCCL_BUFFSIZE=1200`、`HCCL_EXEC_TIMEOUT=204`；**归约确定性默认关**，由 `HCCL_DET=strict\|true\|atb` 打开（`run_cp_diag.sh` → `--env` → launcher 打印 `[cp-ab-hccl]` 行） |
+| 站点 | 切换用 `export CP_AB_SITE=its\|share`（档案在 `tools/cp_balance_compare/sites.sh`，**默认 `its`**）：<br>`its` = A3 `7.246.78.76`、repo `/opt/its/z30055003/vllm-ascend`、权重 `/opt/its/model/GLM-5.2-W4A8C8`、**TP=16**、可见卡 0..15、vendor env 跳过<br>`share` = 当前站点 `141.61.133.104`、repo `/home/z30055003/vllm-ascend`、权重 `/mnt/share/weights/GLM-5.2-w4a4c8-mxfp4`、TP=8、可见卡 0..7<br>⚠️ `its` 的权重路径是历史档案（W4A8C8）；那边若挂的是 mxfp4 权重，`export MODEL_PATH=…` 覆盖（档案不会挡） |
+| 通信 | launcher 固定 `HCCL_ALGO=level0:fullmesh`（现可覆盖）、`HCCL_BUFFSIZE=1200`、`HCCL_EXEC_TIMEOUT=204`；**归约确定性默认关**，由 `HCCL_DET=true\|atb\|expand\|strict` 打开（`run_cp_diag.sh` → `--env` → launcher 打印 `[cp-ab-hccl]` 行） |
+| 版本对齐 | launcher 每次打印 `[cp-ab-site] CP_AB_SITE=… LOCAL_IP=… TP_SIZE=… VISIBLE=… MODEL=…`：**轮次在哪个节点、多少卡，日志里必须能看出来**（TP 就是 zigzag 的 cp_size，半切换会让整轮结论作废） |
 | vLLM | **装好的包**（0.26.0，`site-packages`），模型层代码不在本仓库 ⇒ 本仓库只能靠 **hook/patch** 打点 |
 | 站点特性 | **每次 `bash` 启动 ≈22s**（自测里 4 个 launcher 用例会自动 `[skip]`）；`git` 常常不可用 |
 | 现场数据 | `/root/cp_probe/<时间戳>/`（probe 轮 dump，每轮一个子目录）、`/dev/shm/cp_ab*/<round>/`（summary + server 日志） |
@@ -254,7 +255,7 @@ python tools/cp_balance_compare/check_zigzag_dumps.py --dir "$DIR" \
 
 | 目的 | 命令 | 判据 |
 | --- | --- | --- |
-| CPU 自测（改完代码必跑） | `python tools/cp_balance_compare/selftest_mock.py` | 每项 `[run]`/`[ok] …(Ns)`，末行 `SELFTEST OK`（56 项）；卡住时最后一行 `[run]` 就是卡住的用例，90s 后自动超时并打栈；慢 bash 站点自动 `[skip]` 4 个 launcher 用例（`--only/--skip` 可覆盖） |
+| CPU 自测（改完代码必跑） | `python tools/cp_balance_compare/selftest_mock.py` | 每项 `[run]`/`[ok] …(Ns)`，末行 `SELFTEST OK`（57 项）；卡住时最后一行 `[run]` 就是卡住的用例，90s 后自动超时并打栈；慢 bash 站点自动 `[skip]` 4 个 launcher 用例（`--only/--skip` 可覆盖） |
 | 版本指纹（无 git） | `python tools/cp_balance_compare/selfcheck.py --fingerprint` | 末行 `[fp] <16 位>` + 文件摘要 + marker OK/MISSING |
 | 环境体检 | `python tools/cp_balance_compare/selfcheck.py` | `[verdict] READY`、无 FAIL |
 | 配置门（不加载模型） | `ab_cp_compare.py --preflight` | 末行 `[preflight] all configs OK` |

@@ -74,6 +74,9 @@ KEY_FILES = (
     "tools/cp_balance_compare/selftest_mock.py",
     "tools/cp_balance_compare/repro_row_order.py",
     "tools/cp_balance_compare/launcher_glm52_w4a4c8_mxfp4.sh",
+    # Site profiles: switching nodes is an env var, so the *file* has to be part
+    # of the version too (a stale copy on the box silently runs the wrong node).
+    "tools/cp_balance_compare/sites.sh",
     "vllm_ascend/attention/sfa_v1.py",
     "vllm_ascend/worker/model_runner_v1.py",
     "vllm_ascend/layers/cp_zigzag.py",

@@ -33,17 +33,26 @@
 #   bash launcher_glm52_w4a4c8_mxfp4.sh x <port>
 
 # ---------------------------------------------------------------------------
-# SITE section: adapt these to the machine.
+# SITE section: the values come from a switchable profile (sites.sh), so moving
+# to another test node is one variable, not an edit:
+#
+#   export CP_AB_SITE=its     # A3 站点 7.246.78.76（16 卡）—— 默认
+#   export CP_AB_SITE=share   # 当前站点 141.61.133.104（8 卡）
+#
+# Everything below keeps the `:=` override semantics: an explicit `export` of any
+# single value still wins over the profile.
 # ---------------------------------------------------------------------------
-NIC_NAME="${NIC_NAME:-eth2}"
-LOCAL_IP="${LOCAL_IP:-141.61.133.104}"
-VLLM_ASCEND_REPO="${VLLM_ASCEND_REPO:-/home/z30055003/vllm-ascend}"
-MODEL_PATH="${MODEL_PATH:-/mnt/share/weights/GLM-5.2-w4a4c8-mxfp4}"
+# shellcheck source=sites.sh
+source "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/sites.sh"
+if ! cp_ab_site_apply "${CP_AB_SITE:-}"; then
+  echo "[cp-ab] 站点档案无效，先 export CP_AB_SITE=$(cp_ab_site_list | tr '\n' '|' | sed 's/|$//') 再试" >&2
+  exit 2
+fi
 # Vendor environment that must be sourced before `vllm serve` (CANN custom
 # transformer ops).  It is a build artifact of a vllm-ascend checkout
 # (vllm_ascend/_cann_ops_custom/vendors/... is not in git), so the candidates
 # below hold the site path first and the repo-local one second.
-#   unset                                -> auto-detect, first hit wins
+#   profile 决定默认：auto = 自动探测候选链；none = 显式跳过（A3 历来如此）
 #   VENDOR_SET_ENV=                      -> skip the vendor env entirely
 #   VENDOR_SET_ENV=/path/to/set_env.bash -> use exactly that file
 VENDOR_SET_ENV_FALLBACKS=(
@@ -52,7 +61,12 @@ VENDOR_SET_ENV_FALLBACKS=(
   "${VLLM_ASCEND_REPO}/vllm_ascend/_cann_ops_custom/vendors/custom_transformer/bin/set_env.bash"
 )
 vendor_auto=false
-if [ -z "${VENDOR_SET_ENV+set}" ]; then
+if [ "${SITE_VENDOR_SET_ENV:-auto}" = "none" ]; then
+  # Profile says this site does not use the vendor env: pin it empty (which the
+  # code below and the [cp-ab-site] line both read as "skipped"), and let an
+  # explicit `export VENDOR_SET_ENV=...` override it.
+  : "${VENDOR_SET_ENV:=}"
+elif [ -z "${VENDOR_SET_ENV+set}" ]; then
   vendor_auto=true
   VENDOR_SET_ENV=""
   for candidate in "${VENDOR_SET_ENV_FALLBACKS[@]}"; do
@@ -62,7 +76,6 @@ if [ -z "${VENDOR_SET_ENV+set}" ]; then
     fi
   done
 fi
-PROFILER_DIR="${PROFILER_DIR:-/home/z30055003/profiling_no_pooling}"
 
 # ---------------------------------------------------------------------------
 # Site environment (same as the original prefill script).
@@ -110,9 +123,10 @@ export OMP_PROC_BIND=false
 export OMP_NUM_THREADS=10
 export PYTORCH_NPU_ALLOC_CONF=expandable_segments:True
 
-# 8 chips by default: TP_SIZE=8 needs ASCEND_RT_VISIBLE_DEVICES to cover them
-# (override if the box exposes a different set, e.g. 0..15 for TP=16).
-export ASCEND_RT_VISIBLE_DEVICES="${ASCEND_RT_VISIBLE_DEVICES:-0,1,2,3,4,5,6,7}"
+# Visible chips come from the site profile (its: 0..15 for TP=16, share: 0..7 for
+# TP=8); a manual `export` still wins.  Keep it in sync with TP_SIZE -- a short
+# list makes vllm fail at startup, a long one silently wastes chips.
+export ASCEND_RT_VISIBLE_DEVICES="${ASCEND_RT_VISIBLE_DEVICES:?site profile must set it (see sites.sh)}"
 export TASK_QUEUE_ENABLE=1
 
 plog_dir="${PWD}/$(date +%Y%m%d_%H%M%S)/plog"
@@ -227,6 +241,10 @@ echo "[cp-ab-cfg] ${additional_config}"
 # Diagnostic dump switch: the driver injects it per round; echoing it here makes
 # "round finished but no dump was written" traceable to the env that was applied.
 echo "[cp-ab] DUMP=${VLLM_ASCEND_CP_BALANCE_DUMP:-<unset>}"
+# Which site profile this round actually ran with.  A round on the wrong node (or
+# with the wrong TP) is otherwise indistinguishable in the log -- and TP is the
+# zigzag's cp_size, so a mismatch invalidates every conclusion of the round.
+echo "[cp-ab-site] CP_AB_SITE=${CP_AB_SITE_RESOLVED} LOCAL_IP=${LOCAL_IP} TP_SIZE=${TP_SIZE} VISIBLE=${ASCEND_RT_VISIBLE_DEVICES} REPO=${VLLM_ASCEND_REPO} MODEL=${MODEL_PATH} VENDOR=${VENDOR_SET_ENV:-none}"
 # HCCL/ATB determinism knobs -- deliberately pass-through: this launcher never
 # forces them, the round decides (`run_cp_diag.sh` with HCCL_DET=...).  The
 # candidate root cause for the B-vs-C prefill difference is the cross-rank

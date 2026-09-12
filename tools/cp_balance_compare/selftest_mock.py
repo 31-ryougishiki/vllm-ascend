@@ -1647,6 +1647,96 @@ def test_repro_row_order_replays_the_nz_cast_for_an_nd_weight_dump() -> None:
         shutil.rmtree(out, ignore_errors=True)
 
 
+def test_site_profiles_switch_the_node_in_one_variable() -> None:
+    """``CP_AB_SITE`` must switch IP/repo/model/TP/visible chips together.
+
+    The 2026-09-12 site move taught the lesson: `43a8b336d` changed the paths but
+    left ``TP_SIZE=16``/``ASCEND_RT_VISIBLE_DEVICES=0..15`` behind, and TP *is* the
+    zigzag's cp_size -- a half-switched profile silently invalidates a round.  The
+    profiles are therefore checked as a set: node parameters and TP move together,
+    an explicit export still wins, and an unknown name fails loudly.
+    """
+    sites = HERE / "sites.sh"
+    assert sites.is_file(), sites
+    text = sites.read_text(encoding="utf-8")
+    for needle in (
+        "its)",
+        "share)",
+        "7.246.78.76",
+        "141.61.133.104",
+        "/opt/its/z30055003/vllm-ascend",
+        "/home/z30055003/vllm-ascend",
+        "/opt/its/model/GLM-5.2-W4A8C8",
+        "/mnt/share/weights/GLM-5.2-w4a4c8-mxfp4",
+        "TP_SIZE:=16",
+        "TP_SIZE:=8",
+        "0,1,2,3,4,5,6,7,8,9,10,11,12,13,14,15",
+    ):
+        assert needle in text, f"{needle!r} missing from sites.sh"
+    launcher = (HERE / "launcher_glm52_w4a4c8_mxfp4.sh").read_text(encoding="utf-8")
+    assert "cp_ab_site_apply" in launcher, launcher
+    assert "[cp-ab-site]" in launcher, launcher
+    runner = (HERE / "run_cp_diag.sh").read_text(encoding="utf-8")
+    # cp_size must follow the profile's TP_SIZE, not a hard-coded 8.
+    assert 'source "${script_dir}/sites.sh"' in runner, runner
+    assert "cp_ab_site_apply" in runner, runner
+    assert "cp_size=${cp_size}" in runner, runner
+
+    if _skip_if_bash_slow("test_site_profiles_switch_the_node_in_one_variable"):
+        return
+    import os
+    import shlex
+    import subprocess
+
+    out = _temp_dir("cp_ab_site_")
+    try:
+        overrides = _launcher_dry_run_env(out)
+        seen: dict[str, str] = {}
+        for site in ("its", "share"):
+            env = os.environ.copy()
+            env.update(overrides)
+            env["CP_AB_SITE"] = site
+            env["DRY_RUN"] = "1"
+            cmd = f"bash {shlex.quote((HERE / 'launcher_glm52_w4a4c8_mxfp4.sh').as_posix())} 8034"
+            try:
+                proc = subprocess.run(
+                    ["bash", "-lc", cmd], cwd=str(HERE), env=env, capture_output=True,
+                    text=True, encoding="utf-8", errors="replace", timeout=120,
+                )
+            except (OSError, subprocess.SubprocessError) as exc:
+                print(f"[skip] cannot execute bash ({exc})")
+                return
+            text_out = proc.stdout + proc.stderr
+            # The site line is printed before the dry-run checks, so the profile
+            # assertions work even where the fake `vllm` is not executable.
+            line = next((l for l in text_out.splitlines() if "[cp-ab-site]" in l), None)
+            assert line is not None, text_out
+            assert f"CP_AB_SITE={site}" in line, line
+            seen[site] = line
+            if "vllm not found in PATH" not in text_out:
+                assert proc.returncode == 0, f"{site}: rc={proc.returncode}\n{text_out}"
+        assert "LOCAL_IP=7.246.78.76" in seen["its"], seen["its"]
+        assert "TP_SIZE=16" in seen["its"], seen["its"]
+        assert "VISIBLE=0,1,2,3,4,5,6,7,8,9,10,11,12,13,14,15" in seen["its"], seen["its"]
+        assert "LOCAL_IP=141.61.133.104" in seen["share"], seen["share"]
+        assert "TP_SIZE=8" in seen["share"], seen["share"]
+
+        # An unknown site fails before touching any NPU.
+        env = os.environ.copy()
+        env.update(overrides)
+        env["CP_AB_SITE"] = "nope"
+        env["DRY_RUN"] = "1"
+        proc = subprocess.run(
+            ["bash", "-lc", f"bash {shlex.quote((HERE / 'launcher_glm52_w4a4c8_mxfp4.sh').as_posix())} 8034"],
+            cwd=str(HERE), env=env, capture_output=True, text=True,
+            encoding="utf-8", errors="replace", timeout=120,
+        )
+        assert proc.returncode != 0, proc.stdout + proc.stderr
+        assert "未知站点" in (proc.stdout + proc.stderr), proc.stdout + proc.stderr
+    finally:
+        shutil.rmtree(out, ignore_errors=True)
+
+
 def test_selfcheck_fingerprint_markers_match_the_code() -> None:
     """Every behaviour marker in ``selfcheck.fingerprint_lines`` must be present here.
 
