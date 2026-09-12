@@ -117,6 +117,57 @@ _FILE_KIND_OP = {
 }
 
 
+def _hint_subdirs(dump_dir: str, kind: str) -> str:
+    """``"（最近一轮在 <dir>）"`` when the dumps live one level down.
+
+    ``probe`` writes into ``<dump root>/<timestamp>/`` so that two rounds can never
+    be stitched into one table.  Pointing ``--dir`` at the *root* then finds
+    nothing (the glob is not recursive) -- and the root still holds an older
+    round's files, so the tempting "just pass the parent" would silently judge the
+    wrong round.  Say where the dumps actually are instead.
+    """
+    try:
+        entries = sorted(
+            (path for path in os.scandir(dump_dir) if path.is_dir()),
+            key=lambda path: path.stat().st_mtime,
+            reverse=True,
+        )
+    except OSError:
+        return ""
+    for entry in entries[:3]:
+        if any(glob.glob(os.path.join(entry.path, pattern)) for pattern in _KIND_GLOBS.get(kind, (f"{kind}_*.pt",))):
+            return f"（最近一轮在 {entry.path}）"
+    return ""
+
+
+def _newer_subdir(dump_dir: str, kind: str, newest_ts: int) -> str:
+    """Newest subdirectory holding a *newer* dump of ``kind`` than ``newest_ts``.
+
+    The dangerous half of the per-round-directory scheme: the root still holds the
+    previous round's files, so pointing ``--dir`` at the root silently judges stale
+    data instead of failing.  Compare what was selected with what the subdirectories
+    hold and say so.
+    """
+    try:
+        entries = sorted(
+            (path for path in os.scandir(dump_dir) if path.is_dir()),
+            key=lambda path: path.stat().st_mtime,
+            reverse=True,
+        )
+    except OSError:
+        return ""
+    for entry in entries[:3]:
+        best = 0
+        for pattern in _KIND_GLOBS.get(kind, (f"{kind}_*.pt",)):
+            for path in glob.glob(os.path.join(entry.path, pattern)):
+                match = NAME_RE.search(os.path.basename(path))
+                if match is not None:
+                    best = max(best, int(match.group("ts")))
+        if best > newest_ts:
+            return entry.path
+    return ""
+
+
 def _load(path: str, warn: bool = True) -> dict | None:
     """Load one dump, or ``None`` when the file is unreadable.
 
@@ -371,7 +422,7 @@ def _topk_cross_config(args, latest: dict) -> int:
 def check_topk(args) -> int:
     files = list(_iter_dumps(args.dir, "topk"))
     if not files:
-        print(f"[topk] no dump found under {args.dir}", file=sys.stderr)
+        print(f"[topk] no dump found under {args.dir}{_hint_subdirs(args.dir, 'topk')}", file=sys.stderr)
         return 2
     latest, counts = _latest_per_server(files)
     failures = 0
@@ -691,7 +742,7 @@ def _print_kv_summary(per_layer: dict[int, dict], ignored: int) -> None:
 def check_kv(args) -> int:
     files = list(_iter_dumps(args.dir, "kv"))
     if not files:
-        print(f"[kv] no dump found under {args.dir}", file=sys.stderr)
+        print(f"[kv] no dump found under {args.dir}{_hint_subdirs(args.dir, 'kv')}", file=sys.stderr)
         return 2
     latest, counts = _latest_per_server(files)
     by_layer: dict[tuple[int, int], dict[str, tuple[str, dict]]] = defaultdict(dict)
@@ -982,7 +1033,7 @@ def check_act(args) -> int:
     """
     files = list(_iter_dumps(args.dir, "act"))
     if not files:
-        print(f"[act] no dump found under {args.dir}", file=sys.stderr)
+        print(f"[act] no dump found under {args.dir}{_hint_subdirs(args.dir, 'act')}", file=sys.stderr)
         return 2
     latest, counts = _latest_per_server(files, fields=("kind", "layer", "rank", "cpbal"))
     groups: dict[tuple[int, str], dict[str, list[str]]] = defaultdict(lambda: defaultdict(list))
@@ -994,7 +1045,7 @@ def check_act(args) -> int:
             ignored += counts[key] - 1
         groups[(layer, op)][cpbal].append(latest[key][0])
     if not groups:
-        print(f"[act] no usable dump under {args.dir}", file=sys.stderr)
+        print(f"[act] no usable dump under {args.dir}{_hint_subdirs(args.dir, 'act')}", file=sys.stderr)
         return 2
 
     # Rounds share a dump directory unless the caller gives each one its own, and
@@ -1007,6 +1058,13 @@ def check_act(args) -> int:
         span_min = (stamps[-1] - stamps[0]) / 60e9
         newest = time.strftime("%m-%d %H:%M", time.localtime(stamps[-1] / 1e9))
         print(f"[act] 选中 dump 时间跨度 {span_min:.1f} 分钟（最新 {newest}）")
+        newer = _newer_subdir(args.dir, "act", stamps[-1])
+        if newer:
+            print(
+                f"[act] 警告: {args.dir} 这一层是**旧** dump，更新的一轮在 {newer} "
+                f"⇒ 请改用 --dir {newer}（probe 每轮写自己的时间戳子目录）",
+                file=sys.stderr,
+            )
         if span_min > 90:
             print(
                 f"[act] 警告: 跨度 {span_min:.0f} 分钟远超一轮时长 ⇒ 很可能混了旧轮次的文件；"

@@ -166,7 +166,7 @@ driver 每个配置都会：校验 `[cp-ab]` 指纹与 `[cp-ab-cfg]` 里的 `add
 
 1. **`DUMP_DIR` 会被继承**：`probe` 尊重已导出的 `DUMP_DIR`，sweep 留下的 `/root/cp_dump` 会让 probe 数据改道、`/root/cp_probe` 不出现。跑前 `unset DUMP_DIR`，或先 `--dry-run` 看 `dir=`（脚本会对继承值打 WARN）。
 2. **`/dev/shm` 很小**（容器默认几十 MB）：`kv:all` 是 GB 级、`act`/`mlp` 是几百 MB 级 ⇒ 一律落真实磁盘；写满会连 server 一起搞死（IPC/prometheus 在那儿）。
-3. **dump 目录跨轮累积**：判读按 `(layer[, op], rank, cpbal)` 取最新一份 ⇒ 不同轮次混在同一目录会"串味"。`probe` 已默认写进 `/root/cp_probe/<时间戳>` 子目录；`sweep` 等其他模式仍写固定目录，跨轮复用前先换目录。判读会打印选中文件的时间跨度，>90 分钟即告警。
+3. **dump 目录跨轮累积**：判读按 `(layer[, op], rank, cpbal)` 取最新一份 ⇒ 不同轮次混在同一目录会"串味"。`probe`/`probe2` 已默认写进 `/root/cp_probe/<时间戳>` 子目录；`sweep` 等其他模式仍写固定目录，跨轮复用前先换目录。判读会打印选中文件的时间跨度（>90 分钟告警），并在**指到父目录**（还有更新的子目录）时直接给出该用的 `--dir`；子目录里没有 dump 时也会提示最近一轮在哪。
 4. **`VAR=... cmd | tee` 前缀会静默丢**：用 `export` 单独一行，或用模式词（`probe`/`sweep`/`--no-repeat`）。
 5. **打点是 one-shot**（每层每进程一次、跳过 profile/warmup）⇒ 只有**第一个 prefill 请求**（driver 发的 2048）有数据；换层要改 `DUMP_SPEC` 再跑一轮。
 6. **截断的 dump** 判读会跳过并告警（不再崩）；一轮跑完却没有 dump，`run_cp_diag.sh` 以 rc=3 明确失败。

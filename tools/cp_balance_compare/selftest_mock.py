@@ -1237,6 +1237,56 @@ def test_parse_dump_spec_accepts_the_round_spec() -> None:
     assert parse("qin:all") == {"qin": set(range(1 << 20))}
 
 
+def test_check_zigzag_act_points_at_the_round_subdir() -> None:
+    """Each probe round writes its own <timestamp>/ subdir; judging the parent must warn.
+
+    The glob is not recursive, so passing the dump *root* silently judges whatever
+    older round is still lying there -- the most expensive misread available (a
+    whole round's conclusion).  The checker has to name the newer subdirectory.
+    """
+    if checker is None:
+        print("[skip] torch not available (check_zigzag_dumps needs it)")
+        return
+    import argparse
+
+    import torch
+
+    out = _temp_dir("cp_ab_subdir_")
+    try:
+        torch.manual_seed(61)
+        positions = torch.tensor(list(range(4)), dtype=torch.int32)
+        base = torch.zeros(4, 2).to(torch.bfloat16)
+        shifted = base.clone()
+        shifted[2:] = 1.0
+        for directory, stamp in ((out, 100), (out / "0912_101010", 999)):
+            directory.mkdir(exist_ok=True)
+            for cpbal, data in ((0, base), (1, shifted if stamp == 999 else base)):
+                for kind, payload in (("actin", base), ("actout", data)):
+                    torch.save(
+                        {"kind": "act", "positions": positions, "act": payload.clone()},
+                        directory / f"{kind}_cpbal{cpbal}_layer0_rank0_pid{stamp}_1{stamp}.pt",
+                    )
+
+        buffer, errors = io.StringIO(), io.StringIO()
+        with redirect_stdout(buffer), redirect_stderr(errors):
+            checker.check_act(argparse.Namespace(dir=str(out), summary_only=True, block_size=4))
+        errs = errors.getvalue()
+        assert "更新的一轮在" in errs and "0912_101010" in errs, errs
+
+        # Pointing at the subdir judges that round (here: a real divergence).
+        buffer, errors = io.StringIO(), io.StringIO()
+        with redirect_stdout(buffer), redirect_stderr(errors):
+            rc = checker.check_act(
+                argparse.Namespace(dir=str(out / "0912_101010"), summary_only=True, block_size=4)
+            )
+        text, errs = buffer.getvalue(), errors.getvalue()
+        assert rc == 1, text + errs
+        assert "FIRST DIVERGENCE (act): layer 0 op=out at token 2" in text, text
+        assert "更新的一轮在" not in errs, errs
+    finally:
+        shutil.rmtree(out, ignore_errors=True)
+
+
 def test_load_prompts_file() -> None:
     out = Path(_temp_dir("cp_ab_pf_"))
     try:
