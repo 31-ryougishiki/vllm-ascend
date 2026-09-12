@@ -231,7 +231,7 @@ python tools/cp_balance_compare/check_zigzag_dumps.py --dir "$DIR" \
 
 | commit | 内容 |
 | --- | --- |
-| `<本次>` | 复现器 `--run-op` 显式设备（`--device`，默认 `npu:0`）：dump 是 CPU 加载的，权重与算子输入必须先搬设备，否则 `npu_format_cast` / `npu_quant_matmul` 报 "'CPU' backend"（站点日志 09-12 的第二次失败）+ 对应 CPU 自测与指纹 marker |
+| `a02a44635` | 复现器 `--run-op` 显式设备（`--device`，默认 `npu:0`）：dump 是 CPU 加载的，权重与算子输入必须先搬设备，否则 `npu_format_cast` / `npu_quant_matmul` 报 "'CPU' backend"（站点日志 09-12 的第二次失败）+ 对应 CPU 自测与指纹 marker |
 | `b7de04fe2` | 复现器离线可用（`npu_format_cast` 直连，不依赖 ascend config）+ 退化保护 + `--no-nz` |
 | `e6292ab0e` | 复现器 slot 归一化 + `--random-weight`（不必再跑一轮）；HANDOVER 记录"只差最后一个算子" |
 | `18cb6a7c2` | 指纹按 LF 归一化（跨平台可比）+ 慢 bash 站点自动跳过 launcher 用例 |
