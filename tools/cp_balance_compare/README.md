@@ -63,7 +63,7 @@
 
 ```bash
 # 站点点错了整轮作废：先确认（也用于切换节点）
-export CP_AB_SITE=its                              # its=A3 7.246.78.76/16 卡（默认）；share=141.61.133.104/8 卡
+export CP_AB_SITE=its                              # its=A3 7.246.78.75/16 卡（默认）；share=141.61.133.104/8 卡
 # 当前这一步（一轮 ≈ 20 分钟，2 次模型加载）
 unset DUMP_DIR                                     # ⚠️ 继承的 DUMP_DIR 会让 dump 改道（§九.1）
 bash tools/cp_balance_compare/run_cp_diag.sh probe --dry-run    # 先看 site=/tp_size=/dir= 与 spec 对不对

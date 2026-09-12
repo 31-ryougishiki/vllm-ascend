@@ -164,7 +164,7 @@ prev/next 两次调用形状（验证用的 `2call` 开关已随结论删除，�
 
 | 项 | 值 |
 | --- | --- |
-| 站点 | 切换用 `export CP_AB_SITE=its\|share`（档案在 `tools/cp_balance_compare/sites.sh`，**默认 `its`**）：<br>`its` = A3 `7.246.78.76`、repo `/opt/its/z30055003/vllm-ascend`、权重 `/opt/its/model/GLM-5.2-W4A8C8`、**TP=16**、可见卡 0..15、vendor env 跳过<br>`share` = 当前站点 `141.61.133.104`、repo `/home/z30055003/vllm-ascend`、权重 `/mnt/share/weights/GLM-5.2-w4a4c8-mxfp4`、TP=8、可见卡 0..7<br>⚠️ `its` 的权重路径是历史档案（W4A8C8）；那边若挂的是 mxfp4 权重，`export MODEL_PATH=…` 覆盖（档案不会挡） |
+| 站点 | 切换用 `export CP_AB_SITE=its\|share`（档案在 `tools/cp_balance_compare/sites.sh`，**默认 `its`**）：<br>`its` = A3 `7.246.78.75`、repo `/opt/its/z30055003/vllm-ascend`、权重 `/opt/its/model/GLM-5.2-W4A8C8`、**TP=16**、可见卡 0..15、vendor env 跳过<br>`share` = 当前站点 `141.61.133.104`、repo `/home/z30055003/vllm-ascend`、权重 `/mnt/share/weights/GLM-5.2-w4a4c8-mxfp4`、TP=8、可见卡 0..7<br>⚠️ `its` 的权重路径是历史档案（W4A8C8）；那边若挂的是 mxfp4 权重，`export MODEL_PATH=…` 覆盖（档案不会挡） |
 | 通信 | launcher 固定 `HCCL_ALGO=level0:fullmesh`（现可覆盖）、`HCCL_BUFFSIZE=1200`、`HCCL_EXEC_TIMEOUT=204`；**归约确定性默认关**，由 `HCCL_DET=true\|atb\|expand\|strict` 打开（`run_cp_diag.sh` → `--env` → launcher 打印 `[cp-ab-hccl]` 行） |
 | 版本对齐 | launcher 每次打印 `[cp-ab-site] CP_AB_SITE=… LOCAL_IP=… TP_SIZE=… VISIBLE=… MODEL=…`：**轮次在哪个节点、多少卡，日志里必须能看出来**（TP 就是 zigzag 的 cp_size，半切换会让整轮结论作废） |
 | vLLM | **装好的包**（0.26.0，`site-packages`），模型层代码不在本仓库 ⇒ 本仓库只能靠 **hook/patch** 打点 |

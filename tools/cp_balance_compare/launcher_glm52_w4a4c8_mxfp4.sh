@@ -36,7 +36,7 @@
 # SITE section: the values come from a switchable profile (sites.sh), so moving
 # to another test node is one variable, not an edit:
 #
-#   export CP_AB_SITE=its     # A3 站点 7.246.78.76（16 卡）—— 默认
+#   export CP_AB_SITE=its     # A3 站点 7.246.78.75（16 卡）—— 默认
 #   export CP_AB_SITE=share   # 当前站点 141.61.133.104（8 卡）
 #
 # Everything below keeps the `:=` override semantics: an explicit `export` of any

@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # 站点档案（site profiles）—— 一次 export 就能换测试节点。
 #
-#   export CP_AB_SITE=its      # A3 站点 7.246.78.76（16 卡）—— 默认
+#   export CP_AB_SITE=its      # A3 站点 7.246.78.75（16 卡）—— 默认
 #   export CP_AB_SITE=share    # 当前站点 141.61.133.104（8 卡）
 #   unset CP_AB_SITE           # 等价于默认档案
 #
@@ -28,10 +28,12 @@ cp_ab_site_apply() {
   case "${name}" in
     its)
       # A3 站点：/opt/its 挂载点、16 卡；`a5507f5e3` 的 SITE 段原样恢复。
+      # ⚠️ IP 用现场值 **7.246.78.75**：git 历史里写的是 7.246.78.76（末位 6），
+      #    现场确认末位是 5；别再照历史"改回去"。
       # ⚠️ 历史档案用的权重是 GLM-5.2-W4A8C8；若该机器上挂的是 w4a4c8-mxfp4，
       #    用 `export MODEL_PATH=/opt/its/model/GLM-5.2-w4a4c8-mxfp4` 覆盖（档案不会挡）。
       : "${NIC_NAME:=eth2}"
-      : "${LOCAL_IP:=7.246.78.76}"
+      : "${LOCAL_IP:=7.246.78.75}"
       : "${VLLM_ASCEND_REPO:=/opt/its/z30055003/vllm-ascend}"
       : "${MODEL_PATH:=/opt/its/model/GLM-5.2-W4A8C8}"
       : "${PROFILER_DIR:=/opt/its/z30055003/profiling_no_pooling}"

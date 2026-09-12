@@ -1662,7 +1662,7 @@ def test_site_profiles_switch_the_node_in_one_variable() -> None:
     for needle in (
         "its)",
         "share)",
-        "7.246.78.76",
+        "7.246.78.75",
         "141.61.133.104",
         "/opt/its/z30055003/vllm-ascend",
         "/home/z30055003/vllm-ascend",
@@ -1715,7 +1715,7 @@ def test_site_profiles_switch_the_node_in_one_variable() -> None:
             seen[site] = line
             if "vllm not found in PATH" not in text_out:
                 assert proc.returncode == 0, f"{site}: rc={proc.returncode}\n{text_out}"
-        assert "LOCAL_IP=7.246.78.76" in seen["its"], seen["its"]
+        assert "LOCAL_IP=7.246.78.75" in seen["its"], seen["its"]
         assert "TP_SIZE=16" in seen["its"], seen["its"]
         assert "VISIBLE=0,1,2,3,4,5,6,7,8,9,10,11,12,13,14,15" in seen["its"], seen["its"]
         assert "LOCAL_IP=141.61.133.104" in seen["share"], seen["share"]

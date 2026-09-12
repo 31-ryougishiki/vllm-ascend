@@ -12,7 +12,7 @@
 #
 # 可覆盖的环境变量：
 #   LAUNCHER     默认 bash tools/cp_balance_compare/launcher_glm52_w4a4c8_mxfp4.sh {port}
-#   CP_AB_SITE   站点档案（sites.sh）：its = A3 7.246.78.76/16 卡（默认）；share = 141.61.133.104/8 卡。
+#   CP_AB_SITE   站点档案（sites.sh）：its = A3 7.246.78.75/16 卡（默认）；share = 141.61.133.104/8 卡。
 #                它决定 IP/repo/权重/PROFILER_DIR/TP_SIZE/可见卡；TP_SIZE 与 CP_SIZE 由档案给出，
 #                显式 export 仍然优先。切换节点只改这一个变量。
 #   PROMPT_LENS  默认 2048,2049,4096        MIN_TOKENS 默认 2048
