@@ -98,9 +98,29 @@ python tools/cp_balance_compare/repro_row_order.py --dir "$DIR" --layer 0 \
 现在设备由 `--device`（默认 `npu:0`）决定，权重与算子输入都会先搬过去；跑起来应先看到
 `[repro] device: npu:0（dump 是 CPU 加载的…）`。
 
-**后续分支**：8/8 rank 都行序无关 ⇒ 归约侧 → 把 row-parallel 归约换成 `all_reduce + slice` 做 A/B
-（或查 HCCL 算法/确定性开关），再用 `probe2` 看 `C−B` 是否回噪；输出 NaN/全零 ⇒ 权重布局不被接受
-（试 `--no-nz`，或用真实 `w` dump）。
+**后续分支**（8/8 rank 都行序无关 ⇒ 归约侧；两步走，先便宜的后贵的）：
+
+**第 1 步 — 开 HCCL 归约确定性（一轮 probe ≈20 分钟，先做这个）**。这条归约就是
+`tensor_model_parallel_reduce_scatter` → vLLM `base_device_communicator.reduce_scatter` →
+`torch.distributed.reduce_scatter_tensor` → **HCCL ReduceScatter**，而 HCCL 本身有归约类算子的
+确定性与保序开关（官方说明见 [HCCL_DETERMINISTIC](https://gitcode.com/cann/hccl/blob/master/docs/user_guide/hccl_env/HCCL_DETERMINISTIC.md)：
+`false`(默认)/`true`/`strict`，覆盖 AllReduce / ReduceScatter / ReduceScatterV / Reduce；
+`LCCL_DETERMINISTIC=1` 在 rankSize ≤ 8 时生效 —— 本站 TP=8 正命中）：
+
+```bash
+export HCCL_DET=strict        # 单独一行：VAR=... 前缀在同一条命令里会静默丢
+unset DUMP_DIR
+bash tools/cp_balance_compare/run_cp_diag.sh probe      # → r_probe_det，env=HCCL_DETERMINISTIC=strict LCCL_DETERMINISTIC=1
+```
+
+判据：① 日志有 `[cp-ab-hccl] … HCCL_DETERMINISTIC=strict LCCL_DETERMINISTIC=1 …`；
+② `compare_cp_rounds.py 基线=/dev/shm/cp_ab_probe/r_probe 确定性=/dev/shm/cp_ab_probe/r_probe_det`
+末行 `back to the noise floor`（`p99|d|C-B ≤ 0.05`）⇒ 归约顺序即根因、且这是可用的缓解手段（代价是性能）；
+③ 同轮 `[act]` 里 layer 0 `mlp_out` 从 1664/2048 变 0 ⇒ 算子级确认。
+`strict` 不被芯片/CANN 支持时退到 `HCCL_DET=true`。
+
+**第 2 步（第 1 步无效才做）** — 换归约实现：把 row-parallel 归约换成 `all_reduce + slice` 做 A/B
+（或继续查 HCCL 算法/展开模式 `HCCL_ALGO`、`HCCL_OP_EXPANSION_MODE`），再用 `probe2` 看 `C−B` 是否回噪。
 
 ## 2. 已确认 / 已排除（可直接引用）
 
@@ -126,6 +146,7 @@ prev/next 两次调用形状（验证用的 `2call` 开关已随结论删除，�
 | 项 | 值 |
 | --- | --- |
 | 站点 | `VLLM_ASCEND_REPO=/home/z30055003/vllm-ascend`、`MODEL_PATH=/mnt/share/weights/GLM-5.2-w4a4c8-mxfp4`、TP=**8**（=zigzag 的 `cp_size`，SP padding 到 `2*TP`） |
+| 通信 | launcher 固定 `HCCL_ALGO=level0:fullmesh`（现可覆盖）、`HCCL_BUFFSIZE=1200`、`HCCL_EXEC_TIMEOUT=204`；**归约确定性默认关**，由 `HCCL_DET=strict\|true\|atb` 打开（`run_cp_diag.sh` → `--env` → launcher 打印 `[cp-ab-hccl]` 行） |
 | vLLM | **装好的包**（0.26.0，`site-packages`），模型层代码不在本仓库 ⇒ 本仓库只能靠 **hook/patch** 打点 |
 | 站点特性 | **每次 `bash` 启动 ≈22s**（自测里 4 个 launcher 用例会自动 `[skip]`）；`git` 常常不可用 |
 | 现场数据 | `/root/cp_probe/<时间戳>/`（probe 轮 dump，每轮一个子目录）、`/dev/shm/cp_ab*/<round>/`（summary + server 日志） |
@@ -214,12 +235,13 @@ python tools/cp_balance_compare/check_zigzag_dumps.py --dir "$DIR" \
 
 | 目的 | 命令 | 判据 |
 | --- | --- | --- |
-| CPU 自测（改完代码必跑） | `python tools/cp_balance_compare/selftest_mock.py` | 每项 `[run]`/`[ok] …(Ns)`，末行 `SELFTEST OK`（53 项）；卡住时最后一行 `[run]` 就是卡住的用例，90s 后自动超时并打栈；慢 bash 站点自动 `[skip]` 4 个 launcher 用例（`--only/--skip` 可覆盖） |
+| CPU 自测（改完代码必跑） | `python tools/cp_balance_compare/selftest_mock.py` | 每项 `[run]`/`[ok] …(Ns)`，末行 `SELFTEST OK`（54 项）；卡住时最后一行 `[run]` 就是卡住的用例，90s 后自动超时并打栈；慢 bash 站点自动 `[skip]` 4 个 launcher 用例（`--only/--skip` 可覆盖） |
 | 版本指纹（无 git） | `python tools/cp_balance_compare/selfcheck.py --fingerprint` | 末行 `[fp] <16 位>` + 文件摘要 + marker OK/MISSING |
 | 环境体检 | `python tools/cp_balance_compare/selfcheck.py` | `[verdict] READY`、无 FAIL |
 | 配置门（不加载模型） | `ab_cp_compare.py --preflight` | 末行 `[preflight] all configs OK` |
 | 一轮 A/B（B/C） | `unset DUMP_DIR; bash tools/cp_balance_compare/run_cp_diag.sh probe` | 上述三件套；N≈272（融合路径下 `dn_in` 缺 16 个，N≈256） |
 | 一轮 A/B + C 重复 | `… run_cp_diag.sh probe2` | 三件套 + `[noise] C2 vs C` |
+| **归约确定性轮** | `export HCCL_DET=strict; unset DUMP_DIR; bash tools/cp_balance_compare/run_cp_diag.sh probe` | 轮次目录 `r_probe_det`；日志有 `[cp-ab-hccl] … HCCL_DETERMINISTIC=strict LCCL_DETERMINISTIC=1`；与 `r_probe` 并排看是否回噪（README §七） |
 | 判读激活剖面 | `check_zigzag_dumps.py --dir <dir> --kind act --summary-only --block-size 128` | `FIRST DIVERGENCE (act): layer L op=…` + layer 0 八行 + 判词 |
 | 判读索引表 / 全层 KV | `… --kind topk --summary-only` / `export DUMP_DIR=/root/cp_dump; run_cp_diag.sh sweep` → `… --kind kv --summary-only` | `[topk/cross] RESULT: …` / `FIRST DIVERGENCE (fp/value\|fp/bytes): layer L` |
 | **行序复现** | `repro_row_order.py --dir <dir> --layer 0 [--run-op [--random-weight] [--no-nz]] [--all-ranks]` | 数据模式：token→行号置换；`--run-op`：`differing>0` ⇒ 行序相关，最小复现成立；`--all-ranks` 出逐 rank 汇总 |

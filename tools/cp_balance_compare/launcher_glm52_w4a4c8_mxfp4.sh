@@ -93,7 +93,9 @@ export HCCL_IF_IP="${LOCAL_IP}"
 export GLOO_SOCKET_IFNAME="${NIC_NAME}"
 export TP_SOCKET_IFNAME="${NIC_NAME}"
 export HCCL_SOCKET_IFNAME="${NIC_NAME}"
-export HCCL_ALGO=level0:fullmesh
+# Overridable on purpose: the B-vs-C precision triage has to be able to A/B the
+# collective algorithm together with the determinism knobs below.
+export HCCL_ALGO="${HCCL_ALGO:-level0:fullmesh}"
 
 export VLLM_RPC_TIMEOUT=3600000
 export VLLM_EXECUTE_MODEL_TIMEOUT_SECONDS=30000
@@ -225,6 +227,14 @@ echo "[cp-ab-cfg] ${additional_config}"
 # Diagnostic dump switch: the driver injects it per round; echoing it here makes
 # "round finished but no dump was written" traceable to the env that was applied.
 echo "[cp-ab] DUMP=${VLLM_ASCEND_CP_BALANCE_DUMP:-<unset>}"
+# HCCL/ATB determinism knobs -- deliberately pass-through: this launcher never
+# forces them, the round decides (`run_cp_diag.sh` with HCCL_DET=...).  The
+# candidate root cause for the B-vs-C prefill difference is the cross-rank
+# reduction (tensor_model_parallel_reduce_scatter), and whether that reduction is
+# deterministic / layout independent is exactly what these knobs control, so the
+# round has to say which setting it ran with.  NOT part of the [cp-ab] line:
+# that line is parsed as int KEY=VALUE pairs by the driver's --config-check.
+echo "[cp-ab-hccl] HCCL_ALGO=${HCCL_ALGO} HCCL_DETERMINISTIC=${HCCL_DETERMINISTIC:-<unset>} LCCL_DETERMINISTIC=${LCCL_DETERMINISTIC:-<unset>} ATB_MATMUL_SHUFFLE_K_ENABLE=${ATB_MATMUL_SHUFFLE_K_ENABLE:-<unset>} ATB_LLM_LCOC_ENABLE=${ATB_LLM_LCOC_ENABLE:-<unset>}"
 
 port="${2:-${1:-8034}}"
 

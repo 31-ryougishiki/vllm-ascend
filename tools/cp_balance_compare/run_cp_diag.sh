@@ -24,6 +24,16 @@
 #   DUMP_DIR     默认 /dev/shm/cp_balance_dump（**writer 与 checker 共用这一个**；
 #                kv:all 是 GB 级、act 是百 MB 级，/dev/shm 小就指到真实磁盘——写满
 #                /dev/shm 还会把 server 自己搞死，它的 IPC/prometheus 目录都在那里）
+#   HCCL_DET     默认空（关）。开启集合通信确定性（CANN 环境变量参考 HCCL_DETERMINISTIC /
+#                LCCL_DETERMINISTIC；仓库自身用法见 vllm_ascend/batch_invariant.py:82-87
+#                与 docs/source/faqs.md §15）。取值：
+#                  strict → HCCL_DETERMINISTIC=strict + LCCL_DETERMINISTIC=1
+#                  true   → HCCL_DETERMINISTIC=true   + LCCL_DETERMINISTIC=1
+#                  atb    → 上面两个 + ATB_MATMUL_SHUFFLE_K_ENABLE=0 + ATB_LLM_LCOC_ENABLE=0
+#                用途：B/C 差异已收敛到跨 rank 归约（tensor_model_parallel_reduce_scatter），
+#                这一轮回答"归约顺序的不确定性/排布相关性是不是根因"。
+#                判据：`[cp-ab-hccl]` 行里能看到 HCCL_DETERMINISTIC/LCCL_DETERMINISTIC，
+#                且该轮 `p99|d|C-B <= 阈值`（0.05）⇒ 确定性配置即缓解；仍超阈 ⇒ 换归约实现。
 #
 # 说明：digest 变量在 B/C 两个 server 上取值相同，dump 文件名自带 cpbal{0|1}，
 # 所以一轮就能同时拿到 B 与 C 的数据。每轮输出到 $OUT_ROOT/<round>。
@@ -70,6 +80,25 @@ out_root="${OUT_ROOT:-/dev/shm/cp_ab}"
 base_port="${BASE_PORT:-8034}"
 dump_spec="${DUMP_SPEC:-topk:6,kv:0,6}"
 dump_dir="${DUMP_DIR:-/dev/shm/cp_balance_dump}"
+
+# Collective-communication determinism (opt-in).  `HCCL_DET` is not a config
+# knob: it applies to every config of the round, so B and C are still compared
+# under identical settings -- only the token layout differs.
+hccl_det="${HCCL_DET:-}"
+hccl_det_env=()
+case "${hccl_det}" in
+  ""|0|off|false) hccl_det="" ;;
+  strict) hccl_det_env=(HCCL_DETERMINISTIC=strict LCCL_DETERMINISTIC=1) ;;
+  true|1) hccl_det_env=(HCCL_DETERMINISTIC=true LCCL_DETERMINISTIC=1) ;;
+  atb)
+    hccl_det_env=(HCCL_DETERMINISTIC=true LCCL_DETERMINISTIC=1
+                  ATB_MATMUL_SHUFFLE_K_ENABLE=0 ATB_LLM_LCOC_ENABLE=0)
+    ;;
+  *)
+    echo "[run_cp_diag] unknown HCCL_DET=${hccl_det}（可选 strict|true|atb，或留空关闭）" >&2
+    exit 2
+    ;;
+esac
 
 round_name=""
 extra_env=()
@@ -165,11 +194,26 @@ case "${mode}" in
     ;;
 esac
 
+if [[ -n "${hccl_det}" ]]; then
+  # Distinct round name: compare_cp_rounds.py compares rounds by directory, and a
+  # determinism round must not overwrite the baseline round's summary.json --
+  # that would erase the "before" it exists to be compared against.
+  round_name="${round_name}_det"
+fi
+
 # One knob for both sides: the writer must put its files where the checker looks.
 # A full-layer sweep is GBs, so point DUMP_DIR at a real disk when /dev/shm is
 # small -- filling /dev/shm also kills the server (its IPC lives there).
 if [[ "${dump_active}" == true ]]; then
   extra_env+=(--env "VLLM_ASCEND_CP_BALANCE_DUMP_DIR=${dump_dir}")
+fi
+
+# Determinism is a round-wide setting: the driver hands it to the launcher for
+# every config, so B and C still differ in nothing but the token layout.
+if (( ${#hccl_det_env[@]} )); then
+  for kv in "${hccl_det_env[@]}"; do
+    extra_env+=(--env "${kv}")
+  done
 fi
 
 out="${out_root}/${round_name}"
@@ -194,6 +238,9 @@ fi
 echo "[run_cp_diag] mode=${mode} round=${round_name}"
 echo "[run_cp_diag] prompt_lens=${prompt_lens} min_tokens=${min_tokens} cp_size=${cp_size} repeat_a=${repeat_a} out=${out}"
 [[ -n "${dump_spec}" ]] && echo "[run_cp_diag] dump=${dump_spec} dir=${dump_dir}"
+if (( ${#hccl_det_env[@]} )); then
+  echo "[run_cp_diag] hccl_det=${hccl_det} env=${hccl_det_env[*]}（B/C 同轮同设置；判据见头部注释）"
+fi
 
 # Which way this round's dumps are judged (probe/probe2 = the activation profile).
 check_kind="both"

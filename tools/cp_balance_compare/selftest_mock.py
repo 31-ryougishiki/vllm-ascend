@@ -1731,6 +1731,56 @@ def test_base_additional_config_has_no_pd_only_knobs() -> None:
     assert merged["enable_dsa_cp"] is True
 
 
+def test_hccl_determinism_round_is_wired_and_self_describing() -> None:
+    """``HCCL_DET=...`` must reach the server *and* be visible in the round log.
+
+    The B-vs-C difference is down to the cross-rank reduction, and CANN's
+    deterministic-collective switch (``HCCL_DETERMINISTIC`` / ``LCCL_DETERMINISTIC``,
+    see vllm_ascend/batch_invariant.py and docs/source/faqs.md §15) is the first
+    thing to try.  Two ways for that experiment to be worthless: the env never
+    reaches the launcher, or the round's log does not say which setting it ran
+    with (the two rounds then look identical afterwards).
+    """
+    script = (HERE / "run_cp_diag.sh").read_text(encoding="utf-8")
+    assert "HCCL_DETERMINISTIC=strict LCCL_DETERMINISTIC=1" in script, script
+    assert "ATB_MATMUL_SHUFFLE_K_ENABLE=0" in script, script
+    assert 'round_name="${round_name}_det"' in script, script
+    launcher = (HERE / "launcher_glm52_w4a4c8_mxfp4.sh").read_text(encoding="utf-8")
+    assert "[cp-ab-hccl]" in launcher, launcher
+    assert "HCCL_DETERMINISTIC=${HCCL_DETERMINISTIC:-<unset>}" in launcher, launcher
+    # The knobs must stay out of the [cp-ab] fingerprint line: that line is parsed
+    # as int KEY=VALUE pairs (HCCL_DETERMINISTIC=strict would be dropped silently).
+    fingerprint = next(line for line in launcher.splitlines() if "[cp-ab] CP_BALANCE=" in line)
+    assert "HCCL_DETERMINISTIC" not in fingerprint, fingerprint
+
+    if _skip_if_bash_slow("test_hccl_determinism_round_is_wired_and_self_describing"):
+        return
+    import os
+    import subprocess
+
+    env = os.environ.copy()
+    env["HCCL_DET"] = "strict"
+    try:
+        proc = subprocess.run(
+            ["bash", "tools/cp_balance_compare/run_cp_diag.sh", "probe", "--dry-run"],
+            cwd=str(HERE.parent.parent),
+            env=env,
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            timeout=120,
+        )
+    except (OSError, subprocess.SubprocessError) as exc:
+        print(f"[skip] cannot execute bash ({exc})")
+        return
+    text = proc.stdout + proc.stderr
+    assert proc.returncode == 0, text
+    assert "hccl_det=strict" in text, text
+    assert "--env HCCL_DETERMINISTIC=strict --env LCCL_DETERMINISTIC=1" in text, text
+    assert "round=r_probe_det" in text, text
+
+
 def test_build_pairs_for_subsets() -> None:
     assert driver.build_pairs(["A", "B", "C"]) == [("B", "A"), ("C", "B"), ("C", "A")]
     assert driver.build_pairs(["B", "C"]) == [("C", "B")]

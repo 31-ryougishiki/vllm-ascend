@@ -44,7 +44,7 @@
 | `check_zigzag_dumps.py` | CPU 侧判读 dump（`kv` / `topk` / `act`，见 §五） | 否 |
 | `repro_row_order.py` | 离线复现"同一 token 的行换个位置结果就变"：读一轮的 `dnq`/`guq` dump（+ 同层 `w` 权重 dump）重跑 `npu_quant_matmul`，比较两种行序下同一 token 的输出。`--all-ranks` 扫全部有 dump 的 TP rank（`w` 只有 rank 0，其余 rank 自动用同形状随机权重并打印 `w=random`）；`--device`（默认 `npu:0`）决定算子跑在哪张卡 | 否（`--run-op` 需要 NPU） |
 | `compare_cp_rounds.py` | 把多轮 `summary.json` 并排，回答"改了某个变量后 `C−B` 是否回到噪声级" | 否 |
-| `mock_vllm_server.py` / `selftest_mock.py` | 假 server + CPU 自测（53 项：协议解析、指纹/payload、dump 判读、复现器设备、launcher 静态检查、端到端）。逐项打印 `[run]`/`[ok] … (耗时)`，单项 90s 超时（Linux 下 SIGALRM + faulthandler 打印卡住的栈），失败不中止整轮；支持 `--list`、`--only <子串>`、`--skip launcher,preflight`、`--test-timeout N`。**每次 `bash` 启动 >2s 的机器**（重 `BASH_ENV`/慢挂载）会自动跳过 4 个起 launcher 的用例并说明原因（要强制跑用 `--only`） | 否 |
+| `mock_vllm_server.py` / `selftest_mock.py` | 假 server + CPU 自测（54 项：协议解析、指纹/payload、dump 判读、复现器设备/全 rank、HCCL 确定性接线、launcher 静态检查、端到端）。逐项打印 `[run]`/`[ok] … (耗时)`，单项 90s 超时（Linux 下 SIGALRM + faulthandler 打印卡住的栈），失败不中止整轮；支持 `--list`、`--only <子串>`、`--skip launcher,preflight`、`--test-timeout N`。**每次 `bash` 启动 >2s 的机器**（重 `BASH_ENV`/慢挂载）会自动跳过 4 个起 launcher 的用例并说明原因（要强制跑用 `--only`） | 否 |
 | `selfcheck.py` | 环境体检（解释器/依赖/import 来源/NPU/端口/磁盘/残留进程）+ **不依赖 git 的版本指纹**（`--fingerprint`：关键文件 sha256 + 修复标记 + 用例数，末行 `[fp] …` 贴回来即可对齐版本）+ 跑一遍自测 + `--collect` 收整轮证据。**不做**配置门与命令预演——那两件事由 `ab_cp_compare.py --preflight` 与 `run_cp_diag.sh <mode> --dry-run` 负责（每轮都会跑，不会腐化） | 否 |
 | `prepare_env.sh` | 一次性 `source` 站点 rc + vendor 环境并 `export CP_AB_SKIP_SOURCE=1`，省掉每轮两次 source；**必须 source** | 否 |
 
@@ -62,7 +62,7 @@
 
 ```bash
 # 当前这一步（一轮 ≈ 20 分钟，2 次模型加载）
-unset DUMP_DIR                                     # ⚠️ 继承的 DUMP_DIR 会让 dump 改道（§八.1）
+unset DUMP_DIR                                     # ⚠️ 继承的 DUMP_DIR 会让 dump 改道（§九.1）
 bash tools/cp_balance_compare/run_cp_diag.sh probe --dry-run    # 先看 dir= 与 spec 对不对
 bash tools/cp_balance_compare/run_cp_diag.sh probe
 # 判读（--dir 用上一行 dry-run/运行输出里打印的那个，每轮都不同）
@@ -86,7 +86,8 @@ python tools/cp_balance_compare/check_zigzag_dumps.py --dir /root/cp_probe/<时�
 也不在补齐后的自然 slot mapping 覆盖范围内 → 该行会缺失（判读会打 `注意: … 缺 … 行`）。
 
 常用覆盖：`PROMPT_LENS`、`MIN_TOKENS`、`TP_SIZE`、`CP_SIZE`、`REPEAT_A=0`/`--no-repeat`（省一次加载）、`OUT_ROOT`、
-`DUMP_SPEC`（如 `act:0,1,2,3,mlp:0,1,2,3`、`kv:all`；置空=不 dump）、`DUMP_DIR`（**writer 与 checker 共用一个旋钮**）、`KIND`、`LAUNCHER`。
+`DUMP_SPEC`（如 `act:0,1,2,3,mlp:0,1,2,3`、`kv:all`；置空=不 dump）、`DUMP_DIR`（**writer 与 checker 共用一个旋钮**）、`KIND`、`LAUNCHER`、
+`HCCL_DET`（集合通信确定性，见 §七）。
 launcher 还支持 `EXTRA_SERVE_ARGS="--enable-return-routed-experts"`（空格分隔，透传额外 `vllm serve` 参数；
 该 flag 要求 **PP=1 且不能用 KV connector**——driver 与 `run_single.py` 默认都已经关掉 KV connector ✓）。
 
@@ -150,7 +151,42 @@ in ─attention─▶ out ─pre-MLP norm─▶ mlp_in ─[量化]─▶ gu_q �
 driver 每个配置都会：校验 `[cp-ab]` 指纹与 `[cp-ab-cfg]` 里的 `additional_config`（`--config-check strict`）、
 确认 C 真进了 zigzag（`--zigzag-check strict`，没进就 `--on-zigzag-miss skip` 停掉整轮非 0 退出）。
 
-## 七、已删除的实验（别再去找开关）
+## 七、归约确定性实验（`HCCL_DET`）
+
+B/C 差异已收敛到紧随 down_proj 的跨 rank 归约（`tensor_model_parallel_reduce_scatter`，
+即 vLLM `base_device_communicator.reduce_scatter` → `torch.distributed.reduce_scatter_tensor`
+→ HCCL **ReduceScatter**）。HCCL 本身就有归约类算子的确定性开关：
+
+| 变量 | 作用 | 取值 |
+| --- | --- | --- |
+| `HCCL_DETERMINISTIC` | 归约类算子（AllReduce / ReduceScatter / ReduceScatterV / Reduce）的确定性计算 | `false`(默认) / `true` / `strict`（strict = 保序，归约顺序逐 bit 一致） |
+| `LCCL_DETERMINISTIC` | LCCL 侧 AllReduce（保序加），**rankSize ≤ 8 时生效**（本站 TP=8 正命中） | `0`(默认) / `1` |
+| `ATB_MATMUL_SHUFFLE_K_ENABLE` / `ATB_LLM_LCOC_ENABLE` | ATB 矩阵乘洗牌 / 低比特通信优化（仓库 FAQ §15 的确定性配方） | `0` 关闭 |
+
+`HCCL_DET` 取值（整轮生效，B/C 同设置，只差 token 排布）：
+
+```bash
+export HCCL_DET=strict     # ← 单独一行！`VAR=... cmd | tee` 的前缀会静默丢（§九.4）
+unset DUMP_DIR
+bash tools/cp_balance_compare/run_cp_diag.sh probe
+# → round=r_probe_det，env=HCCL_DETERMINISTIC=strict LCCL_DETERMINISTIC=1
+#   取值：strict | true | atb(=true + LCCL + 两个 ATB 旋钮)；留空 = 不开（保持 r_probe）
+```
+
+**判据**（三条一起看）：
+
+1. 配置生效：启动日志有 launcher 的 `[cp-ab-hccl] … HCCL_DETERMINISTIC=strict LCCL_DETERMINISTIC=1 …`
+   与 `[run_cp_diag] hccl_det=strict env=…`；driver 的 `[check] B/C fingerprint OK` 仍通过。
+2. 与基线轮并排：`python tools/cp_balance_compare/compare_cp_rounds.py 基线=/dev/shm/cp_ab_probe/r_probe 确定性=/dev/shm/cp_ab_probe/r_probe_det`
+   → `back to the noise floor`（`p99|d|C-B ≤ 0.05`）⇒ 归约顺序即根因、且确定性开关可作缓解；仍 `above threshold` ⇒ 换归约实现（`all_reduce + slice`）再 A/B。
+3. 同轮 `[act]` 表里 layer 0 的 `mlp_out`：1664/2048 → 0 差异，等于在**算子级**确认（比只看 logprob 更硬）。
+
+⚠️ `strict` 的官方约束：归约保序需**对称分布**（卡数对称）、INF/NaN 模式（非饱和），
+在 A2/A3 上支持 AllReduce/ReduceScatter（bf16/fp16/fp32、sum、rank ≥ 3），
+机间只用 HCCS-SDMA（不支持 RoCE RDMA）。单机 TP=8 满足；若站点 CANN/芯片不支持 `strict`，
+退一步用 `HCCL_DET=true` 再跑一轮。
+
+## 八、已删除的实验（别再去找开关）
 
 | 曾经的模式 | 为什么删掉 |
 | --- | --- |
@@ -164,7 +200,7 @@ driver 每个配置都会：校验 `[cp-ab]` 指纹与 `[cp-ab-cfg]` 里的 `add
 | `--kind topk` 的 P1 断言 | 只对**短 prompt**（`< index_topk`）有信息量；长 prompt 下 indexer 走全选捷径，identity 断言不适用 |
 | `baseline` 的 `B2` | 噪声地板已实测为 0；除非换机器/换 TP，可 `--no-repeat` 省一次加载 |
 
-## 八、易错点（工具侧）
+## 九、易错点（工具侧）
 
 1. **`DUMP_DIR` 会被继承**：`probe` 尊重已导出的 `DUMP_DIR`，sweep 留下的 `/root/cp_dump` 会让 probe 数据改道、`/root/cp_probe` 不出现。跑前 `unset DUMP_DIR`，或先 `--dry-run` 看 `dir=`（脚本会对继承值打 WARN）。
 2. **`/dev/shm` 很小**（容器默认几十 MB）：`kv:all` 是 GB 级、`act`/`mlp` 是几百 MB 级 ⇒ 一律落真实磁盘；写满会连 server 一起搞死（IPC/prometheus 在那儿）。
@@ -175,7 +211,7 @@ driver 每个配置都会：校验 `[cp-ab]` 指纹与 `[cp-ab-cfg]` 里的 `add
 7. **改 `vllm_ascend/` 的模块**后先跑 `python tools/cp_balance_compare/selftest_mock.py`（含"模块级用了未 import 的名字"的 AST 静态检查）。
 8. **非 Linux 主机**上依赖 bash 的 launcher 用例会 `[skip]`，属宿主差异，不是 driver 的问题。
 
-## 九、工具与脚本的五条硬要求
+## 十、工具与脚本的五条硬要求
 
 > 对本目录所有工具（含后续新增的诊断脚本）固定生效。
 
