@@ -57,7 +57,24 @@ in ─attn─▶ out ─norm─▶ mlp_in ─[量化]─▶ gu_q ─gate_up─�
 
 ⇒ **① 基本排除**（同一调用形状下行序无关），矛头转向 ② 归约。
 
-**2026-09-12 全 rank 扫描（`--all-ranks`，无需加载模型）**：rank **1..7** 全部
+**2026-09-12 A3 交叉对照轮（`its` 站点 7.246.78.75，W4A8C8，TP=16，vllm py3.12）**——**同一形态复现**：
+
+```
+runtime: B{metadata=False forward=False} C{metadata=True forward=True}      ← C 真进 zigzag
+case            len   top1%   p99|d|   max|d|  first_div  block@first_div      verdict
+single_L2048   2048   86.96    0.391     1.55         92  rank1/prev(b64-128)   DIFF
+single_L2049   2049   90.19    0.388      1.2        227  rank3/prev(b195-260)  DIFF
+single_L4096   4096   79.68    0.392     1.13        171  rank1/prev(b128-256)  DIFF
+act: layer 0 的 in/out/mlp_in/gu_q/gu_out/dn_in/dn_q 全 0；只有 mlp_out 差
+     （1920/2048，首个分歧 token 64 = 第 2 个 zigzag 块，max|d|=4.883e-04）；layer 1 是它的继承
+dump: 16 个 rank 齐全（act/mlp 各 64、guq/dnq/topk 各 32、kv 64）且 **首次落盘 w dump（2 个）**
+```
+
+⇒ 与 A5 完全相同的形状（layer 0 输入逐位相同、输出先不等）⇒ **"A5/mxfp4 特有"被排除**：
+两个芯片、两套量化（A5 的 W8A8_MXFP8 与 A3 的 W4A8C8）上，cp_balance 都扰动了 layer 0 的
+`mlp_out`，量级同阶（A3 p99≈0.39 nats vs A5≈0.56~0.58）。共性嫌疑仍落在
+**down_proj 的行并行 GEMM + 紧随的跨 rank 归约**（A3 上现在可以用真实 `w` dump 跑行序复现，
+不必再依赖 `--random-weight`）。
 `differing=0/2048 max|d|=0.000e+00`；rank 0 在此前两轮同命令下同样 0。⚠️ 那轮 dump 目录里
 **没有 rank 0 的 `dnq`**，所以工具报的是 `7/7 … 覆盖不完整（缺 rank [0]）`（工具现在会显式告警，
 判词不再写成 N/N）。综合 ⇒ **GEMM 侧在全部 8 个 rank 上都排除**（rank≠0 用同形状随机权重），
@@ -155,7 +172,8 @@ bash tools/cp_balance_compare/run_cp_diag.sh probe      # → r_probe_det，env=
 **已排除**：indexer 选点错、KV 重排/写错、元数据契约错、**attention 数值错**（layer 0 `in`/`out` 逐字节相同）、
 pre-MLP norm/残差/跨 rank 归约错（`mlp_in` 相同）、**激活量化与排布相关**（`gu_q`/`dn_q` 逐位相同；
 `w8a8_mxfp8.py` 的 `npu_dynamic_mx_quant` + `group_sizes=[1,1,32]` 是按行、每 32 个 K 元素一个 scale）、
-prev/next 两次调用形状（验证用的 `2call` 开关已随结论删除，见 README §七）。
+prev/next 两次调用形状（验证用的 `2call` 开关已随结论删除，见 README §七）、
+**"这是 A5/mxfp4 特有的算子问题"**（A3+W4A8C8 上同一形态复现，见 §1）。
 
 **仍开放**：**那次跨 rank 归约**（`tensor_model_parallel_reduce_scatter`；GEMM 已在 rank 0 + 随机权重下排除，
 `--all-ranks` 扫完即可定论）；MoE 层（≥3，需 `--enable-return-routed-experts`）；`MIN_TOKENS` 边界（与本问题无关）。
