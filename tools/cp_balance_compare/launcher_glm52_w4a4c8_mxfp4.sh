@@ -83,19 +83,51 @@ fi
 unset ftp_proxy FTP_PROXY
 unset https_proxy HTTPS_PROXY
 unset http_proxy HTTP_PROXY
+# The site rc is sourced below and it *does* override round knobs: on the A3 site
+# (2026-09-12) `/root/.bashrc` reset ``LCCL_DETERMINISTIC`` to 0 and left
+# ``ATB_MATMUL_SHUFFLE_K_ENABLE=1``, so an ``HCCL_DET=...`` round ran with the
+# determinism knob silently neutralised -- indistinguishable from "the knob has no
+# effect".  Snapshot the caller's values here and re-assert them after the rc; any
+# value the rc tried to change is printed, so a round can never be misread again.
+CP_AB_REASSERT_KEYS=(
+  HCCL_DETERMINISTIC LCCL_DETERMINISTIC ATB_MATMUL_SHUFFLE_K_ENABLE
+  ATB_LLM_LCOC_ENABLE CLOSE_MATMUL_K_SHIFT HCCL_OP_EXPANSION_MODE HCCL_ALGO
+  HCCL_BUFFSIZE HCCL_EXEC_TIMEOUT HCCL_CONNECT_TIMEOUT
+  VLLM_ASCEND_CP_BALANCE VLLM_ASCEND_CP_BALANCE_MIN_TOKENS
+  VLLM_ASCEND_CP_BALANCE_EMBED_LOCAL VLLM_ASCEND_CP_BALANCE_DEBUG_LOG
+  VLLM_ASCEND_CP_BALANCE_DUMP VLLM_ASCEND_CP_BALANCE_DUMP_DIR
+  VLLM_ASCEND_ENABLE_FLASHCOMM1 ASCEND_RT_VISIBLE_DEVICES
+)
+declare -A CP_AB_REASSERT_VALUES=()
+for _key in "${CP_AB_REASSERT_KEYS[@]}"; do
+  if [ -n "${!_key+set}" ]; then
+    CP_AB_REASSERT_VALUES["${_key}"]="${!_key}"
+  fi
+done
+# CP_AB_SITE_RC: the rc path is a knob purely so the CPU selftest can point it at a
+# fake rc and check the re-assert below (the real sites all use /root/.bashrc).
+site_rc="${CP_AB_SITE_RC:-/root/.bashrc}"
 # CP_AB_SKIP_SOURCE=1: the caller already sourced the site rc + vendor env once
 # (see README "省掉每次 source 的启动时间") and the driver passes that
 # environment straight to this process, so sourcing again only costs time.
 # Everything below (HCCL ifnames, timeouts, ...) is still applied.
 skip_source="${CP_AB_SKIP_SOURCE:-0}"
 if [ "${skip_source}" = "1" ]; then
-  echo "[cp-ab] CP_AB_SKIP_SOURCE=1: 跳过 source /root/.bashrc 与 vendor set_env（沿用调用者环境）"
+  echo "[cp-ab] CP_AB_SKIP_SOURCE=1: 跳过 source ${site_rc} 与 vendor set_env（沿用调用者环境）"
   echo "[cp-ab] env check: ASCEND_HOME_PATH=${ASCEND_HOME_PATH:-<unset>} LD_LIBRARY_PATH=${#LD_LIBRARY_PATH}B PYTHONPATH=${PYTHONPATH:-<unset>}"
-elif [ -f /root/.bashrc ]; then
+elif [ -f "${site_rc}" ]; then
   # shellcheck disable=SC1091
   # Site rc files are not written for `set -u` (e.g. /etc/bashrc reads
   # BASHRCSOURCED unguarded): relax -u while sourcing, restore it after.
-  set +u; source /root/.bashrc; set -u
+  set +u; source "${site_rc}"; set -u
+  for _key in "${!CP_AB_REASSERT_VALUES[@]}"; do
+    _wanted="${CP_AB_REASSERT_VALUES[${_key}]}"
+    if [ "${!_key-}" != "${_wanted}" ]; then
+      echo "[cp-ab] NOTE: 站点 rc 把 ${_key} 从 '${_wanted}' 改成 '${!_key-<unset>}'，按本轮要求改回 '${_wanted}'"
+      export "${_key}=${_wanted}"
+    fi
+  done
+  unset _key _wanted
 fi
 export PROMETHEUS_MULTIPROC_DIR=/dev/shm/vllm_metrics
 mkdir -p "${PROMETHEUS_MULTIPROC_DIR}"

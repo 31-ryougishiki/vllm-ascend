@@ -110,7 +110,7 @@ I=12288、`dn_q` 的 K=I/tp=768 ⇒ down_proj 权重应为 `[768, 6144]`。
 **没有 rank 0 的 `dnq`**，所以工具报的是 `7/7 … 覆盖不完整（缺 rank [0]）`（工具现在会显式告警，
 判词不再写成 N/N）。⇒ 8 个 rank 上 GEMM 均排除（rank≠0 用随机权重）。
 
-**2026-09-12 A3 上试 `HCCL_DET=true`（一轮 probe）—— 无效果，且两轮数字逐位相同**：
+**2026-09-12 A3 上试 `HCCL_DET=true`（一轮 probe）—— 无效，而且发现"没生效"的真因**：
 
 ```
 === round 基线 ===      single_L2048 86.96 0.391 1.55 92 rank1/prev(b64-128) DIFF   （L2049/4096 同）
@@ -118,18 +118,40 @@ I=12288、`dn_q` 的 K=I/tp=768 ⇒ down_proj 权重应为 `[768, 6144]`。
 change vs ref: +0.0% / +0.0% / +0.0%     act 表也逐行相同（layer 0 mlp_out 1920/2048, 4.883e-04）
 ```
 
-两个结论：
-* **`true` 不是这个问题的正确旋钮**。`HCCL_DETERMINISTIC=true` 保证的是"同输入多次执行同结果"
-  （可复现），而我们**早就有**这个性质（`C2−C=0`，且这两轮跨配置跑出的指标逐位相同 ⇒ A3 的噪声地板也是 0）。
-  要消掉 B/C 差异需要的是**保序**（`strict`：归约顺序逐 bit 一致），这才可能让"同一 token 处于不同行位置"
-  得到同一位序的结果。之前把 `true` 排在候选首位是判断失误 —— **正确顺序是 `strict` → 实现层 A/B**。
-* 两轮逐位相同也证明**方法学可靠**（"配置没生效"会立刻以数字完全相同暴露），且 0.391 是确定性的排布效应。
+配置生效证据（这轮补上了）暴露了问题：
 
-**下一步（按优先级）**：① 用**真实权重**跑一次 `--run-op`（免费，补上"GEMM 行序无关"的最后一个保留：
-之前用的是随机权重；先 `ls "$DIR"/w_cpbal*.pt | wc -l` 确认是 4 = 两个 op 都写了、修复已同步）；
-② A3 上试 `HCCL_DET=strict`（A3 的 CANN 与 A5 不同，A5 死于 AICPU kernel，A3 未必）；
-③ 都不行则走实现层 `all_reduce + slice` 的 A/B，或把这条 ReduceScatter 做成 16 进程离线最小复现交算子侧。
-⚠️ 每次都要留下配置生效证据（`[run_cp_diag] hccl_det=…` 与 `[cp-ab-hccl] …`），否则"没生效"与"没效果"无法区分。
+```
+[cp-ab-hccl] HCCL_ALGO=level0:fullmesh HCCL_DETERMINISTIC=true LCCL_DETERMINISTIC=0
+             ATB_MATMUL_SHUFFLE_K_ENABLE=1 …
+```
+
+⇒ **A3 的 `/root/.bashrc` 把 `LCCL_DETERMINISTIC` 重置成 0、并把
+`ATB_MATMUL_SHUFFLE_K_ENABLE` 留成 1**（我们请求的是 1 / 0）：本轮 env 被站点 rc 静默覆盖，
+"无效果"其实是"没生效"。**launcher 已修**：source 站点 rc *之前*快照调用者设置的值，之后
+re-assert，并对每个被 rc 改掉的键打印 `[cp-ab] NOTE: 站点 rc 把 X 从 A 改成 B，按本轮要求改回 A`
+（`CP_AB_SITE_RC` 让自测能指向假 rc）。⇒ **任何 HCCL_DET 结论都必须在看到这行 NOTE / `[cp-ab-hccl]` 之后才算数。**
+
+两个结论：
+* **`true` 也不是这个问题的正确旋钮**（即使生效）：`HCCL_DETERMINISTIC=true` 保证"同输入多次执行同结果"
+  （可复现），而这我们早就有（`C2−C=0`；两轮跨配置逐位相同 ⇒ A3 噪声地板也是 0）。要消掉 B/C 差异需要
+  **保序**（`strict`：归约顺序逐 bit 一致）。**正确顺序：`strict`（生效前提下）→ 实现层 A/B。**
+* 数字逐位相同也证明**方法学可靠**：配置没生效/没效果都会立刻以"数字完全相同"暴露。
+
+**2026-09-12 A3：真实权重 + 真实形状的复现（免费）—— GEMM 的最后一个保留也消掉了**：
+
+```
+[repro] weight(rank 0): w_cpbal1_layer0_rank0_…pt (768, 6144) torch.int8 | scale=(6144,) | format=as-is
+[repro] rank 0: 输出比较（逐 token，同一 weight、同一 token 值，只有行序不同）: differing=0/2048 max|d|=0.000e+00 w=w
+```
+
+（`ls "$DIR"/w_cpbal*.pt | wc -l` = **4** ⇒ 按 `(layer, op)` 各写一份的修复已同步，复现器取到了
+**真正的 `dn_q` 权重**。）⇒ **真实权重下 GEMM 同样与行序无关** ⇒ 跨 rank 归约是唯一剩余嫌疑。
+
+**下一步**：① 同步本提交后，用 `export HCCL_DET=strict` 再跑一轮 probe —— **先确认
+`[cp-ab-hccl] … HCCL_DETERMINISTIC=strict LCCL_DETERMINISTIC=1` 且没有/符合预期地出现 NOTE**，
+再看 `compare_cp_rounds.py 基线=r_probe 本轮=r_probe_det` 是否回噪；② 若 `strict` 无效或像 A5 一样崩在
+`RunAicpuIndOpCommInit`，走实现层 `all_reduce + slice` 的 A/B（`linear_op.py:413`），或把这条 ReduceScatter
+做成 16 进程离线最小复现交算子侧。
 `mlp_out` 是 **reduce_scatter 之后**的 rank-local 张量（`dn_q` 是 all-gather 后的 2048 行、`gu_q` 是 rank-local），
 所以"GEMM 输入逐位相同 + GEMM 行序无关"留下的唯一去处就是那次跨 rank 归约本身。
 
@@ -328,7 +350,7 @@ python tools/cp_balance_compare/check_zigzag_dumps.py --dir "$DIR" \
 
 | 目的 | 命令 | 判据 |
 | --- | --- | --- |
-| CPU 自测（改完代码必跑） | `python tools/cp_balance_compare/selftest_mock.py` | 每项 `[run]`/`[ok] …(Ns)`，末行 `SELFTEST OK`（59 项）；卡住时最后一行 `[run]` 就是卡住的用例，90s 后自动超时并打栈；慢 bash 站点自动 `[skip]` 4 个 launcher 用例（`--only/--skip` 可覆盖） |
+| CPU 自测（改完代码必跑） | `python tools/cp_balance_compare/selftest_mock.py` | 每项 `[run]`/`[ok] …(Ns)`，末行 `SELFTEST OK`（60 项）；卡住时最后一行 `[run]` 就是卡住的用例，90s 后自动超时并打栈；慢 bash 站点自动 `[skip]` 4 个 launcher 用例（`--only/--skip` 可覆盖） |
 | 版本指纹（无 git） | `python tools/cp_balance_compare/selfcheck.py --fingerprint` | 末行 `[fp] <16 位>` + 文件摘要 + marker OK/MISSING |
 | 环境体检 | `python tools/cp_balance_compare/selfcheck.py` | `[verdict] READY`、无 FAIL |
 | 配置门（不加载模型） | `ab_cp_compare.py --preflight --launcher "bash tools/cp_balance_compare/launcher_glm52_w4a4c8_mxfp4.sh {port}" --cp-size <TP>` | 末行 `[preflight] all configs OK`；查 `[cp-ab]` 指纹 + additional_config + vllm/model/repo/vendor 路径。⚠️ 漏 `--launcher` 会用 `launcher_template.sh` 的占位路径 |

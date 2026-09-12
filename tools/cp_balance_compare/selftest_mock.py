@@ -2430,6 +2430,70 @@ def _launcher_dry_run_env(out: Path) -> dict[str, str]:
     }
 
 
+def test_launcher_reasserts_round_env_after_the_site_rc() -> None:
+    """A round's env must survive the site rc, and any override must be printed.
+
+    Site 2026-09-12 (A3): ``/root/.bashrc`` resets ``LCCL_DETERMINISTIC=0`` and
+    leaves ``ATB_MATMUL_SHUFFLE_K_ENABLE=1``, so an ``HCCL_DET=true`` round ran with
+    the determinism knob silently neutralised -- the metrics came out *identical* to
+    the baseline, which reads as "this knob has no effect" instead of "it never
+    applied".  The launcher now snapshots the caller's values and re-asserts them
+    with a NOTE for every value the rc tried to change.
+    """
+    if _skip_if_bash_slow("test_launcher_reasserts_round_env_after_the_site_rc"):
+        return
+    import os
+    import shlex
+    import subprocess
+
+    out = _temp_dir("cp_ab_rc_")
+    try:
+        fake_rc = out / "bashrc"
+        fake_rc.write_text(
+            "export HCCL_DETERMINISTIC=false\n"
+            "export LCCL_DETERMINISTIC=0\n"
+            "export ATB_MATMUL_SHUFFLE_K_ENABLE=1\n",
+            encoding="utf-8",
+        )
+        env = os.environ.copy()
+        env.update(_launcher_dry_run_env(out))
+        env.update(
+            {
+                "CP_AB_SITE_RC": str(fake_rc),
+                "DRY_RUN": "1",
+                # What an HCCL_DET=atb round would hand the launcher:
+                "HCCL_DETERMINISTIC": "true",
+                "LCCL_DETERMINISTIC": "1",
+                "ATB_MATMUL_SHUFFLE_K_ENABLE": "0",
+            }
+        )
+        cmd = f"bash {shlex.quote((HERE / 'launcher_glm52_w4a4c8_mxfp4.sh').as_posix())} 8034"
+        try:
+            proc = subprocess.run(
+                ["bash", "-lc", cmd], cwd=str(HERE), env=env, capture_output=True,
+                text=True, encoding="utf-8", errors="replace", timeout=120,
+            )
+        except (OSError, subprocess.SubprocessError) as exc:
+            print(f"[skip] cannot execute bash ({exc})")
+            return
+        text = proc.stdout + proc.stderr
+        line = next((l for l in text.splitlines() if "[cp-ab-hccl]" in l), None)
+        assert line is not None, text
+        assert "HCCL_DETERMINISTIC=true" in line, line
+        assert "LCCL_DETERMINISTIC=1" in line, line
+        assert "ATB_MATMUL_SHUFFLE_K_ENABLE=0" in line, line
+        for key, wanted in (
+            ("HCCL_DETERMINISTIC", "true"),
+            ("LCCL_DETERMINISTIC", "1"),
+            ("ATB_MATMUL_SHUFFLE_K_ENABLE", "0"),
+        ):
+            assert f"NOTE: 站点 rc 把 {key} " in text and f"改回 '{wanted}'" in text, (key, text)
+        if "vllm not found in PATH" not in text:
+            assert proc.returncode == 0, text
+    finally:
+        shutil.rmtree(out, ignore_errors=True)
+
+
 def test_launcher_skip_source_keeps_fingerprint_complete() -> None:
     """CP_AB_SKIP_SOURCE=1 (caller already sourced the site env) must not break the gate.
 
