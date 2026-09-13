@@ -15,6 +15,7 @@
 # limitations under the License.
 # This file is a part of the vllm-ascend project.
 #
+import functools
 import os
 from typing import Any
 
@@ -22,6 +23,7 @@ import torch
 import torch.nn.functional as F
 import torch_npu
 from vllm.triton_utils import HAS_TRITON
+from vllm.v1.utils import record_function_or_nullcontext
 
 from vllm_ascend.device import utils as device_utils
 from vllm_ascend.device.mxfp_compat import (
@@ -42,6 +44,20 @@ if HAS_TRITON:
     from vllm_ascend.ops.triton.rms_norm import triton_q_rms  # noqa: F811
 else:
     triton_q_rms = None  # type: ignore
+
+
+def _sfa_5_3_scope(name: str):
+    """Add an optional profiler scope for SFA-5.3 device modules."""
+
+    def decorator(func):
+        @functools.wraps(func)
+        def wrapper(*args: Any, **kwargs: Any) -> Any:
+            with record_function_or_nullcontext(name):
+                return func(*args, **kwargs)
+
+        return wrapper
+
+    return decorator
 
 
 class BaseDeviceAdaptor:
@@ -456,6 +472,7 @@ class BaseDeviceAdaptor:
         return hidden_states, ql_nope, q_pe, q_c
 
     @staticmethod
+    @_sfa_5_3_scope("SFA-5.3/07_device_indexer_post")
     def indexer_select_post_process(
         sfa_impl,
         q_li: torch.Tensor,
@@ -468,12 +485,15 @@ class BaseDeviceAdaptor:
         actual_seq_lengths_key: torch.Tensor,
         enable_sparse_li_c8: bool,
         use_torch_npu_lightning_indexer: bool,
+        block_table: torch.Tensor | None = None,
     ) -> torch.Tensor:
         # DSV3.2 currently has graph compilation issues when using torch_npu.npu.lightning_indexer.
         # So two branches are maintained temporarily.
         # TODO: torch.ops._C_ascend.npu_lightning_indexer needs to be removed.
         indexer_cache_idx = sfa_impl.kv_cache_indexer_k_idx
         indexer_scale_cache_idx = sfa_impl.kv_cache_indexer_scale_idx
+        if block_table is None:
+            block_table = attn_metadata.block_table
 
         if enable_sparse_li_c8:
             assert len(kv_cache) == (3 if sfa_impl.enable_sparse_sfa_c8 else 4)
@@ -488,7 +508,7 @@ class BaseDeviceAdaptor:
                 key_dequant_scale=kv_cache[indexer_scale_cache_idx].squeeze(2),  # B S N D -> B S D
                 actual_seq_lengths_query=actual_seq_lengths_query,
                 actual_seq_lengths_key=actual_seq_lengths_key,
-                block_table=attn_metadata.block_table,
+                block_table=block_table,
                 query_quant_mode=0,
                 key_quant_mode=0,
                 layout_query="TND",
@@ -503,7 +523,7 @@ class BaseDeviceAdaptor:
                 weights=weights,
                 actual_seq_lengths_query=actual_seq_lengths_query,
                 actual_seq_lengths_key=actual_seq_lengths_key,
-                block_table=attn_metadata.block_table,
+                block_table=block_table,
                 layout_query="TND",
                 layout_key="PA_BSND",
                 sparse_count=2048,
@@ -516,7 +536,7 @@ class BaseDeviceAdaptor:
                 weights=weights,
                 actual_seq_lengths_query=actual_seq_lengths_query,
                 actual_seq_lengths_key=actual_seq_lengths_key,
-                block_table=attn_metadata.block_table,
+                block_table=block_table,
                 layout_query="TND",
                 layout_key="PA_BSND",
                 sparse_count=2048,
@@ -525,6 +545,7 @@ class BaseDeviceAdaptor:
         return topk_indices
 
     @classmethod
+    @_sfa_5_3_scope("SFA-5.3/08_device_sfa_process")
     def execute_sparse_flash_attention_process(
         cls,
         sfa_impl,
@@ -596,6 +617,7 @@ class BaseDeviceAdaptor:
             return result[0]
 
     @staticmethod
+    @_sfa_5_3_scope("SFA-5.3/08_device_kv_quant_sfa")
     def _execute_kv_quant_sparse_flash_attention(
         sfa_impl,
         ql_nope: torch.Tensor,
@@ -999,6 +1021,7 @@ class A5DeviceAdaptor(BaseDeviceAdaptor):
         )
 
     @staticmethod
+    @_sfa_5_3_scope("SFA-5.3/08_a5_kv_quant_sfa")
     def _execute_kv_quant_sparse_flash_attention(
         sfa_impl,
         ql_nope: torch.Tensor,
@@ -1651,6 +1674,7 @@ class A5DeviceAdaptor(BaseDeviceAdaptor):
         return [8, 16, 128]
 
     @staticmethod
+    @_sfa_5_3_scope("SFA-5.3/07_a5_indexer_post")
     def indexer_select_post_process(
         sfa_impl,
         q_li: torch.Tensor,
@@ -1663,9 +1687,12 @@ class A5DeviceAdaptor(BaseDeviceAdaptor):
         actual_seq_lengths_key: torch.Tensor,
         enable_sparse_li_c8: bool,
         use_torch_npu_lightning_indexer: bool,
+        block_table: torch.Tensor | None = None,
     ) -> torch.Tensor:
         indexer_cache_idx = sfa_impl.kv_cache_indexer_k_idx
         indexer_scale_cache_idx = sfa_impl.kv_cache_indexer_scale_idx
+        if block_table is None:
+            block_table = attn_metadata.block_table
 
         if enable_sparse_li_c8:
             assert len(kv_cache) == (3 if sfa_impl.enable_sparse_sfa_c8 else 4)
@@ -1683,7 +1710,7 @@ class A5DeviceAdaptor(BaseDeviceAdaptor):
                     key_dequant_scale=key_dequant_scale,
                     actual_seq_lengths_query=actual_seq_lengths_query,
                     actual_seq_lengths_key=actual_seq_lengths_key,
-                    block_table=attn_metadata.block_table,
+                    block_table=block_table,
                     query_quant_mode=0,
                     key_quant_mode=0,
                     layout_query="TND",
@@ -1698,7 +1725,7 @@ class A5DeviceAdaptor(BaseDeviceAdaptor):
                     weights=weights,
                     actual_seq_lengths_query=actual_seq_lengths_query,
                     actual_seq_lengths_key=actual_seq_lengths_key,
-                    block_table=attn_metadata.block_table,
+                    block_table=block_table,
                     layout_query="TND",
                     layout_key="PA_BSND",
                     sparse_count=2048,
@@ -1711,7 +1738,7 @@ class A5DeviceAdaptor(BaseDeviceAdaptor):
                 weights=weights,
                 actual_seq_lengths_query=actual_seq_lengths_query,
                 actual_seq_lengths_key=actual_seq_lengths_key,
-                block_table=attn_metadata.block_table,
+                block_table=block_table,
                 layout_query="TND",
                 layout_key="PA_BSND",
                 sparse_count=2048,

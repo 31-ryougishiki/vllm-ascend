@@ -10,13 +10,41 @@ from vllm.distributed import (
     tensor_model_parallel_all_reduce,
     tensor_model_parallel_reduce_scatter,
 )
+from vllm.distributed.parallel_state import get_tp_group
 from vllm.forward_context import get_forward_context
+from vllm.logger import logger
 from vllm.utils.torch_utils import direct_register_custom_op
 
 from vllm_ascend.ascend_forward_context import _EXTRA_CTX, MoECommType
 from vllm_ascend.ops.rotary_embedding import rope_forward_oot
 from vllm_ascend.ops.triton.muls_add import muls_add_triton
 from vllm_ascend.utils import enable_sp_by_pass, is_vl_model
+
+
+def _fixed_order_dsa_cp_reduce_scatter(x: torch.Tensor) -> torch.Tensor | None:
+    """Use the cp_balance fixed-order TP reduce when DSA-CP changes owners.
+
+    Returns ``None`` when the optimisation is not applicable (non-DSA-CP,
+    shape mismatch, profiling, unsupported backend), so the caller can keep the
+    original collective.
+    """
+    try:
+        from vllm_ascend.distributed.utils import fixed_order_reduce_scatter
+        from vllm_ascend.utils import enable_dsa_cp
+
+        if not enable_dsa_cp():
+            return None
+        group = get_tp_group()
+        if x.shape[0] % group.world_size != 0:
+            return None
+        return fixed_order_reduce_scatter(x, group)
+    except Exception as exc:  # noqa: BLE001 - fall back, never break a forward
+        logger.warning_once(
+            "cp_balance fixed-order MoE/reduce path unavailable (%s); "
+            "falling back to tensor_model_parallel_reduce_scatter",
+            exc,
+        )
+        return None
 
 
 def _maybe_chunk_residual_impl(x: torch.Tensor, residual: torch.Tensor) -> torch.Tensor:
@@ -87,6 +115,9 @@ def _maybe_pad_and_reduce_impl(x: torch.Tensor, is_ep_comm: bool = False) -> tor
         pad_size = _EXTRA_CTX.pad_size
         if pad_size > 0:
             x = F.pad(x, (0, 0, 0, pad_size))
+        fixed = _fixed_order_dsa_cp_reduce_scatter(x)
+        if fixed is not None:
+            return fixed
         return tensor_model_parallel_reduce_scatter(x, 0)
     else:
         if enable_sp_by_pass():

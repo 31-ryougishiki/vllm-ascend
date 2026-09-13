@@ -13,6 +13,7 @@ from vllm.forward_context import BatchDescriptor, get_forward_context, set_forwa
 from vllm.logger import logger
 
 from vllm_ascend.ascend_config import get_ascend_config
+from vllm_ascend.layers.cp_zigzag import zigzag_reorder_moe_aux
 from vllm_ascend.utils import (
     AscendDeviceType,
     enable_sp,
@@ -64,6 +65,101 @@ def override_mrv2_in_profile_run(enabled: bool):
 
 def get_mrv2_in_profile_run() -> bool:
     return _MRV2_IN_PROFILE_RUN.get()
+
+
+def _iter_attn_metadata(attn_metadata: Any):
+    """Yield per-layer metadata objects from dict / list-of-dict / object.
+
+    v1 attention metadata is normally ``{layer_name: metadata}``.  When
+    ubatching is enabled it becomes a list of such dicts, so walk both shapes
+    to keep zigzag activation/fallback decisions consistent.
+    """
+    if isinstance(attn_metadata, dict):
+        yield from attn_metadata.values()
+    elif isinstance(attn_metadata, (list, tuple)):
+        for item in attn_metadata:
+            if isinstance(item, dict):
+                yield from item.values()
+            else:
+                yield item
+    else:
+        yield attn_metadata
+
+
+def _find_zigzag_cp_context(attn_metadata: Any):
+    """Find the DSA-CP zigzag context from attention metadata.
+
+    ``attn_metadata`` may be a per-layer dict (vLLM v1), a list of per-layer
+    dicts (ubatching), or a single object.  All layers of one forward share
+    the same token layout, so returning the first non-None context is enough.
+    """
+    for meta in _iter_attn_metadata(attn_metadata):
+        if meta is None:
+            continue
+        ctx = getattr(meta, "dsa_cp_context", None)
+        if ctx is not None and getattr(ctx, "zigzag_index", None) is not None:
+            return ctx
+    return None
+
+
+def _disable_zigzag_metadata_for_fallback(attn_metadata: Any) -> None:
+    """Restore continuous-slice metadata when zigzag has to be disabled.
+
+    ``AscendSFAMetadataBuilder`` decides zigzag before the forward context
+    knows whether the current run is a draft forward, uses the V2 model
+    runner, or has DP > 1. In those cases ``zigzag_cp_active`` is turned off
+    after the metadata was already built in zigzag layout. Switch the RoPE
+    tables, KV write slots and zigzag flags back to the stored continuous
+    fallback so attention, KV cache writes and the model boundary all execute
+    the same non-zigzag path.
+    """
+    for meta in _iter_attn_metadata(attn_metadata):
+        if meta is None:
+            continue
+        ctx = getattr(meta, "dsa_cp_context", None)
+        if ctx is None or getattr(ctx, "zigzag_index", None) is None:
+            continue
+
+        fallback_slot_mapping = getattr(ctx, "fallback_slot_mapping_cp", None)
+        fallback_cos = getattr(ctx, "fallback_cos", None)
+        fallback_sin = getattr(ctx, "fallback_sin", None)
+        if (
+            fallback_slot_mapping is None
+            or fallback_cos is None
+            or fallback_sin is None
+        ):
+            raise RuntimeError(
+                "DSA-CP zigzag metadata is missing its continuous-slice "
+                "fallback tensors and cannot be safely disabled."
+            )
+
+        ctx.slot_mapping_cp = fallback_slot_mapping
+        meta.cos = fallback_cos
+        meta.sin = fallback_sin
+        ctx.zigzag_index = None
+        ctx.zigzag_gather_index = None
+        ctx.inv_gather_index = None
+        ctx.q_half = 0
+        ctx.total_q_prev_tokens = 0
+        ctx.total_q_next_tokens = 0
+        ctx.split_list = None
+        ctx.cp_reverse_index = None
+        ctx.reverse_split_len = None
+        ctx.prefix_offsets = None
+        ctx.q_len_prev = None
+        ctx.q_len_next = None
+        ctx.kv_len_prev = None
+        ctx.kv_len_next = None
+        ctx.actual_seq_q_prev_list = None
+        ctx.actual_seq_q_next_list = None
+        ctx.kv_len_prev_list = None
+        ctx.kv_len_next_list = None
+        ctx.actual_seq_lengths_query_zigzag = None
+        ctx.actual_seq_lengths_key_zigzag = None
+        ctx.block_table_zigzag = None
+        ctx.fallback_slot_mapping_cp = None
+        ctx.fallback_cos = None
+        ctx.fallback_sin = None
 
 
 def _cann_megamoe_supported_by_config(vllm_config: VllmConfig) -> bool:
@@ -130,6 +226,22 @@ def set_ascend_forward_context(
         forward_context.draft_attn_metadatas = draft_attn_metadatas
 
         forward_context.input_ids = input_ids
+
+        zigzag_cp_context = _find_zigzag_cp_context(attn_metadata)
+        zigzag_cp_active = (
+            zigzag_cp_context is not None
+            and not is_draft_model
+            and not envs_vllm.VLLM_USE_V2_MODEL_RUNNER
+        )
+        if zigzag_cp_context is not None and not zigzag_cp_active:
+            # Metadata was built in zigzag layout before these disables were
+            # known. Restore the continuous-slice fallback on every metadata
+            # object so the whole forward stays on the non-zigzag path.
+            _disable_zigzag_metadata_for_fallback(attn_metadata)
+            if draft_attn_metadatas:
+                for draft_meta in draft_attn_metadatas:
+                    _disable_zigzag_metadata_for_fallback(draft_meta)
+            zigzag_cp_context = None
 
         from vllm_ascend.ops.fused_moe.moe_comm_method import get_moe_comm_method
 
@@ -202,6 +314,11 @@ def set_ascend_forward_context(
             num_tokens = attn_metadata.num_actual_tokens
 
         dp_world_size = get_dp_group().world_size
+        if dp_world_size > 1:
+            if zigzag_cp_active:
+                _disable_zigzag_metadata_for_fallback(attn_metadata)
+                zigzag_cp_active = False
+                zigzag_cp_context = None
         if dp_world_size > 1 and forward_context.dp_metadata is not None:
             dp_meta = forward_context.dp_metadata
             max_tokens_across_dp = dp_meta.num_tokens_across_dp_cpu.max().item()
@@ -218,6 +335,24 @@ def set_ascend_forward_context(
 
         forward_context.eplb_heat_collection_status = eplb_heat_collection_status
 
+        if envs_vllm.VLLM_USE_V2_MODEL_RUNNER:
+            forward_context.additional_kwargs["zigzag_cp_context"] = zigzag_cp_context
+            forward_context.additional_kwargs["zigzag_cp_active"] = zigzag_cp_active
+        else:
+            forward_context.zigzag_cp_context = zigzag_cp_context
+            forward_context.zigzag_cp_active = zigzag_cp_active
+
+        if zigzag_cp_active and zigzag_cp_context is not None and input_ids is not None:
+            # MoE hash routing runs once per MoE layer, but the reorder is
+            # identical every time: reorder ``input_ids`` here once and let
+            # experts_selector consume the rank-concatenating zigzag order
+            # directly.  Keep the model-embedding ``input_ids`` (passed to the
+            # model by the runner) in natural order; this context copy is only
+            # the MoE-side alias.
+            input_ids = input_ids.to(torch.int64)
+            input_ids = zigzag_reorder_moe_aux(input_ids, zigzag_cp_context)
+            forward_context.input_ids = input_ids
+
         if num_tokens is not None:
             if num_actual_tokens is None:
                 num_actual_tokens = num_tokens
@@ -228,6 +363,14 @@ def set_ascend_forward_context(
                 mc2_mask = reserved_mc2_mask[: forward_context.padded_num_tokens]
                 mc2_mask[:num_actual_tokens] = True
                 mc2_mask[num_actual_tokens:] = False
+                if zigzag_cp_active and zigzag_cp_context is not None:
+                    # MoE consumes rank-concatenating zigzag order.  Both
+                    # mc2_mask and forward_context.input_ids use the exact
+                    # same full padded zigzag_gather_index, so they can never
+                    # drift apart.
+                    mc2_mask = zigzag_reorder_moe_aux(
+                        mc2_mask, zigzag_cp_context
+                    )
                 forward_context.mc2_mask = mc2_mask
         try:
             yield
@@ -433,6 +576,8 @@ class _ExtraForwardContextProxy:
         "padded_num_tokens",
         "sinks",
         "eplb_heat_collection_status",
+        "zigzag_cp_active",
+        "zigzag_cp_context",
     )
 
     def check_extra_attr(self, name: str):

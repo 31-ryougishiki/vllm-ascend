@@ -77,6 +77,24 @@ env_variables: dict[str, Callable[[], Any]] = {
     # it will consume more NPU memory. If reducing NPU memory usage is a higher priority
     # for your DeepSeek W8A8 scene, then disable it.
     "VLLM_ASCEND_ENABLE_MLAPO": lambda: bool(int(os.getenv("VLLM_ASCEND_ENABLE_MLAPO", "1"))),
+    # Whether to enable zigzag CP balance for DSA prefill (multi-request and
+    # radix-cache prefix are supported; every sequence's extend length must be
+    # >= 2 * tp_size and the SP-padded token count must be a multiple of
+    # tp_size; actual prompt length may be non-divisible). Set to 0 to
+    # force the original continuous-slice attention path.
+    "VLLM_ASCEND_CP_BALANCE": lambda: bool(int(os.getenv("VLLM_ASCEND_CP_BALANCE", "1"))),
+    # Minimum number of prefill tokens required before zigzag CP balance is
+    # applied. Below this threshold the per-layer block exchange and extra
+    # kernel launches cost more than the attention imbalance they save. Tune
+    # this on the target hardware: 8192 is a conservative default.
+    "VLLM_ASCEND_CP_BALANCE_MIN_TOKENS": lambda: int(os.getenv("VLLM_ASCEND_CP_BALANCE_MIN_TOKENS", "8192")),
+    # Experimental A/B knob for the zigzag embedding entry. Disabled by
+    # default: 0 uses the validated model-boundary fallback (full embedding ->
+    # all-gather -> zigzag shard), 1 lets the vocab-parallel embedding consume
+    # the full token ids and return only the rank-local zigzag rows.
+    "VLLM_ASCEND_CP_BALANCE_EMBED_LOCAL": lambda: bool(
+        int(os.getenv("VLLM_ASCEND_CP_BALANCE_EMBED_LOCAL", "0"))
+    ),
     # Whether to enable weight cast format to FRACTAL_NZ.
     # 0: close nz;
     # 1: only quant case enable nz;

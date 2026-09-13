@@ -8,7 +8,9 @@ from vllm.distributed import (
     get_pp_group,
     get_tensor_model_parallel_world_size,
     tensor_model_parallel_all_gather,
+    tensor_model_parallel_all_reduce,
 )
+from vllm.distributed.parallel_state import get_tp_group
 from vllm.model_executor.layers.layernorm import RMSNorm
 from vllm.model_executor.layers.linear import (
     ColumnParallelLinear,
@@ -23,7 +25,10 @@ from vllm.model_executor.layers.quantization import QuantizationConfig
 from vllm.model_executor.layers.rotary_embedding import get_rope
 from vllm.model_executor.models.deepseek_v2 import (
     DeepSeekV2FusedQkvAProjLinear,
+    DeepseekAttention,
+    DeepseekV2DecoderLayer,
     DeepseekV2MLAAttention,
+    DeepseekV2MLP,
     DeepseekV2Model,
     Indexer,
     _get_llama_4_scaling,
@@ -31,6 +36,12 @@ from vllm.model_executor.models.deepseek_v2 import (
 )
 from vllm.model_executor.models.utils import extract_layer_index
 from vllm.sequence import IntermediateTensors
+
+from vllm_ascend import envs as ascend_envs
+from vllm_ascend.layers.cp_zigzag import (
+    zigzag_shard_positions,
+    zigzag_shard_tensor,
+)
 
 
 def _should_skip_indexer_init(
@@ -305,19 +316,77 @@ def _patched_forward(
     intermediate_tensors: IntermediateTensors | None,
     inputs_embeds: torch.Tensor | None = None,
 ) -> torch.Tensor | IntermediateTensors:
+    from vllm_ascend.ascend_forward_context import _EXTRA_CTX
+
+    zigzag_active = bool(_EXTRA_CTX.zigzag_cp_active)
+
+    hidden_is_zigzag_local = False
+    use_embed_local = (
+        zigzag_active
+        and ascend_envs.VLLM_ASCEND_CP_BALANCE_EMBED_LOCAL
+        and hasattr(self.embed_tokens, "forward_zigzag_local")
+    )
+    tp_size = get_tensor_model_parallel_world_size()
+    tp_rank = get_tp_group().rank_in_group
+    expected_local_tokens = positions.shape[0] // tp_size if zigzag_active else None
+
     if get_pp_group().is_first_rank:
         if inputs_embeds is not None:
             hidden_states = inputs_embeds
         else:
             if input_ids is None:
                 raise ValueError("Either input_ids or inputs_embeds must be provided to DeepseekV2Model.forward")
-            hidden_states = self.embed_input_ids(input_ids)
+            if use_embed_local:
+                # Experimental path (VLLM_ASCEND_CP_BALANCE_EMBED_LOCAL=1):
+                # every rank feeds the same full SP-padded token ids to the
+                # vocab-parallel embedding, which all-reduces the sharded
+                # partials into complete embeddings and returns only this
+                # rank's zigzag rows.  Never pass the rank-local ids here: the
+                # TP all-reduce would sum embeddings of different tokens.
+                if input_ids.shape[0] != positions.shape[0]:
+                    raise RuntimeError(
+                        f"[CP_BALANCE][EMBED] rank={tp_rank} zigzag "
+                        f"input_ids shape {tuple(input_ids.shape)} is not the "
+                        f"full padded stream {tuple(positions.shape)}"
+                    )
+                hidden_states = self.embed_tokens.forward_zigzag_local(input_ids)
+                hidden_is_zigzag_local = True
+            else:
+                hidden_states = self.embed_input_ids(input_ids)
         residual = None
+        if zigzag_active and not hidden_is_zigzag_local:
+            if hidden_states.shape[0] != positions.shape[0]:
+                # AscendVocabParallelEmbedding under FlashComm/SP ends with
+                # maybe_pad_and_reduce: it returns a TP-reduce-scattered
+                # rank-local continuous slice, NOT the full padded
+                # natural-order embedding.  zigzag_shard_tensor indexes with
+                # global natural positions, so it must consume the full
+                # tensor.  Gather the embedding back to full padded length
+                # before applying the zigzag shard.  ``positions`` is still
+                # the full padded tensor, so the shape check also avoids a
+                # double gather when embedding already returns full rows.
+                hidden_states = tensor_model_parallel_all_gather(hidden_states, 0)
+            hidden_states = zigzag_shard_tensor(hidden_states)
+            if hidden_states.shape[0] != expected_local_tokens:
+                raise RuntimeError(
+                    f"[CP_BALANCE][EMBED] rank={tp_rank} zigzag hidden "
+                    f"shard shape {tuple(hidden_states.shape)} != expected "
+                    f"{expected_local_tokens}"
+                )
     else:
         assert intermediate_tensors is not None
         hidden_states = intermediate_tensors["hidden_states"]
         residual = intermediate_tensors["residual"]
+        # The previous PP stage already returned the rank-local zigzag order.
 
+    if zigzag_active:
+        positions = zigzag_shard_positions(positions)
+        if positions.shape[0] != expected_local_tokens:
+            raise RuntimeError(
+                f"[CP_BALANCE][EMBED] rank={tp_rank} zigzag positions "
+                f"shape {tuple(positions.shape)} != expected "
+                f"{expected_local_tokens}"
+            )
     llama_4_scaling_config = getattr(self.config, "llama_4_scaling", None)
     llama_4_scaling: torch.Tensor | None
     if llama_4_scaling_config is not None:
@@ -336,7 +405,7 @@ def _patched_forward(
     ):
         if idx in self.aux_hidden_state_layers:
             aux_hidden_state = hidden_states + residual
-            if aux_hidden_state.shape[0] != positions.shape[0]:
+            if not zigzag_active and aux_hidden_state.shape[0] != positions.shape[0]:
                 aux_hidden_state = tensor_model_parallel_all_gather(aux_hidden_state, 0)
                 aux_hidden_state = aux_hidden_state[: positions.shape[0]]
             aux_hidden_states.append(aux_hidden_state)
@@ -345,7 +414,7 @@ def _patched_forward(
     if not get_pp_group().is_last_rank:
         return IntermediateTensors({"hidden_states": hidden_states, "residual": residual})
 
-    if hidden_states.shape[0] != positions.shape[0]:
+    if not zigzag_active and hidden_states.shape[0] != positions.shape[0]:
         combined_states = torch.cat([hidden_states, residual], dim=-1)
         combined_states = tensor_model_parallel_all_gather(combined_states, 0)
         combined_states = combined_states[: positions.shape[0]]
@@ -357,9 +426,91 @@ def _patched_forward(
         aux_hidden_states.append(hidden_states + residual)
 
     hidden_states, _ = self.norm(hidden_states, residual)
+    # The model runner performs the single model-boundary gather + rerange
+    # for zigzag outputs; return rank-local tensors here.
     if len(aux_hidden_states) > 0:
         return hidden_states, aux_hidden_states
     return hidden_states
 
 
+def _zigzag_layer_forward(
+    self,
+    positions: torch.Tensor,
+    hidden_states: torch.Tensor,
+    residual: torch.Tensor | None,
+    llama_4_scaling: torch.Tensor | None = None,
+) -> torch.Tensor:
+    """DeepseekV2DecoderLayer.forward with the model-level zigzag layout.
+
+    The normal SP branch all-gathers hidden before attention and
+    reduce-scatters it after attention; under zigzag CP the rank-local
+    [prev_block, next_block] order must be preserved throughout the layer.
+    """
+    if residual is None:
+        residual = hidden_states
+        hidden_states = self.input_layernorm(hidden_states)
+    else:
+        hidden_states, residual = self.input_layernorm(hidden_states, residual)
+
+    if self.use_mha:
+        hidden_states = self.self_attn(positions, hidden_states)
+    else:
+        hidden_states = self.self_attn(positions, hidden_states, llama_4_scaling)
+
+    # self.self_attn.mla_attn is AscendMultiHeadLatentAttention (the pluggable
+    # MultiHeadLatentAttentionWrapper).  Depending on the vLLM version the
+    # actual attention implementation is exposed either directly on the
+    # wrapper (wrapper.impl) or nested one level deeper
+    # (wrapper.mla_attn.impl); support both.
+    mla_impl = None
+    mla_wrapper = getattr(self.self_attn, "mla_attn", None)
+    if mla_wrapper is not None:
+        mla_impl = getattr(mla_wrapper, "impl", None)
+        if mla_impl is None:
+            mla_impl = getattr(getattr(mla_wrapper, "mla_attn", None), "impl", None)
+    full_o_proj = (
+        mla_impl is not None
+        and getattr(mla_impl, "enable_dsa_cp_with_o_proj_tp", False)
+    )
+    if self.use_sequence_parallel_moe and not full_o_proj:
+        # The attention o_proj was built with reduce_results=False for the
+        # contiguous-SP path; produce the full per-token result locally.
+        hidden_states = tensor_model_parallel_all_reduce(hidden_states)
+
+    if not isinstance(self.self_attn, DeepseekAttention) and hidden_states.dtype == torch.float16:
+        hidden_states *= 1.0 / self.routed_scaling_factor
+        if self.layer_idx == 0:
+            residual *= 1.0 / self.routed_scaling_factor
+
+    hidden_states, residual = self.post_attention_layernorm(hidden_states, residual)
+    hidden_states = self.mlp(hidden_states)
+
+    if isinstance(self.mlp, DeepseekV2MLP) and hidden_states.dtype == torch.float16:
+        hidden_states *= 1.0 / self.routed_scaling_factor
+
+    return hidden_states, residual
+
+
+_original_decoder_layer_forward = DeepseekV2DecoderLayer.forward
+
+
+def _patched_decoder_layer_forward(
+    self,
+    positions: torch.Tensor,
+    hidden_states: torch.Tensor,
+    residual: torch.Tensor | None,
+    llama_4_scaling: torch.Tensor | None = None,
+) -> torch.Tensor:
+    from vllm_ascend.ascend_forward_context import _EXTRA_CTX
+
+    if _EXTRA_CTX.zigzag_cp_active:
+        return _zigzag_layer_forward(
+            self, positions, hidden_states, residual, llama_4_scaling
+        )
+    return _original_decoder_layer_forward(
+        self, positions, hidden_states, residual, llama_4_scaling
+    )
+
+
 DeepseekV2Model.forward = _patched_forward
+DeepseekV2DecoderLayer.forward = _patched_decoder_layer_forward

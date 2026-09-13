@@ -60,6 +60,7 @@ from vllm_ascend.distributed.parallel_state import (
     get_mlp_tp_group,
     get_otp_group,
 )
+from vllm_ascend.distributed.utils import fixed_order_reduce_scatter
 from vllm_ascend.utils import (
     enable_dsa_cp,
     enable_sp,
@@ -197,7 +198,18 @@ class MLPRowParallelOp(CustomRowParallelOp):
         assert self.quant_method is not None
         bias_ = None if (self.tp_rank > 0 or self.skip_bias_add) else self.layer.bias
         output_parallel = self.quant_method.apply(self.layer, input_parallel, bias=bias_)
-        output = self.comm_group.reduce_scatter(output_parallel, 0)
+        output = None
+        try:
+            dsa_cp_enabled = enable_dsa_cp()
+        except Exception:  # pragma: no cover - config-less unit tests / profile runs
+            dsa_cp_enabled = False
+        if dsa_cp_enabled:
+            try:
+                output = fixed_order_reduce_scatter(output_parallel, self.comm_group)
+            except Exception:  # noqa: BLE001 - keep the original collective as fallback
+                output = None
+        if output is None:
+            output = self.comm_group.reduce_scatter(output_parallel, 0)
 
         output_bias = self.bias if self.skip_bias_add else None
         return output, output_bias
@@ -334,6 +346,42 @@ class SequenceRowParallelOp(CustomRowParallelOp):
         output_bias = self.bias if self.skip_bias_add else None
         return output, output_bias
 
+    def _fixed_order_reduce_scatter(self, output_parallel: torch.Tensor) -> torch.Tensor:
+        """Row-parallel reduce with a layout-independent summation order.
+
+        ``tensor_model_parallel_reduce_scatter`` owns a token row according to
+        the rank that requested the chunk, and HCCL's reduction order can
+        depend on that owner.  cp_balance deliberately moves rows between the
+        owners (that is how it balances attention), so the same per-token
+        partials can be rounded differently in B and C even though every
+        producer is bit-identical.
+
+        This helper implements the same mathematical reduce-scatter with
+        ``all_to_all_single`` + ``fixed_order_rank_sum``: every owner receives
+        the same per-token partials from source ranks ``0..world_size-1`` and
+        sums them in that fixed order, so token identity rather than chunk
+        ownership determines the rounding.  It is only used for DSA-CP, where
+        FlashComm changes rank ownership between B and C.
+
+        The communication volume is the same O(N) as the ring reduce-scatter
+        it replaces (each rank sends its full local row set once and receives
+        one chunk per source rank).  The fallback to the original collective
+        keeps unsupported shapes / dtypes from breaking a run.
+        """
+        world_size = int(self.layer.tp_size)
+        rows = int(output_parallel.shape[0])
+        if world_size <= 1 or rows % world_size != 0:
+            return tensor_model_parallel_reduce_scatter(output_parallel, 0)
+        try:
+            return fixed_order_reduce_scatter(output_parallel, self.comm_group)
+        except (RuntimeError, NotImplementedError, TypeError, ValueError) as exc:
+            logger.warning_once(
+                "cp_balance fixed-order reduce_scatter unavailable (%s); "
+                "falling back to tensor_model_parallel_reduce_scatter",
+                exc,
+            )
+            return tensor_model_parallel_reduce_scatter(output_parallel, 0)
+
     def matmul_and_reduce(self, input_parallel: torch.Tensor, bias_: Parameter | None) -> torch.Tensor:
         assert self.quant_method is not None
         try:
@@ -354,7 +402,8 @@ class SequenceRowParallelOp(CustomRowParallelOp):
             return tensor_model_parallel_all_reduce(output_parallel)
 
         pad_size = _EXTRA_CTX.pad_size
-        dsa_cp_attn_out = enable_dsa_cp() and ("o_proj" in self.layer.prefix or "wo_b" in self.layer.prefix)
+        dsa_cp = enable_dsa_cp()
+        dsa_cp_attn_out = dsa_cp and ("o_proj" in self.layer.prefix or "wo_b" in self.layer.prefix)
         if pad_size > 0 and not dsa_cp_attn_out:
             x = F.pad(x, (0, 0, 0, pad_size))
 
@@ -410,7 +459,12 @@ class SequenceRowParallelOp(CustomRowParallelOp):
             output = torch.add(output, torch.mul(quant_bias, deq_scale).to(self.layer.params_dtype))
         else:
             output_parallel = self.layer.quant_method.apply(self.layer, x, bias=bias_)
-            output = tensor_model_parallel_reduce_scatter(output_parallel, 0)
+            if dsa_cp:
+                # The zigzag path moves token rows between the chunk owners;
+                # make the reduction order a function of token identity only.
+                output = self._fixed_order_reduce_scatter(output_parallel)
+            else:
+                output = tensor_model_parallel_reduce_scatter(output_parallel, 0)
 
         return output
 

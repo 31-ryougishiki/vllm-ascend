@@ -34,6 +34,7 @@ import numpy as np
 import torch
 import torch.distributed as dist
 import torch.nn as nn
+import vllm.envs as envs_vllm
 from vllm._aiter_ops import rocm_aiter_ops
 from vllm.compilation.cuda_graph import CUDAGraphStat
 from vllm.config import CompilationMode, CUDAGraphMode, VllmConfig, get_layers_from_vllm_config
@@ -182,6 +183,7 @@ from vllm_ascend.ascend_forward_context import (  # isort: skip
 
 from vllm.model_executor.models.interfaces import supports_multimodal_pruning
 
+from vllm_ascend.layers.cp_zigzag import zigzag_gather_hidden_states_and_aux
 from vllm_ascend.sample.rejection_sampler import AscendRejectionSampler
 
 if TYPE_CHECKING:
@@ -2598,15 +2600,31 @@ class NPUModelRunner(GPUModelRunner):
             hidden_states = run_model()
             self._update_full_graph_params_if_needed(forward_context, num_tokens_padded)
 
-        if forward_context.flash_comm_v1_enabled and not isinstance(hidden_states, IntermediateTensors):
-            hidden_states = self._all_gather_hidden_states_and_aux(hidden_states)
+        if (
+            forward_context.flash_comm_v1_enabled
+            or getattr(forward_context, "zigzag_cp_active", False)
+        ) and not isinstance(hidden_states, IntermediateTensors):
+            if getattr(forward_context, "zigzag_cp_active", False):
+                hidden_states = zigzag_gather_hidden_states_and_aux(hidden_states)
+            else:
+                hidden_states = self._all_gather_hidden_states_and_aux(hidden_states)
         return hidden_states
 
-    def _pad_for_sequence_parallelism(self, num_scheduled_tokens: int) -> int:
-        # Pad tokens to multiple of tensor_parallel_size when
-        # enabled collective fusion for SP
+    def _pad_for_sequence_parallelism(
+        self,
+        num_scheduled_tokens: int,
+        num_scheduled_tokens_np: np.ndarray | None = None,
+    ) -> int:
+        # Pad tokens to a multiple of tensor_parallel_size when collective
+        # fusion for SP is enabled.  Zigzag CP also keeps this alignment: the
+        # per-sequence 2 * tp_size blocks distribute their remainders so every
+        # rank still holds the same number of local rows, while B and C feed
+        # the same M to every GEMM/SFA kernel.  The eligibility check is
+        # identical to AscendSFAMetadataBuilder, so non-zigzag batches keep the
+        # normal tp_size alignment as before.
         tp_size = self.vllm_config.parallel_config.tensor_parallel_size
-        if enable_sp(self.vllm_config) or enable_sp_by_pass():
+        sp_enabled = enable_sp(self.vllm_config)
+        if sp_enabled or enable_sp_by_pass():
             return round_up(num_scheduled_tokens, tp_size)
         return num_scheduled_tokens
 
@@ -2675,7 +2693,9 @@ class NPUModelRunner(GPUModelRunner):
         force_num_active_loras: int | None = None,
         num_encoder_reqs: int = 0,
     ) -> tuple[CUDAGraphMode, BatchDescriptor, bool, torch.Tensor | None, CUDAGraphStat | None]:
-        num_tokens_padded = self._pad_for_sequence_parallelism(num_tokens)
+        num_tokens_padded = self._pad_for_sequence_parallelism(
+            num_tokens, num_scheduled_tokens_np
+        )
         is_all_decode = np.all(self.input_batch.num_computed_tokens_cpu[:num_reqs] > 0)
         uniform_decode = (
             (
@@ -2890,6 +2910,7 @@ class NPUModelRunner(GPUModelRunner):
             slot_mapping=slot_mapping_gid_0,
             causal=True,
             is_prefilling=is_prefilling,
+            is_prefilling_cpu=is_prefilling,
             num_input_tokens=num_tokens_padded,
             actual_seq_lengths_q=self.actual_seq_lengths_q,
             positions=self.positions,
@@ -3501,6 +3522,7 @@ class NPUModelRunner(GPUModelRunner):
                 self.model = self.load_lora_model(self.model, self.vllm_config, self.device)
         self.model_memory_usage = m.consumed_memory
         logger.info("Loading model weights took %.4f GB", m.consumed_memory / float(2**30))
+
 
         get_offloader().post_init()
 

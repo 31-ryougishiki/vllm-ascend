@@ -3,6 +3,8 @@ import torch.distributed as dist
 from vllm.distributed import get_dcp_group
 from vllm.distributed.parallel_state import GroupCoordinator
 
+from vllm_ascend.layers.cp_zigzag import fixed_order_rank_sum
+
 
 def get_decode_context_model_parallel_world_size() -> int:
     """Return DCP world size (v0.21.0 helper removed on vLLM main)."""
@@ -12,6 +14,47 @@ def get_decode_context_model_parallel_world_size() -> int:
 def get_decode_context_model_parallel_rank() -> int:
     """Return DCP rank within group (v0.21.0 helper removed on vLLM main)."""
     return get_dcp_group().rank_in_group
+
+
+def fixed_order_reduce_scatter(tensor: torch.Tensor, group: GroupCoordinator) -> torch.Tensor:
+    """Reduce-scatter with a source-rank order that does not depend on the owner.
+
+    ``dist.reduce_scatter_tensor`` (and the HCCL kernel behind it) may
+    accumulate a chunk differently depending on which rank receives that
+    chunk.  cp_balance deliberately moves tokens between chunk owners, so that
+    implementation detail turns the same per-token partials into different
+    bf16 values in B and C.
+
+    This helper keeps the same O(N) communication volume but exchanges whole
+    chunks with ``all_to_all_single`` and then sums the received per-source
+    chunks in rank order ``0..world_size-1``.  Token identity, not chunk
+    ownership, now determines the accumulation order.
+
+    Every rank must arrange ``tensor`` in the same row order and own exactly
+    ``tensor.shape[0] / group.world_size`` of those rows.  Callers fall back to
+    the original collective when that precondition does not hold.
+    """
+    world_size = int(group.world_size)
+    if world_size <= 1:
+        return tensor
+    rows = int(tensor.shape[0])
+    if rows == 0:
+        return tensor
+    if rows % world_size != 0:
+        raise ValueError(
+            f"fixed_order_reduce_scatter needs rows divisible by {world_size}, got {rows}"
+        )
+    chunk = rows // world_size
+    trailing = tuple(tensor.shape[1:])
+    send = tensor.reshape(world_size, chunk, -1).contiguous()
+    recv = torch.empty_like(send)
+    dist.all_to_all_single(
+        recv.view(-1),
+        send.view(-1),
+        group=group.device_group,
+    )
+    result = fixed_order_rank_sum([recv[source_rank] for source_rank in range(world_size)])
+    return result.reshape(chunk, *trailing).contiguous()
 
 
 def all_gather_async(

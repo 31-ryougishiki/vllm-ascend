@@ -629,12 +629,23 @@
 #    Why:
 #       After vllm PR #41706, GlmMoeDsaForCausalLM.load_weights uses `AutoWeightsLoader` which
 #       does not skip `rot.weight`, and will cause ValueError while loading weights.
+#       In addition, when the same checkpoint is launched with a smaller
+#       `num_hidden_layers` (e.g. a 3-layer GLM-5.2 slice for single-node
+#       no-PP debugging), the checkpoint still contains all remaining backbone
+#       layers and MTP/nextn layers. Those weights have no destination module
+#       and fail in `DeepseekV2Model.load_weights`.
 #    How：
-#       Use the `skip_prefixes` parameter to skip certain weight tensors.
+#       Use the `skip_prefixes` parameter to skip certain weight tensors, and
+#       filter out `model.layers.{idx}` / `layers.{idx}` weights whose idx is
+#       greater than or equal to `num_hidden_layers` before loading. The
+#       safetensors `should_skip_weight` hook is extended as well so that
+#       extra layer tensors are skipped before `f.get_tensor` reads their
+#       bodies from disk.
 #    Related PR (if no, explain why):
 #       https://github.com/vllm-project/vllm/pull/41706
 #    Future Plan:
-#       Remove this patch when vllm supports rotary quant or pluggable `MultiTokenPredictorLayer`.
+#       Remove this patch when vllm supports rotary quant, pluggable
+#       `MultiTokenPredictorLayer`, and native checkpoint layer slicing.
 #
 # ** 3. File: worker/patch_deepseek_v2.py**
 # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
