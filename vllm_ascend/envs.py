@@ -88,6 +88,21 @@ env_variables: dict[str, Callable[[], Any]] = {
     # kernel launches cost more than the attention imbalance they save. Tune
     # this on the target hardware: 8192 is a conservative default.
     "VLLM_ASCEND_CP_BALANCE_MIN_TOKENS": lambda: int(os.getenv("VLLM_ASCEND_CP_BALANCE_MIN_TOKENS", "8192")),
+    # How cp_balance implements the layout-independent row-parallel reduction.
+    # `allreduce` (default) sums the complete tensor across TP and then slices
+    # the rank-owned chunk; `alltoall` uses all_to_all_single + fixed-order sum.
+    # The former has 2x communication volume but makes rounding independent of
+    # which rank owns a token, which is the correctness requirement for
+    # zigzag CP. Keep `alltoall` only for A/B perf comparison.
+    "VLLM_ASCEND_CP_BALANCE_REDUCE_MODE": lambda: os.getenv(
+        "VLLM_ASCEND_CP_BALANCE_REDUCE_MODE", "allreduce"
+    ).strip().lower(),
+    # Print the per-rank zigzag plan in the first prefill metadata build.  This
+    # is the cheapest way to prove that C really entered the zigzag path and to
+    # compare idx/q/kv lengths between two runs.
+    "VLLM_ASCEND_CP_BALANCE_DEBUG": lambda: bool(
+        int(os.getenv("VLLM_ASCEND_CP_BALANCE_DEBUG", "0"))
+    ),
     # Experimental A/B knob for the zigzag embedding entry. Disabled by
     # default: 0 uses the validated model-boundary fallback (full embedding ->
     # all-gather -> zigzag shard), 1 lets the vocab-parallel embedding consume

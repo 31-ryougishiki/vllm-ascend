@@ -24,6 +24,7 @@ from vllm.v1.kv_cache_interface import AttentionSpec
 from vllm.v1.utils import record_function_or_nullcontext
 from vllm.v1.worker.utils import select_common_block_size
 
+from vllm_ascend import envs as ascend_envs
 from vllm_ascend.ascend_config import get_ascend_config
 from vllm_ascend.ascend_forward_context import _EXTRA_CTX
 from vllm_ascend.attention.attention_mask import AttentionMaskBuilder
@@ -760,6 +761,22 @@ class AscendSFAMetadataBuilder(MLACommonMetadataBuilder[AscendSFAMetadata]):
                 # write slots and RoPE tables all follow the same order.
                 # cos/sin were already generated in that order above.
                 slot_mapping_cp = slot_mapping[zigzag["zigzag_index"]]
+                if ascend_envs.VLLM_ASCEND_CP_BALANCE_DEBUG:
+                    head = min(8, int(zigzag["zigzag_index"].numel()))
+                    logger.info(
+                        "[CP_BALANCE][plan] rank=%d pad=%d actual=%d local=%d "
+                        "idx=%s qprev=%s qnext=%s kvprev=%s kvnext=%s slots=%s",
+                        get_tp_group().rank_in_group,
+                        num_tokens_pad,
+                        num_actual_tokens,
+                        num_tokens_per_device,
+                        zigzag["zigzag_index"][:head].tolist(),
+                        zigzag["q_len_prev"].tolist(),
+                        zigzag["q_len_next"].tolist(),
+                        zigzag["kv_len_prev"].tolist(),
+                        zigzag["kv_len_next"].tolist(),
+                        slot_mapping_cp[:head].tolist(),
+                    )
             else:
                 slot_mapping_cp = slot_mapping_cp_continuous
                 cos = cos_continuous

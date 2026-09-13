@@ -356,17 +356,16 @@ class SequenceRowParallelOp(CustomRowParallelOp):
         partials can be rounded differently in B and C even though every
         producer is bit-identical.
 
-        This helper implements the same mathematical reduce-scatter with
-        ``all_to_all_single`` + ``fixed_order_rank_sum``: every owner receives
-        the same per-token partials from source ranks ``0..world_size-1`` and
-        sums them in that fixed order, so token identity rather than chunk
-        ownership determines the rounding.  It is only used for DSA-CP, where
-        FlashComm changes rank ownership between B and C.
+        This helper delegates to
+        :func:`vllm_ascend.distributed.utils.fixed_order_reduce_scatter`, which
+        implements an owner-independent reduction.  The default ``allreduce``
+        mode sums the complete row set in rank order and slices the local
+        chunk; ``alltoall`` mode keeps the lower-volume chunk exchange for A/B
+        experiments.  It is only used for DSA-CP, where FlashComm changes rank
+        ownership between B and C.
 
-        The communication volume is the same O(N) as the ring reduce-scatter
-        it replaces (each rank sends its full local row set once and receives
-        one chunk per source rank).  The fallback to the original collective
-        keeps unsupported shapes / dtypes from breaking a run.
+        The fallback to the original collective keeps unsupported shapes /
+        dtypes from breaking a run.
         """
         world_size = int(self.layer.tp_size)
         rows = int(output_parallel.shape[0])

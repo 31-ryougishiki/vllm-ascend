@@ -1,3 +1,5 @@
+import os
+
 import torch
 import torch.distributed as dist
 from vllm.distributed import get_dcp_group
@@ -16,8 +18,49 @@ def get_decode_context_model_parallel_rank() -> int:
     return get_dcp_group().rank_in_group
 
 
+def _allreduce_slice_reduce_scatter(tensor: torch.Tensor, group: GroupCoordinator) -> torch.Tensor:
+    """Owner-independent reduce-scatter: all-reduce, then slice our chunk.
+
+    An AllReduce sums every row across the whole TP group.  Its result is the
+    concatenation of the chunks that a ReduceScatter would have delivered to
+    the different owners, so each rank can simply slice its own chunk.  As the
+    reduction order is a property of the collective (rank order), not of the
+    token-row owner, the same per-token partials produce the same bits in B
+    and C even though zigzag moves a token between owners.
+    """
+    world_size = int(group.world_size)
+    rows = int(tensor.shape[0])
+    chunk = rows // world_size
+    summed = tensor.contiguous().clone()
+    dist.all_reduce(summed, group=group.device_group)
+    rank = int(group.rank_in_group)
+    return summed[rank * chunk : (rank + 1) * chunk].contiguous()
+
+
+def _all_to_all_fixed_order_reduce_scatter(tensor: torch.Tensor, group: GroupCoordinator) -> torch.Tensor:
+    """Reduce-scatter with a source-rank sum order, using all_to_all_single.
+
+    Kept as an A/B alternative for ``VLLM_ASCEND_CP_BALANCE_REDUCE_MODE=alltoall``.
+    It has lower communication volume than all-reduce but uses a less common
+    HCCL collective and therefore needs extra validation on each target SoC.
+    """
+    world_size = int(group.world_size)
+    rows = int(tensor.shape[0])
+    chunk = rows // world_size
+    trailing = tuple(tensor.shape[1:])
+    send = tensor.reshape(world_size, chunk, -1).contiguous()
+    recv = torch.empty_like(send)
+    dist.all_to_all_single(
+        recv.view(-1),
+        send.view(-1),
+        group=group.device_group,
+    )
+    result = fixed_order_rank_sum([recv[source_rank] for source_rank in range(world_size)])
+    return result.reshape(chunk, *trailing).contiguous()
+
+
 def fixed_order_reduce_scatter(tensor: torch.Tensor, group: GroupCoordinator) -> torch.Tensor:
-    """Reduce-scatter with a source-rank order that does not depend on the owner.
+    """Reduce-scatter whose rounding does not depend on chunk ownership.
 
     ``dist.reduce_scatter_tensor`` (and the HCCL kernel behind it) may
     accumulate a chunk differently depending on which rank receives that
@@ -25,10 +68,16 @@ def fixed_order_reduce_scatter(tensor: torch.Tensor, group: GroupCoordinator) ->
     implementation detail turns the same per-token partials into different
     bf16 values in B and C.
 
-    This helper keeps the same O(N) communication volume but exchanges whole
-    chunks with ``all_to_all_single`` and then sums the received per-source
-    chunks in rank order ``0..world_size-1``.  Token identity, not chunk
-    ownership, now determines the accumulation order.
+    Two owner-independent implementations are provided and selected by
+    ``VLLM_ASCEND_CP_BALANCE_REDUCE_MODE``:
+
+    ``allreduce`` (default)
+        Sum the complete row set in rank order and slice the local chunk.  This
+        is the most robust mode on HCCL and is the current correctness target.
+    ``alltoall``
+        Exchange chunks with ``all_to_all_single`` and sum the received
+        per-source chunks in rank order ``0..world_size-1``.  Lower
+        communication volume, kept for performance A/B testing.
 
     Every rank must arrange ``tensor`` in the same row order and own exactly
     ``tensor.shape[0] / group.world_size`` of those rows.  Callers fall back to
@@ -44,17 +93,16 @@ def fixed_order_reduce_scatter(tensor: torch.Tensor, group: GroupCoordinator) ->
         raise ValueError(
             f"fixed_order_reduce_scatter needs rows divisible by {world_size}, got {rows}"
         )
-    chunk = rows // world_size
-    trailing = tuple(tensor.shape[1:])
-    send = tensor.reshape(world_size, chunk, -1).contiguous()
-    recv = torch.empty_like(send)
-    dist.all_to_all_single(
-        recv.view(-1),
-        send.view(-1),
-        group=group.device_group,
+
+    mode = os.getenv("VLLM_ASCEND_CP_BALANCE_REDUCE_MODE", "allreduce").strip().lower()
+    if mode in ("allreduce", "all_reduce", "ar"):
+        return _allreduce_slice_reduce_scatter(tensor, group)
+    if mode in ("alltoall", "all_to_all", "a2a"):
+        return _all_to_all_fixed_order_reduce_scatter(tensor, group)
+    raise ValueError(
+        "VLLM_ASCEND_CP_BALANCE_REDUCE_MODE must be one of "
+        f"'allreduce' or 'alltoall', got {mode!r}"
     )
-    result = fixed_order_rank_sum([recv[source_rank] for source_rank in range(world_size)])
-    return result.reshape(chunk, *trailing).contiguous()
 
 
 def all_gather_async(
