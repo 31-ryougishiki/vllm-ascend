@@ -54,7 +54,8 @@ from vllm.distributed.parallel_state import get_tp_group
 from vllm.logger import logger
 from vllm.model_executor.models.utils import extract_layer_index
 
-from vllm_ascend.ascend_forward_context import _EXTRA_CTX
+from vllm_ascend import envs as ascend_envs
+from vllm_ascend.ascend_forward_context import _EXTRA_CTX, zigzag_active
 from vllm_ascend.device.device_op import DeviceOperator
 from vllm_ascend.distributed.parallel_state import (
     get_mlp_tp_group,
@@ -199,16 +200,17 @@ class MLPRowParallelOp(CustomRowParallelOp):
         bias_ = None if (self.tp_rank > 0 or self.skip_bias_add) else self.layer.bias
         output_parallel = self.quant_method.apply(self.layer, input_parallel, bias=bias_)
         output = None
-        try:
-            dsa_cp_enabled = enable_dsa_cp()
-        except Exception:  # pragma: no cover - config-less unit tests / profile runs
-            dsa_cp_enabled = False
-        if dsa_cp_enabled:
+        if zigzag_active():
+            # Only the zigzag layout moves token rows between chunk owners, so
+            # only those forwards need the owner-independent reduction.  Every
+            # other batch keeps the original collective bit for bit.
             try:
                 output = fixed_order_reduce_scatter(output_parallel, self.comm_group)
             except Exception:  # noqa: BLE001 - keep the original collective as fallback
                 output = None
         if output is None:
+            if ascend_envs.VLLM_ASCEND_CP_BALANCE_DEBUG:
+                logger.info_once("[CP_BALANCE][reduce] path=native site=mlp")
             output = self.comm_group.reduce_scatter(output_parallel, 0)
 
         output_bias = self.bias if self.skip_bias_add else None
@@ -458,11 +460,13 @@ class SequenceRowParallelOp(CustomRowParallelOp):
             output = torch.add(output, torch.mul(quant_bias, deq_scale).to(self.layer.params_dtype))
         else:
             output_parallel = self.layer.quant_method.apply(self.layer, x, bias=bias_)
-            if dsa_cp:
+            if zigzag_active():
                 # The zigzag path moves token rows between the chunk owners;
                 # make the reduction order a function of token identity only.
                 output = self._fixed_order_reduce_scatter(output_parallel)
             else:
+                if ascend_envs.VLLM_ASCEND_CP_BALANCE_DEBUG:
+                    logger.info_once("[CP_BALANCE][reduce] path=native site=sequence")
                 output = tensor_model_parallel_reduce_scatter(output_parallel, 0)
 
         return output

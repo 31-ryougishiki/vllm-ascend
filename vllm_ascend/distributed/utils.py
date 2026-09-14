@@ -5,6 +5,9 @@ import torch.distributed as dist
 from vllm.distributed import get_dcp_group
 from vllm.distributed.parallel_state import GroupCoordinator
 
+from vllm.logger import logger
+
+from vllm_ascend import envs as ascend_envs
 from vllm_ascend.layers.cp_zigzag import fixed_order_rank_sum
 
 
@@ -114,6 +117,13 @@ def fixed_order_reduce_scatter(tensor: torch.Tensor, group: GroupCoordinator) ->
         )
 
     mode = os.getenv("VLLM_ASCEND_CP_BALANCE_REDUCE_MODE", "allreduce").strip().lower()
+    if ascend_envs.VLLM_ASCEND_CP_BALANCE_DEBUG:
+        logger.info_once(
+            "[CP_BALANCE][reduce] path=fixed_order mode=%s group=%s rows=%d",
+            mode,
+            getattr(group, "unique_name", "?"),
+            rows,
+        )
     if mode in ("allreduce", "all_reduce", "ar"):
         return _allreduce_slice_reduce_scatter(tensor, group)
     if mode in ("alltoall", "all_to_all", "a2a"):

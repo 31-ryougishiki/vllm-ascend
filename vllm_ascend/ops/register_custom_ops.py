@@ -15,24 +15,25 @@ from vllm.forward_context import get_forward_context
 from vllm.logger import logger
 from vllm.utils.torch_utils import direct_register_custom_op
 
-from vllm_ascend.ascend_forward_context import _EXTRA_CTX, MoECommType
+from vllm_ascend import envs as ascend_envs
+from vllm_ascend.ascend_forward_context import _EXTRA_CTX, MoECommType, zigzag_active
 from vllm_ascend.ops.rotary_embedding import rope_forward_oot
 from vllm_ascend.ops.triton.muls_add import muls_add_triton
 from vllm_ascend.utils import enable_sp_by_pass, is_vl_model
 
 
-def _fixed_order_dsa_cp_reduce_scatter(x: torch.Tensor) -> torch.Tensor | None:
-    """Use the cp_balance fixed-order TP reduce when DSA-CP changes owners.
+def _fixed_order_zigzag_reduce_scatter(x: torch.Tensor) -> torch.Tensor | None:
+    """Use the cp_balance fixed-order TP reduce only for a zigzag forward.
 
-    Returns ``None`` when the optimisation is not applicable (non-DSA-CP,
-    shape mismatch, profiling, unsupported backend), so the caller can keep the
-    original collective.
+    Returns ``None`` when the optimisation is not applicable (non-zigzag batch,
+    shape mismatch, profiling, unsupported backend), so the caller keeps the
+    original collective and every other path stays on the original DSA-CP
+    implementation.
     """
     try:
         from vllm_ascend.distributed.utils import fixed_order_reduce_scatter
-        from vllm_ascend.utils import enable_dsa_cp
 
-        if not enable_dsa_cp():
+        if not zigzag_active():
             return None
         group = get_tp_group()
         if x.shape[0] % group.world_size != 0:
@@ -115,9 +116,11 @@ def _maybe_pad_and_reduce_impl(x: torch.Tensor, is_ep_comm: bool = False) -> tor
         pad_size = _EXTRA_CTX.pad_size
         if pad_size > 0:
             x = F.pad(x, (0, 0, 0, pad_size))
-        fixed = _fixed_order_dsa_cp_reduce_scatter(x)
+        fixed = _fixed_order_zigzag_reduce_scatter(x)
         if fixed is not None:
             return fixed
+        if ascend_envs.VLLM_ASCEND_CP_BALANCE_DEBUG:
+            logger.info_once("[CP_BALANCE][reduce] path=native site=pad_and_reduce")
         return tensor_model_parallel_reduce_scatter(x, 0)
     else:
         if enable_sp_by_pass():

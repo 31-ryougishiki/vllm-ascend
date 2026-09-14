@@ -611,3 +611,18 @@ class _ExtraForwardContextProxy:
 
 # usage: from vllm_ascend.ascend_forward_context import _EXTRA_CTX
 _EXTRA_CTX = _ExtraForwardContextProxy()
+
+
+def zigzag_active() -> bool:
+    """Whether the current forward executes the model-level zigzag layout.
+
+    cp_balance must be selected per forward, not per config: the same process
+    runs both layouts (an ineligible batch, a draft step or a profiling run
+    keeps the original continuous-slice behaviour).  A missing or foreign
+    forward context reports False so every cp_balance-specific collective falls
+    back to the original one.
+    """
+    try:
+        return bool(_EXTRA_CTX.zigzag_cp_active)
+    except Exception:  # noqa: BLE001 - AttributeError / no forward context
+        return False
