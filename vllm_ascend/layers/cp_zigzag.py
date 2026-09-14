@@ -586,6 +586,85 @@ def build_zigzag_plan(
     )
 
 
+def zigzag_ineligible_reason(
+    attn_state: Any,
+    num_tokens_pad: int,
+    cp_size: int,
+    query_lens: Sequence[int] | None,
+    prefix_lens: Sequence[int] | None = None,
+    is_prefilling: Sequence[bool] | None = None,
+    num_actual_tokens: int | None = None,
+    *,
+    speculative: bool = False,
+    v2_model_runner: bool = False,
+    dp_size: int = 1,
+    dcp_replicated: bool = False,
+    full_o_proj: bool = True,
+) -> str | None:
+    """Name the first gate that keeps this batch on continuous DSA-CP.
+
+    None means the batch may use the zigzag layout.  The gate order is the
+    one of can_enable_zigzag_for_batch; the name is only reported by the
+    VLLM_ASCEND_CP_BALANCE_DEBUG branch log.
+    """
+    if not ascend_envs.VLLM_ASCEND_CP_BALANCE:
+        return "flag_off"
+    if cp_size <= 1:
+        return "cp_size<=1"
+    if speculative:
+        return "draft"
+    if v2_model_runner:
+        return "v2_model_runner"
+    if dp_size > 1:
+        return "dp>1"
+    if dcp_replicated:
+        return "dcp_replicated"
+    if not full_o_proj:
+        return "o_proj_not_full"
+    state_name = getattr(attn_state, "name", attn_state)
+    if state_name not in _PURE_PREFILL_ATTENTION_STATES:
+        return f"state={state_name}"
+    if query_lens is None:
+        return "no_query_lens"
+    query_lens = tuple(int(x) for x in query_lens)
+    if not query_lens:
+        return "empty_batch"
+    if prefix_lens is None:
+        prefix_lens = (0,) * len(query_lens)
+    prefix_lens = tuple(int(x) for x in prefix_lens)
+    if len(prefix_lens) != len(query_lens):
+        return "prefix_len_mismatch"
+    if any(prefix < 0 for prefix in prefix_lens):
+        return "negative_prefix"
+    if any(query_len < 2 * cp_size for query_len in query_lens):
+        return f"query_len<{2 * cp_size}"
+    if num_actual_tokens is None:
+        num_actual_tokens = sum(query_lens)
+    if num_actual_tokens > num_tokens_pad:
+        return "actual>pad"
+    if num_actual_tokens < ascend_envs.VLLM_ASCEND_CP_BALANCE_MIN_TOKENS:
+        return f"actual<min({ascend_envs.VLLM_ASCEND_CP_BALANCE_MIN_TOKENS})"
+    # cp_size alignment is enough: every rank still owns exactly
+    # num_tokens_pad / cp_size rows because the remainder extras are
+    # distributed per rank.  Keeping the same alignment as the continuous
+    # path is what prevents an M-shape difference between B and C.
+    if num_tokens_pad % cp_size != 0:
+        return "pad%cp_size!=0"
+    if is_prefilling is None:
+        # PrefillNoCache is pure prefill by construction.  ChunkedPrefill /
+        # PrefillCacheHit can also contain decode rows, so require an explicit
+        # per-request is_prefilling mask there instead of guessing.
+        if state_name != "PrefillNoCache":
+            return f"is_prefilling_missing({state_name})"
+        return None
+    is_prefilling = tuple(bool(x) for x in is_prefilling)
+    if len(is_prefilling) != len(query_lens):
+        return "is_prefilling_len_mismatch"
+    if not all(is_prefilling):
+        return "not_all_prefilling"
+    return None
+
+
 def can_enable_zigzag_for_batch(
     attn_state: Any,
     num_tokens_pad: int,
@@ -603,76 +682,32 @@ def can_enable_zigzag_for_batch(
 ) -> bool:
     """The single source of truth for whether a batch may use zigzag CP.
 
-    ``AscendSFAMetadataBuilder`` calls this predicate before switching a batch
-    to the zigzag layout.  The model runner only pads to ``cp_size`` (the same
+    AscendSFAMetadataBuilder calls this predicate before switching a batch
+    to the zigzag layout.  The model runner only pads to cp_size (the same
     alignment the continuous path uses); the per-sequence head/tail remainder
-    distribution keeps every rank's local row count equal, so the two sides
+    distribution keeps every rank local row count equal, so the two sides
     stay consistent without a second padding rule.
 
-    SGLang guards every sequence with ``extend_len >= 2 * cp_size``; we keep
+    SGLang guards every sequence with extend_len >= 2 * cp_size; we keep
     that guard for multi-request batches as well.
     """
-    if not ascend_envs.VLLM_ASCEND_CP_BALANCE:
-        return False
-    if cp_size <= 1:
-        return False
-    if speculative or v2_model_runner or dp_size > 1 or dcp_replicated:
-        # The model-boundary fallback paths cannot carry the zigzag layout.
-        # Replicated-indexer DCP owns a different block-table/gather flow and
-        # must stay on the continuous-slice path.
-        return False
-    if not full_o_proj:
-        # Under zigzag every rank owns different token rows.  SFA prefill can
-        # only produce a complete per-row o_proj result when it may gather the
-        # full TP weight (enable_dsa_cp_with_o_proj_tp); a KV-consumer-only
-        # deployment keeps the TP-sharded o_proj and cannot reduce correctly
-        # across ranks that hold different rows.
-        return False
-    state_name = getattr(attn_state, "name", attn_state)
-    if state_name not in _PURE_PREFILL_ATTENTION_STATES:
-        return False
-    if query_lens is None:
-        return False
-
-    query_lens = tuple(int(x) for x in query_lens)
-    if not query_lens:
-        return False
-    if prefix_lens is None:
-        prefix_lens = (0,) * len(query_lens)
-    prefix_lens = tuple(int(x) for x in prefix_lens)
-    if len(prefix_lens) != len(query_lens):
-        return False
-    if any(prefix < 0 for prefix in prefix_lens):
-        return False
-    if any(query_len < 2 * cp_size for query_len in query_lens):
-        return False
-
-    if num_actual_tokens is None:
-        num_actual_tokens = sum(query_lens)
-    if num_actual_tokens > num_tokens_pad:
-        return False
-    if num_actual_tokens < ascend_envs.VLLM_ASCEND_CP_BALANCE_MIN_TOKENS:
-        return False
-    # ``cp_size`` alignment is enough: every rank still owns exactly
-    # ``num_tokens_pad / cp_size`` rows because the remainder extras are
-    # distributed per rank.  Keeping the same alignment as the continuous
-    # path is what prevents an M-shape difference between B and C.
-    if num_tokens_pad % cp_size != 0:
-        return False
-
-    if is_prefilling is None:
-        # PrefillNoCache is pure prefill by construction.  ChunkedPrefill /
-        # PrefillCacheHit can also contain decode rows, so require an explicit
-        # per-request is_prefilling mask there instead of guessing.
-        if state_name != "PrefillNoCache":
-            return False
-    else:
-        is_prefilling = tuple(bool(x) for x in is_prefilling)
-        if len(is_prefilling) != len(query_lens):
-            return False
-        if not all(is_prefilling):
-            return False
-    return True
+    return (
+        zigzag_ineligible_reason(
+            attn_state,
+            num_tokens_pad,
+            cp_size,
+            query_lens,
+            prefix_lens,
+            is_prefilling,
+            num_actual_tokens,
+            speculative=speculative,
+            v2_model_runner=v2_model_runner,
+            dp_size=dp_size,
+            dcp_replicated=dcp_replicated,
+            full_o_proj=full_o_proj,
+        )
+        is None
+    )
 
 
 def zigzag_shard_tensor(x: torch.Tensor, dim: int = 0) -> torch.Tensor:

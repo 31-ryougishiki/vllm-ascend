@@ -47,7 +47,7 @@ from vllm_ascend.distributed.parallel_state import get_otp_group
 from vllm_ascend.distributed.utils import all_gather_async
 from vllm_ascend.layers.cp_zigzag import (
     build_zigzag_plan,
-    can_enable_zigzag_for_batch,
+    zigzag_ineligible_reason,
 )
 from vllm_ascend.memcache_comm_fence import (
     record_attention_compute_start,
@@ -273,12 +273,12 @@ class DSACPContext:
     fallback_sin: torch.Tensor | None = None
 
 
-def _can_zigzag(
-    attn_state: AscendAttentionState,
+def _zigzag_gate_reason(
+    attn_state: Any,
     num_tokens: int,
     num_tokens_pad: int,
     cp_size: int,
-    query_lens: Sequence[int] | None = None,
+    query_lens: Sequence[int] | None,
     prefix_lens: Sequence[int] | None = None,
     is_prefilling: Sequence[bool] | None = None,
     num_actual_tokens: int | None = None,
@@ -288,18 +288,19 @@ def _can_zigzag(
     dp_size: int = 1,
     dcp_replicated: bool = False,
     full_o_proj: bool = True,
-) -> bool:
+) -> str | None:
     """Gate model-level zigzag CP to the prefill cases it can support.
 
-    ``num_tokens`` / ``num_tokens_pad`` are the padded token counts seen by
-    the metadata builder; they must agree for the metadata path.  The actual
-    policy is :func:`vllm_ascend.layers.cp_zigzag.can_enable_zigzag_for_batch`,
-    which is also used by the model runner for SP padding, so both sides
-    always make the same zigzag decision.
+    num_tokens / num_tokens_pad are the padded token counts seen by the
+    metadata builder; they must agree for the metadata path.  The actual
+    policy is vllm_ascend.layers.cp_zigzag.zigzag_ineligible_reason; the
+    model runner pads tokens to a tp_size multiple, which the plan relies
+    on.  None means zigzag may be used; the name is only reported by the
+    VLLM_ASCEND_CP_BALANCE_DEBUG branch log.
     """
     if num_tokens != num_tokens_pad:
-        return False
-    return can_enable_zigzag_for_batch(
+        return "tokens!=pad"
+    return zigzag_ineligible_reason(
         attn_state,
         num_tokens_pad,
         cp_size,
@@ -654,6 +655,10 @@ class AscendSFAMetadataBuilder(MLACommonMetadataBuilder[AscendSFAMetadata]):
         sin: torch.Tensor | None = None
 
         dsa_cp_context = None
+        zigzag = None
+        zigzag_gate: str | None = "dsa_cp_off"
+        num_tokens_pad = num_input_tokens
+        num_tokens_per_device = 0
         if self.enable_dsa_cp:
             global_tp_size = get_tp_group().world_size
             num_tokens = num_input_tokens
@@ -678,8 +683,8 @@ class AscendSFAMetadataBuilder(MLACommonMetadataBuilder[AscendSFAMetadata]):
             # disagree.  SFA C8 is no longer a hard requirement: both
             # C8 and non-C8 DSA-CP KV/indexer writers use the reordered slot
             # mapping below.
-            zigzag = None
-            if _can_zigzag(
+            block_table_zigzag = None
+            zigzag_gate = _zigzag_gate_reason(
                 common_attn_metadata.attn_state,
                 num_tokens,
                 num_tokens_pad,
@@ -698,7 +703,8 @@ class AscendSFAMetadataBuilder(MLACommonMetadataBuilder[AscendSFAMetadata]):
                 dp_size=self.vllm_config.parallel_config.data_parallel_size,
                 dcp_replicated=enable_sfa_dcp_replicated_indexer(self.vllm_config),
                 full_o_proj=dsa_cp_with_o_proj_tp_for_config(self.vllm_config),
-            ):
+            )
+            if zigzag_gate is None:
                 assert query_lens_cpu is not None and prefix_lens_cpu is not None
                 try:
                     zigzag = _build_zigzag_meta(
@@ -721,6 +727,7 @@ class AscendSFAMetadataBuilder(MLACommonMetadataBuilder[AscendSFAMetadata]):
                         exc,
                     )
                     zigzag = None
+                    zigzag_gate = f"plan_error:{type(exc).__name__}"
 
                 if zigzag is not None:
                     # The merged single-call operators treat prev and next as
@@ -743,10 +750,6 @@ class AscendSFAMetadataBuilder(MLACommonMetadataBuilder[AscendSFAMetadata]):
                     block_table_zigzag = torch.cat(
                         [ordered_block_table, ordered_block_table], dim=0
                     )
-                else:
-                    block_table_zigzag = None
-            else:
-                block_table_zigzag = None
 
             if zigzag is not None:
                 # Position-based rotary lookup: cos[zigzag_index] on the
@@ -932,6 +935,28 @@ class AscendSFAMetadataBuilder(MLACommonMetadataBuilder[AscendSFAMetadata]):
         else:
             cos, sin = get_cos_and_sin_mla(
                 input_positions, use_cache=(draft_index is None)
+            )
+
+        if ascend_envs.VLLM_ASCEND_CP_BALANCE_DEBUG:
+            branch_q_lens = query_lens_cpu or []
+            logger.info(
+                "[CP_BALANCE][branch] rank=%d branch=%s reason=%s state=%s pad=%d "
+                "actual=%d reqs=%d real=%d min_qlen=%d local=%d min_tokens=%d",
+                get_tp_group().rank_in_group,
+                "ZIGZAG" if zigzag is not None else "CONTINUOUS",
+                zigzag_gate or "-",
+                getattr(
+                    common_attn_metadata.attn_state,
+                    "name",
+                    common_attn_metadata.attn_state,
+                ),
+                num_tokens_pad,
+                num_actual_tokens,
+                num_reqs,
+                len(branch_q_lens),
+                min(branch_q_lens) if branch_q_lens else 0,
+                num_tokens_per_device,
+                ascend_envs.VLLM_ASCEND_CP_BALANCE_MIN_TOKENS,
             )
 
         if get_ascend_config().c8_enable_reshape_optim:
