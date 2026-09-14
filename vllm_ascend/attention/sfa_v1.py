@@ -700,35 +700,51 @@ class AscendSFAMetadataBuilder(MLACommonMetadataBuilder[AscendSFAMetadata]):
                 full_o_proj=dsa_cp_with_o_proj_tp_for_config(self.vllm_config),
             ):
                 assert query_lens_cpu is not None and prefix_lens_cpu is not None
-                zigzag = _build_zigzag_meta(
-                    num_tokens_pad,
-                    global_tp_size,
-                    get_tp_group().rank_in_group,
-                    query_lens_cpu,
-                    prefix_lens_cpu,
-                    slot_mapping.device,
-                    num_actual_tokens,
-                    num_reqs_meta=num_reqs,
-                )
-                # The merged single-call operators treat prev and next as two
-                # batches per request.  block_table rows must follow the same
-                # [all prevs, all nexts] order as the local Q tensor, so each
-                # real request row is repeated twice.  Re-select the rows by
-                # the same indices used to build query_lens_cpu: padded request
-                # slots are not guaranteed to sit at the tail of the tensor.
-                real_row_index = torch.tensor(
-                    real_req_indices, dtype=torch.long, device=block_table.device
-                )
-                ordered_block_table = block_table.index_select(0, real_row_index)
-                pad_reqs = max(int(num_reqs) - len(real_req_indices), 0)
-                if pad_reqs > 0:
-                    ordered_block_table = torch.cat(
-                        [ordered_block_table, torch.zeros_like(block_table[:pad_reqs])],
-                        dim=0,
+                try:
+                    zigzag = _build_zigzag_meta(
+                        num_tokens_pad,
+                        global_tp_size,
+                        get_tp_group().rank_in_group,
+                        query_lens_cpu,
+                        prefix_lens_cpu,
+                        slot_mapping.device,
+                        num_actual_tokens,
+                        num_reqs_meta=num_reqs,
                     )
-                block_table_zigzag = torch.cat(
-                    [ordered_block_table, ordered_block_table], dim=0
-                )
+                except (ValueError, AssertionError, RuntimeError) as exc:
+                    # Metadata and model-runner padding are expected to agree;
+                    # if they do not, a wrong plan would corrupt the forward.
+                    # Keep the service alive on the continuous-slice path.
+                    logger.warning_once(
+                        "cp_balance zigzag plan rejected (%s); "
+                        "falling back to continuous DSA-CP for this batch",
+                        exc,
+                    )
+                    zigzag = None
+
+                if zigzag is not None:
+                    # The merged single-call operators treat prev and next as
+                    # two batches per request.  block_table rows must follow
+                    # the same [all prevs, all nexts] order as the local Q
+                    # tensor, so each real request row is repeated twice.
+                    # Re-select rows by the same indices used to build
+                    # query_lens_cpu: zero-length padded request slots are not
+                    # guaranteed to sit at the tail of the tensor.
+                    real_row_index = torch.tensor(
+                        real_req_indices, dtype=torch.long, device=block_table.device
+                    )
+                    ordered_block_table = block_table.index_select(0, real_row_index)
+                    pad_reqs = max(int(num_reqs) - len(real_req_indices), 0)
+                    if pad_reqs > 0:
+                        ordered_block_table = torch.cat(
+                            [ordered_block_table, torch.zeros_like(block_table[:pad_reqs])],
+                            dim=0,
+                        )
+                    block_table_zigzag = torch.cat(
+                        [ordered_block_table, ordered_block_table], dim=0
+                    )
+                else:
+                    block_table_zigzag = None
             else:
                 block_table_zigzag = None
 
