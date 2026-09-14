@@ -627,6 +627,7 @@ class AscendSFAMetadataBuilder(MLACommonMetadataBuilder[AscendSFAMetadata]):
         query_lens_cpu: list[int] | None = None
         prefix_lens_cpu: list[int] | None = None
         is_prefilling_cpu: list[bool] | None = None
+        real_req_indices: list[int] = []
         query_start_loc_cpu = getattr(common_attn_metadata, "query_start_loc_cpu", None)
         if query_start_loc_cpu is not None and num_reqs > 0:
             raw_query_lens = [
@@ -712,8 +713,22 @@ class AscendSFAMetadataBuilder(MLACommonMetadataBuilder[AscendSFAMetadata]):
                 # The merged single-call operators treat prev and next as two
                 # batches per request.  block_table rows must follow the same
                 # [all prevs, all nexts] order as the local Q tensor, so each
-                # request row is simply repeated twice.
-                block_table_zigzag = torch.cat([block_table, block_table], dim=0)
+                # real request row is repeated twice.  Re-select the rows by
+                # the same indices used to build query_lens_cpu: padded request
+                # slots are not guaranteed to sit at the tail of the tensor.
+                real_row_index = torch.tensor(
+                    real_req_indices, dtype=torch.long, device=block_table.device
+                )
+                ordered_block_table = block_table.index_select(0, real_row_index)
+                pad_reqs = max(int(num_reqs) - len(real_req_indices), 0)
+                if pad_reqs > 0:
+                    ordered_block_table = torch.cat(
+                        [ordered_block_table, torch.zeros_like(block_table[:pad_reqs])],
+                        dim=0,
+                    )
+                block_table_zigzag = torch.cat(
+                    [ordered_block_table, ordered_block_table], dim=0
+                )
             else:
                 block_table_zigzag = None
 
