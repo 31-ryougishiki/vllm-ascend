@@ -90,10 +90,9 @@ env_variables: dict[str, Callable[[], Any]] = {
     "VLLM_ASCEND_CP_BALANCE_MIN_TOKENS": lambda: int(os.getenv("VLLM_ASCEND_CP_BALANCE_MIN_TOKENS", "8192")),
     # How cp_balance implements the layout-independent row-parallel reduction.
     # `allreduce` (default) sums the complete tensor across TP and then slices
-    # the rank-owned chunk; `alltoall` uses all_to_all_single + fixed-order sum.
-    # The former has 2x communication volume but makes rounding independent of
-    # which rank owns a token, which is the correctness requirement for
-    # zigzag CP. Keep `alltoall` only for A/B perf comparison.
+    # the rank-owned chunk; `alltoall` uses all_to_all_single + fixed-order
+    # sum; `reducescatter` restores the original owner-dependent collective for
+    # baseline debugging.
     "VLLM_ASCEND_CP_BALANCE_REDUCE_MODE": lambda: os.getenv(
         "VLLM_ASCEND_CP_BALANCE_REDUCE_MODE", "allreduce"
     ).strip().lower(),

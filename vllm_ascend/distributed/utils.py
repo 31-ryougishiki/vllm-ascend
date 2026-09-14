@@ -37,6 +37,25 @@ def _allreduce_slice_reduce_scatter(tensor: torch.Tensor, group: GroupCoordinato
     return summed[rank * chunk : (rank + 1) * chunk].contiguous()
 
 
+def _plain_reduce_scatter(tensor: torch.Tensor, group: GroupCoordinator) -> torch.Tensor:
+    """Original reduce_scatter implementation (owner-dependent rounding).
+
+    Selected by ``VLLM_ASCEND_CP_BALANCE_REDUCE_MODE=reducescatter``.  It
+    exists only to restore the exact pre-cp_balance baseline while debugging.
+    """
+    world_size = int(group.world_size)
+    rows = int(tensor.shape[0])
+    chunk = rows // world_size
+    trailing = tuple(tensor.shape[1:])
+    output = torch.empty(
+        (chunk, *trailing), dtype=tensor.dtype, device=tensor.device
+    )
+    dist.reduce_scatter_tensor(
+        output, tensor.contiguous(), group=group.device_group
+    )
+    return output
+
+
 def _all_to_all_fixed_order_reduce_scatter(tensor: torch.Tensor, group: GroupCoordinator) -> torch.Tensor:
     """Reduce-scatter with a source-rank sum order, using all_to_all_single.
 
@@ -99,9 +118,11 @@ def fixed_order_reduce_scatter(tensor: torch.Tensor, group: GroupCoordinator) ->
         return _allreduce_slice_reduce_scatter(tensor, group)
     if mode in ("alltoall", "all_to_all", "a2a"):
         return _all_to_all_fixed_order_reduce_scatter(tensor, group)
+    if mode in ("reducescatter", "reduce_scatter", "rs"):
+        return _plain_reduce_scatter(tensor, group)
     raise ValueError(
         "VLLM_ASCEND_CP_BALANCE_REDUCE_MODE must be one of "
-        f"'allreduce' or 'alltoall', got {mode!r}"
+        f"'allreduce' / 'alltoall' / 'reducescatter', got {mode!r}"
     )
 
 
