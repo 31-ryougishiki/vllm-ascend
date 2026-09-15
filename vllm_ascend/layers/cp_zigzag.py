@@ -14,10 +14,9 @@ These helpers mirror SGLang's NPU legacy DSA-CP flow at the model boundary:
   to natural token order for logits.
 
 The metadata plan built by :func:`build_zigzag_plan` is stored in
-``DSACPContext`` by ``AscendSFAMetadataBuilder``.  The same eligibility
-predicate :func:`can_enable_zigzag_for_batch` is shared by
-``NPUModelRunner._pad_for_sequence_parallelism`` and the metadata builder so
-the SP padding amount and the attention token layout can never diverge.
+``DSACPContext`` by ``AscendSFAMetadataBuilder``.  :func:`zigzag_ineligible_reason`
+is the single eligibility predicate; the metadata builder is its only caller
+and the one that fixes the SP padding alignment the plan relies on.
 """
 
 from __future__ import annotations
@@ -116,13 +115,11 @@ class ZigzagPlan:
     num_reqs: int
     cp_size: int
     cp_rank: int
-    prefix_offsets: tuple[int, ...]
     query_lens: tuple[int, ...]
     effective_query_lens: tuple[int, ...]
     # ``block_sizes[s][i]`` is sequence ``s``'s i-th block length; blocks are
     # contiguous in the natural (sequence-concatenated, tail-padded) stream.
     block_sizes: tuple[tuple[int, ...], ...]
-    split_list: tuple[int, ...]
     # Global token positions owned by this rank in [prev, next] order.
     zigzag_index: tuple[int, ...]
     # Rank-concatenating all-gather order: [r0_prev, r0_next, r1_prev, ...].
@@ -136,9 +133,6 @@ class ZigzagPlan:
     q_len_next_list: tuple[int, ...]
     kv_len_prev_list: tuple[int, ...]
     kv_len_next_list: tuple[int, ...]
-    # SGLang-style block-level rerange metadata.
-    cp_reverse_index: tuple[int, ...]
-    reverse_split_len: tuple[int, ...]
 
     @property
     def local_tokens(self) -> int:
@@ -537,41 +531,15 @@ def build_zigzag_plan(
             prefix_lens[seq_idx] + sum(blocks[: segment_num - cp_rank])
         )
 
-    # SGLang-compatible block-level rerange permutation and split lengths.
-    cp_reverse_index: list[int] = []
-    for batch_id in range(len(query_lens)):
-        cp_reverse_index.extend(
-            range(batch_id, segment_num * len(query_lens), 2 * len(query_lens))
-        )
-        cp_reverse_index.extend(
-            range(
-                (segment_num - 1) * len(query_lens) + batch_id,
-                0,
-                -2 * len(query_lens),
-            )
-        )
-    reverse_split_len: list[int] = []
-    for rank in range(cp_size):
-        for seq_idx in range(len(query_lens)):
-            reverse_split_len.append(block_sizes[seq_idx][rank])
-        for seq_idx in range(len(query_lens)):
-            reverse_split_len.append(block_sizes[seq_idx][segment_num - 1 - rank])
-
-    split_list = tuple(
-        block_len for blocks in block_sizes for block_len in blocks
-    )
-
     return ZigzagPlan(
         num_tokens=num_tokens_pad,
         num_actual_tokens=num_actual_tokens,
         num_reqs=len(query_lens),
         cp_size=cp_size,
         cp_rank=cp_rank,
-        prefix_offsets=prefix_lens,
         query_lens=query_lens,
         effective_query_lens=tuple(effective_query_lens),
         block_sizes=tuple(tuple(blocks) for blocks in block_sizes),
-        split_list=split_list,
         zigzag_index=tuple(zigzag_index),
         zigzag_gather_index=tuple(gather_positions),
         inv_gather_index=tuple(inv_positions),
@@ -581,8 +549,6 @@ def build_zigzag_plan(
         q_len_next_list=tuple(q_len_next_list),
         kv_len_prev_list=tuple(kv_len_prev_list),
         kv_len_next_list=tuple(kv_len_next_list),
-        cp_reverse_index=tuple(cp_reverse_index),
-        reverse_split_len=tuple(reverse_split_len),
     )
 
 
@@ -665,67 +631,13 @@ def zigzag_ineligible_reason(
     return None
 
 
-def can_enable_zigzag_for_batch(
-    attn_state: Any,
-    num_tokens_pad: int,
-    cp_size: int,
-    query_lens: Sequence[int] | None,
-    prefix_lens: Sequence[int] | None = None,
-    is_prefilling: Sequence[bool] | None = None,
-    num_actual_tokens: int | None = None,
-    *,
-    speculative: bool = False,
-    v2_model_runner: bool = False,
-    dp_size: int = 1,
-    dcp_replicated: bool = False,
-    full_o_proj: bool = True,
-) -> bool:
-    """The single source of truth for whether a batch may use zigzag CP.
-
-    AscendSFAMetadataBuilder calls this predicate before switching a batch
-    to the zigzag layout.  The model runner only pads to cp_size (the same
-    alignment the continuous path uses); the per-sequence head/tail remainder
-    distribution keeps every rank local row count equal, so the two sides
-    stay consistent without a second padding rule.
-
-    SGLang guards every sequence with extend_len >= 2 * cp_size; we keep
-    that guard for multi-request batches as well.
-    """
-    return (
-        zigzag_ineligible_reason(
-            attn_state,
-            num_tokens_pad,
-            cp_size,
-            query_lens,
-            prefix_lens,
-            is_prefilling,
-            num_actual_tokens,
-            speculative=speculative,
-            v2_model_runner=v2_model_runner,
-            dp_size=dp_size,
-            dcp_replicated=dcp_replicated,
-            full_o_proj=full_o_proj,
-        )
-        is None
-    )
-
-
 def zigzag_shard_tensor(x: torch.Tensor, dim: int = 0) -> torch.Tensor:
     """Natural-order full tensor -> rank-local ``[prev_block, next_block]``."""
+    if dim != 0:
+        raise NotImplementedError("zigzag shard currently only supports dim=0")
     ctx = get_zigzag_cp_context()
     assert ctx is not None and ctx.zigzag_index is not None
-    index = ctx.zigzag_index
-    if x.ndim > 1 and dim == 0:
-        return x[index].contiguous()
-    if dim == 0:
-        return x[index].contiguous()
-    raise NotImplementedError("zigzag shard currently only supports dim=0")
-
-
-def zigzag_shard_positions(positions: torch.Tensor) -> torch.Tensor:
-    ctx = get_zigzag_cp_context()
-    assert ctx is not None and ctx.zigzag_index is not None
-    return positions[ctx.zigzag_index].contiguous()
+    return x[ctx.zigzag_index].contiguous()
 
 
 def zigzag_gather_tensor(x: torch.Tensor) -> torch.Tensor:

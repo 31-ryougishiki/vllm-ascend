@@ -8,7 +8,6 @@ from vllm.distributed import (
     get_pp_group,
     get_tensor_model_parallel_world_size,
     tensor_model_parallel_all_gather,
-    tensor_model_parallel_all_reduce,
 )
 from vllm.distributed.parallel_state import get_tp_group
 from vllm.model_executor.layers.layernorm import RMSNorm
@@ -25,10 +24,7 @@ from vllm.model_executor.layers.quantization import QuantizationConfig
 from vllm.model_executor.layers.rotary_embedding import get_rope
 from vllm.model_executor.models.deepseek_v2 import (
     DeepSeekV2FusedQkvAProjLinear,
-    DeepseekAttention,
-    DeepseekV2DecoderLayer,
     DeepseekV2MLAAttention,
-    DeepseekV2MLP,
     DeepseekV2Model,
     Indexer,
     _get_llama_4_scaling,
@@ -38,10 +34,7 @@ from vllm.model_executor.models.utils import extract_layer_index
 from vllm.sequence import IntermediateTensors
 
 from vllm_ascend import envs as ascend_envs
-from vllm_ascend.layers.cp_zigzag import (
-    zigzag_shard_positions,
-    zigzag_shard_tensor,
-)
+from vllm_ascend.layers.cp_zigzag import zigzag_shard_tensor
 
 
 def _should_skip_indexer_init(
@@ -380,7 +373,7 @@ def _patched_forward(
         # The previous PP stage already returned the rank-local zigzag order.
 
     if zigzag_active:
-        positions = zigzag_shard_positions(positions)
+        positions = zigzag_shard_tensor(positions)
         if positions.shape[0] != expected_local_tokens:
             raise RuntimeError(
                 f"[CP_BALANCE][EMBED] rank={tp_rank} zigzag positions "
@@ -433,84 +426,12 @@ def _patched_forward(
     return hidden_states
 
 
-def _zigzag_layer_forward(
-    self,
-    positions: torch.Tensor,
-    hidden_states: torch.Tensor,
-    residual: torch.Tensor | None,
-    llama_4_scaling: torch.Tensor | None = None,
-) -> torch.Tensor:
-    """DeepseekV2DecoderLayer.forward with the model-level zigzag layout.
-
-    The normal SP branch all-gathers hidden before attention and
-    reduce-scatters it after attention; under zigzag CP the rank-local
-    [prev_block, next_block] order must be preserved throughout the layer.
-    """
-    if residual is None:
-        residual = hidden_states
-        hidden_states = self.input_layernorm(hidden_states)
-    else:
-        hidden_states, residual = self.input_layernorm(hidden_states, residual)
-
-    if self.use_mha:
-        hidden_states = self.self_attn(positions, hidden_states)
-    else:
-        hidden_states = self.self_attn(positions, hidden_states, llama_4_scaling)
-
-    # self.self_attn.mla_attn is AscendMultiHeadLatentAttention (the pluggable
-    # MultiHeadLatentAttentionWrapper).  Depending on the vLLM version the
-    # actual attention implementation is exposed either directly on the
-    # wrapper (wrapper.impl) or nested one level deeper
-    # (wrapper.mla_attn.impl); support both.
-    mla_impl = None
-    mla_wrapper = getattr(self.self_attn, "mla_attn", None)
-    if mla_wrapper is not None:
-        mla_impl = getattr(mla_wrapper, "impl", None)
-        if mla_impl is None:
-            mla_impl = getattr(getattr(mla_wrapper, "mla_attn", None), "impl", None)
-    full_o_proj = (
-        mla_impl is not None
-        and getattr(mla_impl, "enable_dsa_cp_with_o_proj_tp", False)
-    )
-    if self.use_sequence_parallel_moe and not full_o_proj:
-        # The attention o_proj was built with reduce_results=False for the
-        # contiguous-SP path; produce the full per-token result locally.
-        hidden_states = tensor_model_parallel_all_reduce(hidden_states)
-
-    if not isinstance(self.self_attn, DeepseekAttention) and hidden_states.dtype == torch.float16:
-        hidden_states *= 1.0 / self.routed_scaling_factor
-        if self.layer_idx == 0:
-            residual *= 1.0 / self.routed_scaling_factor
-
-    hidden_states, residual = self.post_attention_layernorm(hidden_states, residual)
-    hidden_states = self.mlp(hidden_states)
-
-    if isinstance(self.mlp, DeepseekV2MLP) and hidden_states.dtype == torch.float16:
-        hidden_states *= 1.0 / self.routed_scaling_factor
-
-    return hidden_states, residual
-
-
-_original_decoder_layer_forward = DeepseekV2DecoderLayer.forward
-
-
-def _patched_decoder_layer_forward(
-    self,
-    positions: torch.Tensor,
-    hidden_states: torch.Tensor,
-    residual: torch.Tensor | None,
-    llama_4_scaling: torch.Tensor | None = None,
-) -> torch.Tensor:
-    from vllm_ascend.ascend_forward_context import _EXTRA_CTX
-
-    if _EXTRA_CTX.zigzag_cp_active:
-        return _zigzag_layer_forward(
-            self, positions, hidden_states, residual, llama_4_scaling
-        )
-    return _original_decoder_layer_forward(
-        self, positions, hidden_states, residual, llama_4_scaling
-    )
-
-
+# DeepseekV2DecoderLayer.forward is deliberately NOT patched: the zigzag
+# layout keeps every token rank-local, so the upstream sequence-parallel
+# branches (input all_gather / post-attention reduce_scatter, both guarded by
+# ``self.use_sequence_parallel_moe``) must simply not fire.  They cannot:
+# ``parallel_config.use_sequence_parallel_moe`` requires data_parallel_size > 1
+# (vllm/config/parallel.py:653-668) and the zigzag eligibility gate rejects
+# dp_size > 1 (layers/cp_zigzag.py:zigzag_ineligible_reason).  If that gate
+# ever loosens, this file has to patch the layer again.
 DeepseekV2Model.forward = _patched_forward
-DeepseekV2DecoderLayer.forward = _patched_decoder_layer_forward

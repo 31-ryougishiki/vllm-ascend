@@ -136,27 +136,16 @@ def _disable_zigzag_metadata_for_fallback(attn_metadata: Any) -> None:
         ctx.slot_mapping_cp = fallback_slot_mapping
         meta.cos = fallback_cos
         meta.sin = fallback_sin
+        # Clearing zigzag_index is what turns the forward back onto the
+        # continuous-slice path: every zigzag consumer keys off it, and
+        # zigzag_active() reads the context flag set by the caller.
         ctx.zigzag_index = None
         ctx.zigzag_gather_index = None
         ctx.inv_gather_index = None
-        ctx.q_half = 0
-        ctx.total_q_prev_tokens = 0
-        ctx.total_q_next_tokens = 0
-        ctx.split_list = None
-        ctx.cp_reverse_index = None
-        ctx.reverse_split_len = None
-        ctx.prefix_offsets = None
-        ctx.q_len_prev = None
-        ctx.q_len_next = None
-        ctx.kv_len_prev = None
-        ctx.kv_len_next = None
-        ctx.actual_seq_q_prev_list = None
-        ctx.actual_seq_q_next_list = None
-        ctx.kv_len_prev_list = None
-        ctx.kv_len_next_list = None
         ctx.actual_seq_lengths_query_zigzag = None
         ctx.actual_seq_lengths_key_zigzag = None
         ctx.block_table_zigzag = None
+        ctx.slot_mapping_cp_gathered = None
         ctx.fallback_slot_mapping_cp = None
         ctx.fallback_cos = None
         ctx.fallback_sin = None

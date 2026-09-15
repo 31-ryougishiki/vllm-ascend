@@ -1,4 +1,4 @@
-import os
+from functools import lru_cache
 
 import torch
 import torch.distributed as dist
@@ -21,6 +21,12 @@ def get_decode_context_model_parallel_rank() -> int:
     return get_dcp_group().rank_in_group
 
 
+@lru_cache(maxsize=1)
+def reduce_mode() -> str:
+    """Resolved owner-independent reduction mode (read once, not per layer)."""
+    return ascend_envs.VLLM_ASCEND_CP_BALANCE_REDUCE_MODE
+
+
 def _allreduce_slice_reduce_scatter(tensor: torch.Tensor, group: GroupCoordinator) -> torch.Tensor:
     """Owner-independent reduce-scatter: all-reduce, then slice our chunk.
 
@@ -30,11 +36,16 @@ def _allreduce_slice_reduce_scatter(tensor: torch.Tensor, group: GroupCoordinato
     reduction order is a property of the collective (rank order), not of the
     token-row owner, the same per-token partials produce the same bits in B
     and C even though zigzag moves a token between owners.
+
+    The AllReduce runs in place: every caller passes a freshly produced
+    activation that is not read again after the reduction, so the full-tensor
+    copy a defensive clone would cost is pure overhead on a path that runs
+    once per layer per collective site.
     """
     world_size = int(group.world_size)
     rows = int(tensor.shape[0])
     chunk = rows // world_size
-    summed = tensor.contiguous().clone()
+    summed = tensor if tensor.is_contiguous() else tensor.contiguous()
     dist.all_reduce(summed, group=group.device_group)
     rank = int(group.rank_in_group)
     return summed[rank * chunk : (rank + 1) * chunk].contiguous()
@@ -116,7 +127,7 @@ def fixed_order_reduce_scatter(tensor: torch.Tensor, group: GroupCoordinator) ->
             f"fixed_order_reduce_scatter needs rows divisible by {world_size}, got {rows}"
         )
 
-    mode = os.getenv("VLLM_ASCEND_CP_BALANCE_REDUCE_MODE", "allreduce").strip().lower()
+    mode = reduce_mode()
     if ascend_envs.VLLM_ASCEND_CP_BALANCE_DEBUG:
         logger.info_once(
             "[CP_BALANCE][reduce] path=fixed_order mode=%s group=%s rows=%d",

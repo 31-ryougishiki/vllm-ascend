@@ -2610,13 +2610,9 @@ class NPUModelRunner(GPUModelRunner):
                 hidden_states = self._all_gather_hidden_states_and_aux(hidden_states)
         return hidden_states
 
-    def _pad_for_sequence_parallelism(
-        self,
-        num_scheduled_tokens: int,
-        num_scheduled_tokens_np: np.ndarray | None = None,
-    ) -> int:
+    def _pad_for_sequence_parallelism(self, num_scheduled_tokens: int) -> int:
         # Pad tokens to a multiple of tensor_parallel_size when collective
-        # fusion for SP is enabled.  Zigzag CP also keeps this alignment: the
+        # fusion for SP is enabled.  Zigzag CP keeps the same alignment: the
         # per-sequence 2 * tp_size blocks distribute their remainders so every
         # rank still holds the same number of local rows, while B and C feed
         # the same M to every GEMM/SFA kernel.  The eligibility check is
@@ -2693,9 +2689,7 @@ class NPUModelRunner(GPUModelRunner):
         force_num_active_loras: int | None = None,
         num_encoder_reqs: int = 0,
     ) -> tuple[CUDAGraphMode, BatchDescriptor, bool, torch.Tensor | None, CUDAGraphStat | None]:
-        num_tokens_padded = self._pad_for_sequence_parallelism(
-            num_tokens, num_scheduled_tokens_np
-        )
+        num_tokens_padded = self._pad_for_sequence_parallelism(num_tokens)
         is_all_decode = np.all(self.input_batch.num_computed_tokens_cpu[:num_reqs] > 0)
         uniform_decode = (
             (

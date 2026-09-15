@@ -84,23 +84,6 @@ if TYPE_CHECKING:
 # token count limits within bmm_transpose operator
 BMM_TRANS_MAX_SUPPORTED_TOKENS = 1024
 
-# Ascend NPU aclnnIndex does not implement float8 advanced indexing.  The
-# zigzag KV/indexer writers therefore avoid tensor[index_tensor] for these
-# dtypes and reorder only the (int) slot mapping instead, letting the scatter
-# op skip padding rows through their -1 slots.  The unified zigzag writer now
-# uses that full-padded scatter path for every dtype; the predicate is kept
-# for diagnostics and for any future dtype-sensitive index path.
-_NPU_INDEX_UNSUPPORTED_FP8_DTYPES = tuple(
-    dtype
-    for dtype in (getattr(torch, "float8_e4m3fn", None), getattr(torch, "float8_e5m2", None))
-    if dtype is not None
-)
-
-
-def _supports_npu_advanced_index(dtype: torch.dtype) -> bool:
-    """Whether aclnnIndex supports ``tensor[index_tensor]`` for ``dtype``."""
-    return dtype not in _NPU_INDEX_UNSUPPORTED_FP8_DTYPES
-
 
 def _sfa_5_3_scope(name: str) -> Callable[[Callable[..., Any]], Callable[..., Any]]:
     """Add an optional profiler scope for the SFA-5.3 module regions.
@@ -236,26 +219,6 @@ class DSACPContext:
     zigzag_index: torch.Tensor | None = None
     zigzag_gather_index: torch.Tensor | None = None
     inv_gather_index: torch.Tensor | None = None
-    # Deprecated prev/next split point.  For the legacy single-request aligned
-    # case it equals total_q_prev_tokens; the active paths use
-    # total_q_prev_tokens / total_q_next_tokens instead.
-    q_half: int = 0
-    total_q_prev_tokens: int = 0
-    total_q_next_tokens: int = 0
-    # SGLang-style multi-request metadata (device tensors, int64 unless the
-    # field is used by the attention kernels).
-    split_list: torch.Tensor | None = None
-    cp_reverse_index: torch.Tensor | None = None
-    reverse_split_len: torch.Tensor | None = None
-    prefix_offsets: torch.Tensor | None = None
-    q_len_prev: torch.Tensor | None = None
-    q_len_next: torch.Tensor | None = None
-    kv_len_prev: torch.Tensor | None = None
-    kv_len_next: torch.Tensor | None = None
-    actual_seq_q_prev_list: torch.Tensor | None = None
-    actual_seq_q_next_list: torch.Tensor | None = None
-    kv_len_prev_list: torch.Tensor | None = None
-    kv_len_next_list: torch.Tensor | None = None
     # Single-kernel-call metadata: prev/next are exposed to the operators as
     # two batches per request.  query lengths are cumulative prefixes over
     # [req0..reqB-1 prev, req0..reqB-1 next]; KV lengths are raw per-batch
@@ -263,6 +226,9 @@ class DSACPContext:
     actual_seq_lengths_query_zigzag: torch.Tensor | None = None
     actual_seq_lengths_key_zigzag: torch.Tensor | None = None
     block_table_zigzag: torch.Tensor | None = None
+    # slot_mapping reordered by zigzag_gather_index, so the per-layer KV and
+    # indexer writers do not each re-run the same device-side permutation.
+    slot_mapping_cp_gathered: torch.Tensor | None = None
     # Continuous-slice fallback values. Metadata is built before the draft /
     # V2-runner / DP>1 disables are known, so keep the non-zigzag cos/sin and
     # slot mapping here. set_ascend_forward_context restores them when it has
@@ -271,49 +237,6 @@ class DSACPContext:
     fallback_slot_mapping_cp: torch.Tensor | None = None
     fallback_cos: torch.Tensor | None = None
     fallback_sin: torch.Tensor | None = None
-
-
-def _zigzag_gate_reason(
-    attn_state: Any,
-    num_tokens: int,
-    num_tokens_pad: int,
-    cp_size: int,
-    query_lens: Sequence[int] | None,
-    prefix_lens: Sequence[int] | None = None,
-    is_prefilling: Sequence[bool] | None = None,
-    num_actual_tokens: int | None = None,
-    *,
-    speculative: bool = False,
-    v2_model_runner: bool = False,
-    dp_size: int = 1,
-    dcp_replicated: bool = False,
-    full_o_proj: bool = True,
-) -> str | None:
-    """Gate model-level zigzag CP to the prefill cases it can support.
-
-    num_tokens / num_tokens_pad are the padded token counts seen by the
-    metadata builder; they must agree for the metadata path.  The actual
-    policy is vllm_ascend.layers.cp_zigzag.zigzag_ineligible_reason; the
-    model runner pads tokens to a tp_size multiple, which the plan relies
-    on.  None means zigzag may be used; the name is only reported by the
-    VLLM_ASCEND_CP_BALANCE_DEBUG branch log.
-    """
-    if num_tokens != num_tokens_pad:
-        return "tokens!=pad"
-    return zigzag_ineligible_reason(
-        attn_state,
-        num_tokens_pad,
-        cp_size,
-        query_lens,
-        prefix_lens,
-        is_prefilling,
-        num_actual_tokens,
-        speculative=speculative,
-        v2_model_runner=v2_model_runner,
-        dp_size=dp_size,
-        dcp_replicated=dcp_replicated,
-        full_o_proj=full_o_proj,
-    )
 
 
 def _build_zigzag_meta(
@@ -370,21 +293,11 @@ def _build_zigzag_meta(
     def _int64_tensor(values: Sequence[int]) -> torch.Tensor:
         return torch.tensor(values, dtype=torch.int64, device=device)
 
-    # Compute the cumulative query boundaries once, then materialize both the
-    # legacy per-half tensors and the merged single-call tensor from the same
-    # lists.
+    # Compute the cumulative query boundaries once and materialize the merged
+    # single-call metadata from the same lists the zigzag plan produced.
     prev_cum = _cumsum_list(q_len_prev_list)
     next_cum = _cumsum_list(q_len_next_list)
     prev_total = prev_cum[-1] if prev_cum else 0
-
-    q_len_prev = torch.tensor(prev_cum, dtype=torch.int32, device=device)
-    q_len_next = torch.tensor(next_cum, dtype=torch.int32, device=device)
-    kv_len_prev = torch.tensor(
-        kv_len_prev_list, dtype=torch.int32, device=device
-    )
-    kv_len_next = torch.tensor(
-        kv_len_next_list, dtype=torch.int32, device=device
-    )
 
     # Single-kernel-call layout: expose prev/next as 2 * B batches.  Q batch
     # boundaries are cumulative prefixes across [all prevs, all nexts]; KV
@@ -406,23 +319,12 @@ def _build_zigzag_meta(
         "zigzag_index": zigzag_index,
         "zigzag_gather_index": zigzag_gather_index,
         "inv_gather_index": inv_gather_index,
-        "q_half": plan.total_q_prev_tokens,
-        "total_q_prev_tokens": plan.total_q_prev_tokens,
-        "total_q_next_tokens": plan.total_q_next_tokens,
-        "split_list": _int64_tensor(plan.split_list),
-        "cp_reverse_index": _int64_tensor(plan.cp_reverse_index),
-        "reverse_split_len": _int64_tensor(plan.reverse_split_len),
-        "prefix_offsets": _int64_tensor(plan.prefix_offsets),
-        "q_len_prev": q_len_prev,
-        "q_len_next": q_len_next,
-        "kv_len_prev": kv_len_prev,
-        "kv_len_next": kv_len_next,
         "actual_seq_lengths_query_zigzag": actual_seq_lengths_query_zigzag,
         "actual_seq_lengths_key_zigzag": actual_seq_lengths_key_zigzag,
-        "actual_seq_q_prev_list": _int64_tensor(q_len_prev_list),
-        "actual_seq_q_next_list": _int64_tensor(q_len_next_list),
-        "kv_len_prev_list": _int64_tensor(kv_len_prev_list),
-        "kv_len_next_list": _int64_tensor(kv_len_next_list),
+        "q_len_prev_list": plan.q_len_prev_list,
+        "q_len_next_list": plan.q_len_next_list,
+        "kv_len_prev_list": plan.kv_len_prev_list,
+        "kv_len_next_list": plan.kv_len_next_list,
     }
 
 
@@ -684,9 +586,8 @@ class AscendSFAMetadataBuilder(MLACommonMetadataBuilder[AscendSFAMetadata]):
             # C8 and non-C8 DSA-CP KV/indexer writers use the reordered slot
             # mapping below.
             block_table_zigzag = None
-            zigzag_gate = _zigzag_gate_reason(
+            zigzag_gate = zigzag_ineligible_reason(
                 common_attn_metadata.attn_state,
-                num_tokens,
                 num_tokens_pad,
                 global_tp_size,
                 query_lens_cpu,
@@ -796,6 +697,9 @@ class AscendSFAMetadataBuilder(MLACommonMetadataBuilder[AscendSFAMetadata]):
                 # cos/sin were already generated in that order above.
                 slot_mapping_cp = slot_mapping[zigzag["zigzag_index"]]
                 if ascend_envs.VLLM_ASCEND_CP_BALANCE_DEBUG:
+                    # All of these come from the CPU-side plan, so the debug
+                    # line costs no device-to-host synchronization on top of
+                    # the slot_mapping print.
                     head = min(8, int(zigzag["zigzag_index"].numel()))
                     logger.info(
                         "[CP_BALANCE][plan] rank=%d pad=%d actual=%d local=%d "
@@ -805,10 +709,10 @@ class AscendSFAMetadataBuilder(MLACommonMetadataBuilder[AscendSFAMetadata]):
                         num_actual_tokens,
                         num_tokens_per_device,
                         zigzag["zigzag_index"][:head].tolist(),
-                        zigzag["q_len_prev"].tolist(),
-                        zigzag["q_len_next"].tolist(),
-                        zigzag["kv_len_prev"].tolist(),
-                        zigzag["kv_len_next"].tolist(),
+                        list(zigzag["q_len_prev_list"]),
+                        list(zigzag["q_len_next_list"]),
+                        list(zigzag["kv_len_prev_list"]),
+                        list(zigzag["kv_len_next_list"]),
                         slot_mapping_cp[:head].tolist(),
                     )
             else:
@@ -882,39 +786,6 @@ class AscendSFAMetadataBuilder(MLACommonMetadataBuilder[AscendSFAMetadata]):
                 inv_gather_index=(
                     zigzag["inv_gather_index"] if zigzag is not None else None
                 ),
-                q_half=zigzag["q_half"] if zigzag is not None else 0,
-                total_q_prev_tokens=(
-                    zigzag["total_q_prev_tokens"] if zigzag is not None else 0
-                ),
-                total_q_next_tokens=(
-                    zigzag["total_q_next_tokens"] if zigzag is not None else 0
-                ),
-                split_list=zigzag["split_list"] if zigzag is not None else None,
-                cp_reverse_index=(
-                    zigzag["cp_reverse_index"] if zigzag is not None else None
-                ),
-                reverse_split_len=(
-                    zigzag["reverse_split_len"] if zigzag is not None else None
-                ),
-                prefix_offsets=(
-                    zigzag["prefix_offsets"] if zigzag is not None else None
-                ),
-                q_len_prev=zigzag["q_len_prev"] if zigzag is not None else None,
-                q_len_next=zigzag["q_len_next"] if zigzag is not None else None,
-                kv_len_prev=zigzag["kv_len_prev"] if zigzag is not None else None,
-                kv_len_next=zigzag["kv_len_next"] if zigzag is not None else None,
-                actual_seq_q_prev_list=(
-                    zigzag["actual_seq_q_prev_list"] if zigzag is not None else None
-                ),
-                actual_seq_q_next_list=(
-                    zigzag["actual_seq_q_next_list"] if zigzag is not None else None
-                ),
-                kv_len_prev_list=(
-                    zigzag["kv_len_prev_list"] if zigzag is not None else None
-                ),
-                kv_len_next_list=(
-                    zigzag["kv_len_next_list"] if zigzag is not None else None
-                ),
                 actual_seq_lengths_query_zigzag=(
                     zigzag["actual_seq_lengths_query_zigzag"]
                     if zigzag is not None
@@ -926,6 +797,11 @@ class AscendSFAMetadataBuilder(MLACommonMetadataBuilder[AscendSFAMetadata]):
                     else None
                 ),
                 block_table_zigzag=block_table_zigzag,
+                slot_mapping_cp_gathered=(
+                    slot_mapping[zigzag["zigzag_gather_index"]]
+                    if zigzag is not None
+                    else None
+                ),
                 fallback_slot_mapping_cp=(
                     slot_mapping_cp_continuous if zigzag is not None else None
                 ),
@@ -2363,9 +2239,10 @@ class AscendSFAImpl(MLAAttentionImpl):
                     # Reorder only the integer slot mapping and scatter the
                     # full padded gather: padding rows carry
                     # slot_mapping == -1 and are skipped by the scatter ops.
-                    scatter_slots = slot_mapping_sfa[
-                        dsa_cp_context.zigzag_gather_index
-                    ]
+                    # The permutation is built once per batch by the metadata
+                    # builder, not once per layer.
+                    assert dsa_cp_context.slot_mapping_cp_gathered is not None
+                    scatter_slots = dsa_cp_context.slot_mapping_cp_gathered
                     fused_kv_actual = fused_kv_no_split
                 else:
                     scatter_slots = slot_mapping_sfa[: attn_metadata.num_actual_tokens]
@@ -2685,10 +2562,10 @@ class AscendSFAImpl(MLAAttentionImpl):
                 ):
                     # Reorder only the integer slot mapping and scatter the
                     # full padded gather.  Padding rows carry -1 slots and
-                    # are skipped by the scatter op.
-                    idx_slots = slot_mapping[
-                        attn_metadata.dsa_cp_context.zigzag_gather_index
-                    ]
+                    # are skipped by the scatter op.  The permutation is built
+                    # once per batch by the metadata builder, not per layer.
+                    assert attn_metadata.dsa_cp_context.slot_mapping_cp_gathered is not None
+                    idx_slots = attn_metadata.dsa_cp_context.slot_mapping_cp_gathered
 
                 if use_li_c8_reshape_optim:
                     torch.ops._C_ascend.store_kv_block(
