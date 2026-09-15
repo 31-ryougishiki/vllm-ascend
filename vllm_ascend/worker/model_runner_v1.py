@@ -34,7 +34,6 @@ import numpy as np
 import torch
 import torch.distributed as dist
 import torch.nn as nn
-import vllm.envs as envs_vllm
 from vllm._aiter_ops import rocm_aiter_ops
 from vllm.compilation.cuda_graph import CUDAGraphStat
 from vllm.config import CompilationMode, CUDAGraphMode, VllmConfig, get_layers_from_vllm_config
@@ -2619,8 +2618,7 @@ class NPUModelRunner(GPUModelRunner):
         # identical to AscendSFAMetadataBuilder, so non-zigzag batches keep the
         # normal tp_size alignment as before.
         tp_size = self.vllm_config.parallel_config.tensor_parallel_size
-        sp_enabled = enable_sp(self.vllm_config)
-        if sp_enabled or enable_sp_by_pass():
+        if enable_sp(self.vllm_config) or enable_sp_by_pass():
             return round_up(num_scheduled_tokens, tp_size)
         return num_scheduled_tokens
 
@@ -3516,7 +3514,6 @@ class NPUModelRunner(GPUModelRunner):
                 self.model = self.load_lora_model(self.model, self.vllm_config, self.device)
         self.model_memory_usage = m.consumed_memory
         logger.info("Loading model weights took %.4f GB", m.consumed_memory / float(2**30))
-
 
         get_offloader().post_init()
 

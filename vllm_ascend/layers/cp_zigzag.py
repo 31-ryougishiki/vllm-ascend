@@ -104,22 +104,14 @@ def zigzag_reorder_moe_aux(x: torch.Tensor, ctx=None) -> torch.Tensor:
 class ZigzagPlan:
     """CPU-side zigzag token plan for one prefill batch.
 
-    ``num_tokens`` is the SP-padded total token count.  ``query_lens`` are the
-    real per-request scheduled token counts; when ``num_tokens > sum(query_lens)``
-    the padding is appended to the last sequence, exactly like SGLang's
+    ``num_tokens`` is the SP-padded total token count; the trailing padding is
+    appended to the last sequence, exactly like SGLang's
     ``prepare_context_parallel_metadata``.
     """
 
     num_tokens: int
-    num_actual_tokens: int
     num_reqs: int
     cp_size: int
-    cp_rank: int
-    query_lens: tuple[int, ...]
-    effective_query_lens: tuple[int, ...]
-    # ``block_sizes[s][i]`` is sequence ``s``'s i-th block length; blocks are
-    # contiguous in the natural (sequence-concatenated, tail-padded) stream.
-    block_sizes: tuple[tuple[int, ...], ...]
     # Global token positions owned by this rank in [prev, next] order.
     zigzag_index: tuple[int, ...]
     # Rank-concatenating all-gather order: [r0_prev, r0_next, r1_prev, ...].
@@ -533,13 +525,8 @@ def build_zigzag_plan(
 
     return ZigzagPlan(
         num_tokens=num_tokens_pad,
-        num_actual_tokens=num_actual_tokens,
         num_reqs=len(query_lens),
         cp_size=cp_size,
-        cp_rank=cp_rank,
-        query_lens=query_lens,
-        effective_query_lens=tuple(effective_query_lens),
-        block_sizes=tuple(tuple(blocks) for blocks in block_sizes),
         zigzag_index=tuple(zigzag_index),
         zigzag_gather_index=tuple(gather_positions),
         inv_gather_index=tuple(inv_positions),

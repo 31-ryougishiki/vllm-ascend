@@ -324,12 +324,11 @@ def set_ascend_forward_context(
 
         forward_context.eplb_heat_collection_status = eplb_heat_collection_status
 
-        if envs_vllm.VLLM_USE_V2_MODEL_RUNNER:
-            forward_context.additional_kwargs["zigzag_cp_context"] = zigzag_cp_context
-            forward_context.additional_kwargs["zigzag_cp_active"] = zigzag_cp_active
-        else:
-            forward_context.zigzag_cp_context = zigzag_cp_context
-            forward_context.zigzag_cp_active = zigzag_cp_active
+        # zigzag is never active under the V2 model runner (see the
+        # VLLM_USE_V2_MODEL_RUNNER term above), so the V2 branch of the
+        # forward context only ever reads the None defaults here.
+        forward_context.zigzag_cp_context = zigzag_cp_context
+        forward_context.zigzag_cp_active = zigzag_cp_active
 
         if zigzag_cp_active and zigzag_cp_context is not None and input_ids is not None:
             # MoE hash routing runs once per MoE layer, but the reorder is
