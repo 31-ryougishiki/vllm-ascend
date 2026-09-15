@@ -634,13 +634,22 @@ def zigzag_gather_tensor(x: torch.Tensor) -> torch.Tensor:
     order: ``[r0_prev, r0_next, r1_prev, r1_next, ...]``. ``inv_gather_index``
     reranges that concatenation back to ``[token0, token1, ..., token_{T-1}]``.
     """
+    from vllm.forward_context import get_forward_context
+
     ctx = get_zigzag_cp_context()
     assert ctx is not None and ctx.inv_gather_index is not None
     if get_tensor_model_parallel_world_size() == 1:
         gathered = x
     else:
         gathered = tensor_model_parallel_all_gather(x, 0)
-    return gathered[ctx.inv_gather_index].contiguous()
+    full = gathered[ctx.inv_gather_index].contiguous()
+    # Drop the trailing SP padding rows exactly like the non-zigzag gather
+    # (NPUModelRunner._all_gather_hidden_states) so every consumer sees the
+    # same row count as before: num_tokens rows in natural token order.
+    pad_size = get_forward_context().pad_size
+    if pad_size > 0:
+        full = full[:-pad_size]
+    return full
 
 
 def zigzag_gather_hidden_states_list(hidden_states_list):

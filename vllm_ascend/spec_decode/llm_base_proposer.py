@@ -2129,8 +2129,15 @@ class AscendSpecDecodeBaseProposer(SpecDecodeBaseProposer):
                     common_attn_metadata, draft_index=1, **extra_attn_metadata_args
                 )
             else:
+                # for_draft keeps cp_balance's zigzag gate away from draft
+                # metadata: the drafter token tensors do not follow the plan
+                # that the gate would build from the target batch.
                 attn_metadata = builder.build(
-                    0, common_attn_metadata, self.runner.get_model(), **extra_attn_metadata_args
+                    0,
+                    common_attn_metadata,
+                    self.runner.get_model(),
+                    for_draft=True,
+                    **extra_attn_metadata_args,
                 )
             if hasattr(attn_metadata, "causal") and not attn_metadata.causal:
                 attn_metadata.attn_mask = None

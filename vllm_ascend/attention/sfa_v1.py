@@ -466,9 +466,15 @@ class AscendSFAMetadataBuilder(MLACommonMetadataBuilder[AscendSFAMetadata]):
         **kwargs,
     ) -> AscendSFAMetadata:
         # common_prefix_len / fast_build are unused; kept for API compatibility.
+        # for_draft marks metadata that the spec-decode drafter will consume.
+        # build_draft_attn_metadata calls build() directly (no draft_index), so
+        # the draft_index sentinel cannot identify it there; such metadata must
+        # never take the zigzag layout because the drafter's token tensors do
+        # not follow the target batch's plan.
+        for_draft = bool(kwargs.pop("for_draft", False))
         return self._build_with_metadata_view(
             common_attn_metadata,
-            lambda: self._build(common_attn_metadata, draft_index=None),
+            lambda: self._build(common_attn_metadata, draft_index=None, for_draft=for_draft),
         )
 
     def build_for_drafting(
@@ -501,6 +507,7 @@ class AscendSFAMetadataBuilder(MLACommonMetadataBuilder[AscendSFAMetadata]):
         self,
         common_attn_metadata: AscendCommonAttentionMetadata,
         draft_index: int | None = None,
+        for_draft: bool = False,
     ) -> AscendSFAMetadata:
         num_reqs = common_attn_metadata.num_reqs
         num_actual_tokens = common_attn_metadata.num_actual_tokens
@@ -538,15 +545,23 @@ class AscendSFAMetadataBuilder(MLACommonMetadataBuilder[AscendSFAMetadata]):
                 for i in range(min(num_reqs, int(query_start_loc_cpu.shape[0]) - 1))
             ]
             real_req_indices = [i for i, query_len in enumerate(raw_query_lens) if query_len > 0]
+            # Draft / dummy metadata may carry per-request fields that are
+            # shorter than num_reqs; skip the extraction instead of indexing
+            # out of range (the eligibility gate then reports no_query_lens and
+            # the batch stays on the continuous path).
+            seq_lens_list = seq_lens_cpu.tolist()
+            longest = max(real_req_indices) if real_req_indices else -1
+            is_prefilling_tensor = getattr(common_attn_metadata, "is_prefilling_cpu", None)
+            if longest >= len(seq_lens_list):
+                real_req_indices = []
+            if real_req_indices and is_prefilling_tensor is not None:
+                if longest >= len(is_prefilling_tensor):
+                    real_req_indices = []
             if real_req_indices:
                 query_lens_cpu = [raw_query_lens[i] for i in real_req_indices]
-                seq_lens_list = seq_lens_cpu.tolist()
                 prefix_lens_cpu = [
                     int(seq_lens_list[i]) - raw_query_lens[i] for i in real_req_indices
                 ]
-                is_prefilling_tensor = getattr(
-                    common_attn_metadata, "is_prefilling_cpu", None
-                )
                 if is_prefilling_tensor is not None:
                     is_prefilling_list = is_prefilling_tensor.tolist()
                     is_prefilling_cpu = [
@@ -599,7 +614,7 @@ class AscendSFAMetadataBuilder(MLACommonMetadataBuilder[AscendSFAMetadata]):
                 # with enforce_eager) does not: the main prefill forward is
                 # still pure-prefill and its output is gathered back to
                 # natural order before the MTP proposer consumes it.
-                speculative=draft_index is not None,
+                speculative=draft_index is not None or for_draft,
                 v2_model_runner=envs_vllm.VLLM_USE_V2_MODEL_RUNNER,
                 dp_size=self.vllm_config.parallel_config.data_parallel_size,
                 dcp_replicated=enable_sfa_dcp_replicated_indexer(self.vllm_config),
