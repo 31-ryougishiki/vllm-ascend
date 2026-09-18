@@ -45,8 +45,8 @@ from vllm_ascend.ops.rotary_embedding import get_cos_and_sin_mla
 from vllm_ascend.ops.triton.rope import rope_forward_triton_siso
 from vllm_ascend.utils import (
     _round_up,
-    dsa_cp_with_o_proj_tp_for_config,
     enable_dsa_cp,
+    enable_dsa_cp_full_o_proj,
     enable_sfa_dcp_replicated_indexer,
     is_pd_decode_recompute_scheduler_enabled,
     vllm_version_is,
@@ -798,7 +798,7 @@ class AscendSFAIndexerMetadataBuilder(AttentionMetadataBuilder[AscendSFAIndexerM
             v2_model_runner=use_v2_model_runner(self.vllm_config) is True,
             dp_size=self.vllm_config.parallel_config.data_parallel_size,
             dcp_replicated=enable_sfa_dcp_replicated_indexer(self.vllm_config),
-            full_o_proj=dsa_cp_with_o_proj_tp_for_config(self.vllm_config),
+            full_o_proj=enable_dsa_cp_full_o_proj(),
         )
         if gate is not None:
             return None

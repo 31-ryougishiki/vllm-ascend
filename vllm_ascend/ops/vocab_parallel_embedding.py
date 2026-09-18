@@ -303,6 +303,8 @@ class AscendVocabParallelEmbedding(VocabParallelEmbedding):
         # Mask the output embedding.
         if self.tp_size > 1:
             output_parallel.masked_fill_(input_mask.unsqueeze(-1), 0)
+        return output_parallel
+
     def _forward_origin(self, input_):
         output_parallel = self._embed_partial(input_)
         if self.tp_size <= 1:

@@ -44,10 +44,9 @@ from vllm_ascend.attention.sfa_v1 import (
 from vllm_ascend.attention.utils import AscendCommonAttentionMetadata, enable_dcp, split_decodes_and_prefills
 from vllm_ascend.device.device_op import DeviceOperator
 from vllm_ascend.distributed.utils import all_gather_async
+from vllm_ascend.mrv2_utils import use_v2_model_runner
 from vllm_ascend.utils import (
     _round_up,
-    dsa_cp_with_o_proj_tp_for_config,
-    use_v2_model_runner,
     enable_dsa_cp,
     enable_dsa_cp_full_o_proj,
     enable_pcp_o_proj_weight_sharding,
@@ -306,8 +305,9 @@ class AscendSFADSACPMetadataBuilder(AscendSFAMetadataBuilder):
         self.dsa_cp_actual_seq_lengths_query = torch.zeros(max_num_reqs + 1, dtype=torch.int32, device=device)
         self.dsa_cp_actual_seq_lengths_key = torch.empty_like(self.dsa_cp_actual_seq_lengths_query)
         # Zigzag exposes prev/next as two batches per request, so the merged
-        # sequence-length vectors are twice as long as the request list.
-        self.dsa_cp_zigzag_seq_query = torch.zeros(2 * max_num_reqs + 1, dtype=torch.int32, device=device)
+        # sequence-length vectors are twice as long as the request list.  The
+        # runner may publish one padded request slot beyond max_num_seqs.
+        self.dsa_cp_zigzag_seq_query = torch.zeros(2 * (max_num_reqs + 1) + 1, dtype=torch.int32, device=device)
         self.dsa_cp_zigzag_seq_key = torch.empty_like(self.dsa_cp_zigzag_seq_query)
         self.dsa_cp_spec_actual_seq_lengths_query: list[torch.Tensor] | None = None
         self.dsa_cp_spec_actual_seq_lengths_key: list[torch.Tensor] | None = None
@@ -483,7 +483,7 @@ class AscendSFADSACPMetadataBuilder(AscendSFAMetadataBuilder):
             v2_model_runner=use_v2_model_runner(self.vllm_config) is True,
             dp_size=self.vllm_config.parallel_config.data_parallel_size,
             dcp_replicated=enable_sfa_dcp_replicated_indexer(self.vllm_config),
-            full_o_proj=dsa_cp_with_o_proj_tp_for_config(self.vllm_config),
+            full_o_proj=enable_dsa_cp_full_o_proj(),
         )
         if gate is not None:
             if ascend_envs.VLLM_ASCEND_CP_BALANCE_DEBUG:
