@@ -3507,6 +3507,9 @@ class NPUModelRunner(GPUModelRunner):
             slot_mapping=slot_mapping_gid_0,
             causal=True,
             is_prefilling=is_prefilling,
+            # Host-side copy: the DSA-CP zigzag gate must not sync the
+            # device tensor inside the metadata build.
+            is_prefilling_cpu=is_prefilling,
             num_input_tokens=num_tokens_padded,
             actual_seq_lengths_q=self.actual_seq_lengths_q,
             positions=self.positions,

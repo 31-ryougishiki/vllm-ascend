@@ -46,10 +46,13 @@ from vllm.distributed import split_tensor_along_last_dim
 from vllm.distributed.parallel_state import get_tp_group
 from vllm.logger import logger
 
+from vllm_ascend import envs as ascend_envs
+from vllm_ascend.ascend_forward_context import zigzag_active
 from vllm_ascend.distributed.parallel_state import (
     get_mlp_tp_group,
     get_otp_group,
 )
+from vllm_ascend.distributed.utils import fixed_order_reduce_scatter
 from vllm_ascend.utils import (
     enable_dsa_cp,
     mlp_tp_enable,
@@ -185,7 +188,19 @@ class MLPRowParallelOp(CustomRowParallelOp):
         assert self.quant_method is not None
         bias_ = None if (self.tp_rank > 0 or self.skip_bias_add) else self.layer.bias
         output_parallel = self.quant_method.apply(self.layer, input_parallel, bias=bias_)
-        output = self.comm_group.reduce_scatter(output_parallel, 0)
+        output = None
+        if zigzag_active():
+            # Only the zigzag layout moves token rows between chunk owners, so
+            # only those forwards need the owner-independent reduction.  Every
+            # other batch keeps the original collective bit for bit.
+            try:
+                output = fixed_order_reduce_scatter(output_parallel, self.comm_group)
+            except Exception:  # noqa: BLE001 - keep the original collective as fallback
+                output = None
+        if output is None:
+            if ascend_envs.VLLM_ASCEND_CP_BALANCE_DEBUG:
+                logger.info_once("[CP_BALANCE][reduce] path=native site=mlp")
+            output = self.comm_group.reduce_scatter(output_parallel, 0)
 
         output_bias = self.bias if self.skip_bias_add else None
         return output, output_bias

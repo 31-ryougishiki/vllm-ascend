@@ -34,6 +34,8 @@ from vllm_ascend.ops.fused_moe.dataclass.shared_experts import (
     RoutedMoEMilestones,
 )
 from vllm_ascend.quantization.quant_type import QuantType
+from vllm_ascend.ascend_forward_context import zigzag_active
+from vllm_ascend.distributed.utils import fixed_order_reduce_scatter
 from vllm_ascend.utils import npu_stream_switch, shared_experts_calculation_stream
 
 # CANN uses 36 to select FP8 E4M3FN output for situ_mx_quant.
@@ -241,6 +243,18 @@ class AscendSharedExperts:
         pad_size = (tp_size - original_num_tokens % tp_size) % tp_size
         if pad_size > 0:
             shared_out = F.pad(shared_out, (0, 0, 0, pad_size))
+        if zigzag_active():
+            # The zigzag layout moves token rows between the reduce-scatter
+            # chunk owners; HCCL's accumulation order follows the owner, so the
+            # owner-independent reduction is required to keep B == base.
+            try:
+                return fixed_order_reduce_scatter(shared_out, self.moe_config.tp_group)
+            except Exception as exc:  # noqa: BLE001 - keep the original collective
+                logger.warning_once(
+                    "cp_balance fixed-order shared-expert reduce unavailable (%s); "
+                    "falling back to tensor_model_parallel_reduce_scatter",
+                    exc,
+                )
         return tensor_model_parallel_reduce_scatter(shared_out, dim=0)
 
     def prepare_input_async(

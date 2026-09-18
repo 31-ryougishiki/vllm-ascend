@@ -3,6 +3,7 @@ from typing import Any
 
 import scipy  # type: ignore
 import torch
+from vllm.logger import logger
 import torch_npu
 from torch import nn
 from vllm.config import VllmConfig, get_current_vllm_config
@@ -29,6 +30,11 @@ from vllm_ascend.attention.context_parallel.sfa_dcp_utils import (
     get_sfa_dcp_max_local_block_table_cols,
     get_sfa_pcp_global_metadata,
 )
+from vllm_ascend.attention.context_parallel.zigzag_cp import (
+    build_zigzag_cp_plan,
+    collect_batch_lengths,
+    zigzag_gate_reason,
+)
 from vllm_ascend.attention.utils import split_decodes_and_prefills
 from vllm_ascend.device.device_op import DeviceOperator
 from vllm_ascend.device.hardware_profile import HardwareCapability, get_current_hardware_profile
@@ -37,6 +43,7 @@ from vllm_ascend.ops.rotary_embedding import get_cos_and_sin_mla
 from vllm_ascend.ops.triton.rope import rope_forward_triton_siso
 from vllm_ascend.utils import (
     _round_up,
+    dsa_cp_with_o_proj_tp_for_config,
     enable_dsa_cp,
     enable_sfa_dcp_replicated_indexer,
     is_pd_decode_recompute_scheduler_enabled,
@@ -750,6 +757,90 @@ class AscendSFAIndexerMetadataBuilder(AttentionMetadataBuilder[AscendSFAIndexerM
             slot_mapping = pcp_slot_mapping
         return block_table, slot_mapping
 
+    def _build_dsa_cp_zigzag_metadata(
+        self,
+        common_attn_metadata: CommonAttentionMetadata,
+        cos: torch.Tensor,
+        sin: torch.Tensor,
+        slot_mapping: torch.Tensor,
+        block_table: torch.Tensor,
+        num_input_tokens: int,
+        num_reqs: int,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor] | None:
+        """Zigzag variant of ``_build_dsa_cp_parallel_metadata``.
+
+        The SFA builder and the indexer builder shard the same batch, so both
+        have to expose the same token order to their kernels: this helper uses
+        the shared planner in ``context_parallel/zigzag_cp.py`` and returns the
+        rank-local RoPE rows, the merged prev/next sequence lengths, the doubled
+        block table and the reordered slot mapping.  ``None`` keeps the
+        continuous-slice path.
+        """
+        cp_size = self.dsa_cp_world_size
+        num_tokens_pad = _round_up(num_input_tokens, cp_size)
+        num_actual_tokens = common_attn_metadata.num_actual_tokens
+        seq_lens_cpu_tensor = common_attn_metadata.seq_lens[:num_reqs].to("cpu")
+        query_lens_cpu, prefix_lens_cpu, is_prefilling_cpu, real_req_indices = collect_batch_lengths(
+            common_attn_metadata, num_reqs, seq_lens_cpu_tensor
+        )
+        gate = zigzag_gate_reason(
+            common_attn_metadata,
+            num_tokens_pad,
+            cp_size,
+            query_lens_cpu=query_lens_cpu,
+            prefix_lens_cpu=prefix_lens_cpu,
+            is_prefilling_cpu=is_prefilling_cpu,
+            num_actual_tokens=num_actual_tokens,
+            draft_index=None,
+            v2_model_runner=False,
+            dp_size=self.vllm_config.parallel_config.data_parallel_size,
+            dcp_replicated=enable_sfa_dcp_replicated_indexer(self.vllm_config),
+            full_o_proj=dsa_cp_with_o_proj_tp_for_config(self.vllm_config),
+        )
+        if gate is not None:
+            return None
+        try:
+            plan = build_zigzag_cp_plan(
+                common_attn_metadata=common_attn_metadata,
+                num_tokens_pad=num_tokens_pad,
+                num_actual_tokens=num_actual_tokens,
+                num_reqs=num_reqs,
+                cp_size=cp_size,
+                cp_rank=get_tp_group().rank_in_group,
+                device=slot_mapping.device,
+                slot_mapping=slot_mapping,
+                block_table=block_table,
+                seq_lens_cpu=seq_lens_cpu_tensor,
+                query_lens_cpu=query_lens_cpu,
+                prefix_lens_cpu=prefix_lens_cpu,
+                real_req_indices=real_req_indices,
+            )
+        except (ValueError, AssertionError, RuntimeError) as exc:
+            logger.warning_once(
+                "cp_balance indexer zigzag plan rejected (%s); falling back to continuous DSA-CP",
+                exc,
+            )
+            return None
+
+        # RoPE rows for the rank-local positions.  ``cos``/``sin`` carry the
+        # unpadded natural stream here, so padding rows (positions beyond it)
+        # stay zero exactly like the continuous-slice buffer.
+        index = plan.zigzag_index
+        in_range = index < cos.shape[0]
+        local_cos = cos.new_zeros((plan.local_tokens, *cos.shape[1:]))
+        local_sin = sin.new_zeros((plan.local_tokens, *sin.shape[1:]))
+        if bool(in_range.any()):
+            local_cos[in_range] = cos[index[in_range]]
+            local_sin[in_range] = sin[index[in_range]]
+        return (
+            local_cos,
+            local_sin,
+            plan.actual_seq_lengths_query_zigzag,
+            plan.actual_seq_lengths_key_zigzag,
+            plan.block_table_zigzag,
+            slot_mapping[index],
+        )
+
     def _build_dsa_cp_slot_mapping(
         self,
         slot_mapping: torch.Tensor,
@@ -1027,17 +1118,29 @@ class AscendSFAIndexerMetadataBuilder(AttentionMetadataBuilder[AscendSFAIndexerM
         actual_seq_lengths_query = cum_query_lens
         actual_seq_lengths_key = seq_lens
         if self.use_dsa_cp and not self.use_pcp:
-            (
-                cos,
-                sin,
-                actual_seq_lengths_query,
-                actual_seq_lengths_key,
-            ) = self._build_dsa_cp_parallel_metadata(
+            zigzag = self._build_dsa_cp_zigzag_metadata(
                 common_attn_metadata,
                 cos,
                 sin,
-                buffer_key,
+                slot_mapping,
+                block_table,
+                num_input_tokens,
+                num_reqs,
             )
+            if zigzag is not None:
+                cos, sin, actual_seq_lengths_query, actual_seq_lengths_key, block_table, slot_mapping = zigzag
+            else:
+                (
+                    cos,
+                    sin,
+                    actual_seq_lengths_query,
+                    actual_seq_lengths_key,
+                ) = self._build_dsa_cp_parallel_metadata(
+                    common_attn_metadata,
+                    cos,
+                    sin,
+                    buffer_key,
+                )
         elif copy_rope:
             cos, sin = self._copy_rope_to_metadata_buffers(
                 cos,

@@ -20,7 +20,7 @@ import torch
 import torch.distributed as dist
 from torch import nn
 from torch.nn.parameter import Parameter
-from vllm.distributed import divide
+from vllm.distributed import divide, tensor_model_parallel_all_reduce
 from vllm.distributed.parallel_state import get_tp_group
 from vllm.model_executor.layers.logits_processor import LogitsProcessor
 from vllm.model_executor.layers.quantization.base_config import (
@@ -192,6 +192,39 @@ class AscendVocabParallelEmbedding(VocabParallelEmbedding):
             return self._forward_embed_tp(input_)
         return self._forward_origin(input_)
 
+    def forward_zigzag_local(self, input_):
+        """Embedding entry for model-level zigzag CP.
+
+        ``input_`` is the full SP-padded natural-order token-id stream (the
+        same rows on every TP rank).  Each rank computes the partial embedding
+        of its own vocabulary shard for these rows, the TP all-reduce turns
+        them into the complete per-row embeddings, and only this rank's local
+        ``[prev_blocks, next_blocks]`` zigzag rows are returned.
+
+        The full row set is mandatory for correctness: the embedding weight is
+        sharded across TP, so an all-reduce only reconstructs the complete
+        embedding when every rank contributes the partials of the *same* token
+        ids.  Feeding rank-local ids (different tokens on every rank) into the
+        lookup and all-reducing would sum embeddings of different tokens.
+
+        Compared with the model-boundary fallback (full embedding followed by
+        all-gather + ``zigzag_shard_tensor``) this trades the hidden-state
+        all-gather for a TP all-reduce of the full hidden states, so it is
+        kept behind the ``VLLM_ASCEND_CP_BALANCE_EMBED_LOCAL`` switch.
+        """
+        if self.forward_type == "embed_tp":
+            raise NotImplementedError(
+                "forward_zigzag_local is not supported together with "
+                "fine-grained embedding TP"
+            )
+        from vllm_ascend.layers.cp_zigzag import zigzag_shard_tensor
+
+        if self.tp_size == 1:
+            # Zigzag CP requires cp_size > 1, so this is only a safety net.
+            return self._forward_origin(input_)
+        output = tensor_model_parallel_all_reduce(self._embed_partial(input_))
+        return zigzag_shard_tensor(output)
+
     def _forward_embed_tp(self, input_):
         num_tokens = input_.shape[0]
 
@@ -251,7 +284,8 @@ class AscendVocabParallelEmbedding(VocabParallelEmbedding):
         # Strip padding rows; preserve the original return shape.
         return self._embed_rs_out_buf[:num_tokens].view(num_tokens, -1)
 
-    def _forward_origin(self, input_):
+    def _embed_partial(self, input_):
+        """Look up this rank's vocabulary shard for ``input_`` (no TP reduce)."""
         if self.tp_size > 1:
             # Build the mask.
             masked_input, input_mask = self._mask_input_for_vocab_range(
@@ -269,9 +303,10 @@ class AscendVocabParallelEmbedding(VocabParallelEmbedding):
         # Mask the output embedding.
         if self.tp_size > 1:
             output_parallel.masked_fill_(input_mask.unsqueeze(-1), 0)
-        else:
+    def _forward_origin(self, input_):
+        output_parallel = self._embed_partial(input_)
+        if self.tp_size <= 1:
             return output_parallel
-
         # Reduce across all the model parallel GPUs.
         tp_group = get_tp_group()
         if tp_group.world_size == 1:
