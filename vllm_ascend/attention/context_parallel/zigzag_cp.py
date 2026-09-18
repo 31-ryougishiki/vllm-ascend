@@ -61,10 +61,23 @@ def _cumsum(values: list[int]) -> list[int]:
     return result
 
 
+def resolve_seq_lens_cpu(common_attn_metadata: Any, num_reqs: int) -> torch.Tensor:
+    """Host-side ``seq_lens`` for the first ``num_reqs`` requests.
+
+    ``seq_lens_cpu`` is published by the runner; falling back to a ``.to("cpu")``
+    copy would add a device-to-host sync to the metadata hot path of every
+    prefill batch.
+    """
+    seq_lens_cpu = getattr(common_attn_metadata, "seq_lens_cpu", None)
+    if seq_lens_cpu is None:
+        return common_attn_metadata.seq_lens[:num_reqs].to("cpu")
+    return seq_lens_cpu[:num_reqs]
+
+
 def collect_batch_lengths(
     common_attn_metadata: Any,
     num_reqs: int,
-    seq_lens_cpu: torch.Tensor,
+    seq_lens_cpu: torch.Tensor | None = None,
 ) -> tuple[list[int], list[int], list[bool] | None, list[int]]:
     """Return per-real-request ``(query_lens, prefix_lens, is_prefilling, row_ids)``.
 
@@ -72,6 +85,8 @@ def collect_batch_lengths(
     sit at the tail of the tensors, so the row ids of the real requests are
     returned together with their lengths.
     """
+    if seq_lens_cpu is None:
+        seq_lens_cpu = resolve_seq_lens_cpu(common_attn_metadata, num_reqs)
     query_start_loc_cpu = getattr(common_attn_metadata, "query_start_loc_cpu", None)
     if query_start_loc_cpu is None or num_reqs <= 0:
         return [], [], None, []

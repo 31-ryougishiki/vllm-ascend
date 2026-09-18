@@ -33,6 +33,7 @@ from vllm_ascend.attention.context_parallel.sfa_dcp_utils import (
 from vllm_ascend.attention.context_parallel.zigzag_cp import (
     build_zigzag_cp_plan,
     collect_batch_lengths,
+    resolve_seq_lens_cpu,
     zigzag_gate_reason,
 )
 from vllm_ascend.attention.utils import split_decodes_and_prefills
@@ -781,7 +782,7 @@ class AscendSFAIndexerMetadataBuilder(AttentionMetadataBuilder[AscendSFAIndexerM
         cp_size = self.dsa_cp_world_size
         num_tokens_pad = _round_up(num_input_tokens, cp_size)
         num_actual_tokens = common_attn_metadata.num_actual_tokens
-        seq_lens_cpu_tensor = common_attn_metadata.seq_lens[:num_reqs].to("cpu")
+        seq_lens_cpu_tensor = resolve_seq_lens_cpu(common_attn_metadata, num_reqs)
         query_lens_cpu, prefix_lens_cpu, is_prefilling_cpu, real_req_indices = collect_batch_lengths(
             common_attn_metadata, num_reqs, seq_lens_cpu_tensor
         )
