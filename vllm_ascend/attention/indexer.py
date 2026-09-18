@@ -39,6 +39,7 @@ from vllm_ascend.attention.utils import split_decodes_and_prefills
 from vllm_ascend.device.device_op import DeviceOperator
 from vllm_ascend.device.hardware_profile import HardwareCapability, get_current_hardware_profile
 from vllm_ascend.distributed.utils import all_gather_async
+from vllm_ascend.mrv2_utils import use_v2_model_runner
 from vllm_ascend.ops.rotary_embedding import get_cos_and_sin_mla
 from vllm_ascend.ops.triton.rope import rope_forward_triton_siso
 from vllm_ascend.utils import (
@@ -766,6 +767,7 @@ class AscendSFAIndexerMetadataBuilder(AttentionMetadataBuilder[AscendSFAIndexerM
         block_table: torch.Tensor,
         num_input_tokens: int,
         num_reqs: int,
+        draft_index: int | None,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor] | None:
         """Zigzag variant of ``_build_dsa_cp_parallel_metadata``.
 
@@ -791,8 +793,8 @@ class AscendSFAIndexerMetadataBuilder(AttentionMetadataBuilder[AscendSFAIndexerM
             prefix_lens_cpu=prefix_lens_cpu,
             is_prefilling_cpu=is_prefilling_cpu,
             num_actual_tokens=num_actual_tokens,
-            draft_index=None,
-            v2_model_runner=False,
+            draft_index=draft_index,
+            v2_model_runner=use_v2_model_runner(self.vllm_config) is True,
             dp_size=self.vllm_config.parallel_config.data_parallel_size,
             dcp_replicated=enable_sfa_dcp_replicated_indexer(self.vllm_config),
             full_o_proj=dsa_cp_with_o_proj_tp_for_config(self.vllm_config),
@@ -1041,6 +1043,7 @@ class AscendSFAIndexerMetadataBuilder(AttentionMetadataBuilder[AscendSFAIndexerM
             buffer_key=self._metadata_buffer_key(common_attn_metadata),
             use_cached_rope=False,
             copy_rope=True,
+            draft_index=draft_index,
             **kwargs,
         )
 
@@ -1073,6 +1076,7 @@ class AscendSFAIndexerMetadataBuilder(AttentionMetadataBuilder[AscendSFAIndexerM
         buffer_key: object,
         use_cached_rope: bool,
         copy_rope: bool,
+        draft_index: int | None = None,
         **kwargs,
     ) -> AscendSFAIndexerMetadata:
         num_reqs = common_attn_metadata.num_reqs
@@ -1126,6 +1130,7 @@ class AscendSFAIndexerMetadataBuilder(AttentionMetadataBuilder[AscendSFAIndexerM
                 block_table,
                 num_input_tokens,
                 num_reqs,
+                draft_index,
             )
             if zigzag is not None:
                 cos, sin, actual_seq_lengths_query, actual_seq_lengths_key, block_table, slot_mapping = zigzag
