@@ -513,7 +513,7 @@ class AscendSFADSACPMetadataBuilder(AscendSFAMetadataBuilder):
                 prefix_lens_cpu=prefix_lens_cpu,
                 real_req_indices=real_req_indices,
             )
-        except (ValueError, AssertionError, RuntimeError) as exc:
+        except Exception as exc:  # noqa: BLE001 - never break a forward on a plan bug
             # Metadata and model-runner padding are expected to agree; if they
             # do not, a wrong plan would corrupt the forward.  Keep the service
             # alive on the continuous-slice path.
@@ -616,6 +616,12 @@ class AscendSFADSACPImpl(OProjWeightSwitchMixin, AscendSFAImpl):
     ) -> torch.Tensor:
         context = getattr(attn_metadata, "dsa_cp_context", None)
         assert context is not None, "DSA-CP requires attn_metadata.dsa_cp_context."
+        if context.zigzag_index is not None:
+            # The model boundary already sharded the hidden states into this
+            # rank's [prev, next] rows: padding to the full padded token count
+            # and taking the contiguous slice would select the padded region
+            # on every rank except rank 0.
+            return hidden_states
         actual_tokens = hidden_states.shape[0]
         if actual_tokens > context.num_tokens_pad:
             raise RuntimeError(

@@ -42,6 +42,10 @@ class ZigzagCPPlan:
     actual_seq_lengths_key_zigzag: torch.Tensor
     # block_table rows duplicated into the same [all prevs, all nexts] order.
     block_table_zigzag: torch.Tensor
+    # Padded slot mapping permuted by zigzag_gather_index: the row order the
+    # rank-concatenating all-gather produces, i.e. what the KV cache writer and
+    # the indexer cache writer have to scatter with.
+    slot_mapping_cp_gathered: torch.Tensor
     # Local token count; also the number of rows every rank owns.
     local_tokens: int
     # CPU-side lengths, used for logging and by the debug branch report.

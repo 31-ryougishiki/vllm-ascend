@@ -818,7 +818,7 @@ class AscendSFAIndexerMetadataBuilder(AttentionMetadataBuilder[AscendSFAIndexerM
                 prefix_lens_cpu=prefix_lens_cpu,
                 real_req_indices=real_req_indices,
             )
-        except (ValueError, AssertionError, RuntimeError) as exc:
+        except Exception as exc:  # noqa: BLE001 - never break a forward on a plan bug
             logger.warning_once(
                 "cp_balance indexer zigzag plan rejected (%s); falling back to continuous DSA-CP",
                 exc,
@@ -841,7 +841,7 @@ class AscendSFAIndexerMetadataBuilder(AttentionMetadataBuilder[AscendSFAIndexerM
             plan.actual_seq_lengths_query_zigzag,
             plan.actual_seq_lengths_key_zigzag,
             plan.block_table_zigzag,
-            slot_mapping[index],
+            plan.slot_mapping_cp_gathered,
         )
 
     def _build_dsa_cp_slot_mapping(
