@@ -18,6 +18,7 @@ from vllm.v1.attention.backend import (
 from vllm.v1.kv_cache_interface import AttentionSpec
 from vllm.v1.worker.utils import select_common_block_size
 
+from vllm_ascend import envs as ascend_envs
 from vllm_ascend.ascend_config import get_ascend_config
 from vllm_ascend.attention.context_parallel.common_cp import (
     build_pcp_ordered_slot_mapping,
@@ -803,6 +804,14 @@ class AscendSFAIndexerMetadataBuilder(AttentionMetadataBuilder[AscendSFAIndexerM
             full_o_proj=enable_dsa_cp_full_o_proj(),
         )
         if gate is not None:
+            # 与 SFA 侧对称：draft 步 / 不合格 batch 必须留下可见证据，
+            # 否则 indexer 单侧 zigzag（SFA 连续 + indexer 排列）会是静默错误。
+            if ascend_envs.VLLM_ASCEND_CP_BALANCE_DEBUG:
+                logger.info_once(
+                    "[CP_BALANCE][branch] rank=%d branch=CONTINUOUS reason=%s site=indexer",
+                    get_tp_group().rank_in_group,
+                    gate,
+                )
             return None
         try:
             plan = build_zigzag_cp_plan(

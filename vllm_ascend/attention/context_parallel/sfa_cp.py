@@ -1319,7 +1319,11 @@ class AscendSFAPCPDCPMetadataBuilder(AscendSFADCPMetadataBuilder):
                 global_dcp_num_blocks = pcp_context.global_block_table_num_blocks[pcp_cache_group_idx]
         metadata = self._build_with_metadata_view(
             common_attn_metadata,
-            lambda: self._build(common_attn_metadata, draft_index=None),
+            lambda: self._build(
+                common_attn_metadata,
+                draft_index=None,
+                for_draft=bool(kwargs.get("for_draft", False)),
+            ),
             global_dcp_block_table=global_dcp_block_table,
             global_dcp_num_blocks=global_dcp_num_blocks,
         )
