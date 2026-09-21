@@ -530,6 +530,12 @@ class AscendSFADSACPMetadataBuilder(AscendSFAMetadataBuilder):
             return None
 
         if ascend_envs.VLLM_ASCEND_CP_BALANCE_DEBUG:
+            # 资格门拒绝时打 CONTINUOUS，这里成功走 zigzag 时补对称的一行，
+            # 让 runbook/测试的 grep -c "branch=ZIGZAG" 有东西可抓。
+            logger.info(
+                "[CP_BALANCE][branch] rank=%d branch=ZIGZAG reason=-",
+                get_tp_group().rank_in_group,
+            )
             logger.info(
                 "[CP_BALANCE][plan] rank=%d pad=%d actual=%d local=%d idx=%s qprev=%s qnext=%s",
                 get_tp_group().rank_in_group,

@@ -657,11 +657,19 @@ class AscendConfig:
         has_indexer = hasattr(vc.model_config, "hf_text_config") and hasattr(
             vc.model_config.hf_text_config, "index_topk"
         )
+        # DSA-CP 的前提是 indexer + tp>1，不是 SP-MoE：连续切片由 DSA-CP 自己按
+        # rank 切（sfa_cp 内部 pad+slice），输出也在内部收齐——o_proj.reduce_results
+        # 为真（= 模型没做序列并行）时走 tp all_gather 还原成 replicated 状态，
+        # 为假时才把 reduce-scatter 交给 decoder 的 SP 路径。
+        # 上游 use_sequence_parallel_moe 是“EP 下避免重复算 MoE”的优化，要求
+        # data_parallel_size>1；把它当 DSA-CP 的前提会让 tp16/dp1 的部署整条关掉
+        # (#15549 之前这里只判 has_indexer)。dp>1 时 SP 仍会被自动打开。
         if self.enable_dsa_cp and not vc.parallel_config.use_sequence_parallel_moe:
-            logger.warning_once(
-                "DSA-CP is enabled, but the current config does not support sequence-parallel MoE. Disabling DSA-CP."
+            logger.info_once(
+                "DSA-CP is enabled without sequence-parallel MoE (data_parallel_size=1): "
+                "using the native DSA-CP sharding path."
             )
-        self.enable_dsa_cp = self.enable_dsa_cp and has_indexer and vc.parallel_config.use_sequence_parallel_moe
+        self.enable_dsa_cp = self.enable_dsa_cp and has_indexer
 
         # Sequence-parallel max_num_batched_tokens divisibility writeback
         if vc.parallel_config.prefill_context_parallel_size > 1 and enable_sp(vllm_config=vc):
