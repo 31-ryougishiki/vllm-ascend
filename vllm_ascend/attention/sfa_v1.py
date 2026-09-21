@@ -429,6 +429,7 @@ class AscendSFAMetadataBuilder(MLACommonMetadataBuilder[AscendSFAMetadata]):
         cum_query_lens: torch.Tensor,
         seq_lens: torch.Tensor,
         draft_index: int | None,
+        for_draft: bool = False,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, dict[str, Any]]:
         """Customize metadata tensors for a parallel SFA layout."""
         return cos, sin, slot_mapping, {}
@@ -475,9 +476,16 @@ class AscendSFAMetadataBuilder(MLACommonMetadataBuilder[AscendSFAMetadata]):
         **kwargs,
     ) -> AscendSFAMetadata:
         # common_prefix_len / fast_build are unused; kept for API compatibility.
+        # The MTP drafter marks its metadata build with for_draft=True; the
+        # zigzag gate must not plan that batch (its token tensors belong to the
+        # target batch, not to the draft step).
         return self._build_with_metadata_view(
             common_attn_metadata,
-            lambda: self._build(common_attn_metadata, draft_index=None),
+            lambda: self._build(
+                common_attn_metadata,
+                draft_index=None,
+                for_draft=bool(kwargs.get("for_draft", False)),
+            ),
         )
 
     def build_for_drafting(
@@ -510,6 +518,7 @@ class AscendSFAMetadataBuilder(MLACommonMetadataBuilder[AscendSFAMetadata]):
         self,
         common_attn_metadata: AscendCommonAttentionMetadata,
         draft_index: int | None = None,
+        for_draft: bool = False,
     ) -> AscendSFAMetadata:
         num_reqs = common_attn_metadata.num_reqs
         num_actual_tokens = common_attn_metadata.num_actual_tokens
@@ -558,6 +567,7 @@ class AscendSFAMetadataBuilder(MLACommonMetadataBuilder[AscendSFAMetadata]):
             cum_query_lens,
             seq_lens,
             draft_index,
+            for_draft=for_draft,
         )
 
         metadata = self.metadata_cls(  # type: ignore

@@ -769,6 +769,7 @@ class AscendSFAIndexerMetadataBuilder(AttentionMetadataBuilder[AscendSFAIndexerM
         num_input_tokens: int,
         num_reqs: int,
         draft_index: int | None,
+        for_draft: bool = False,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor] | None:
         """Zigzag variant of ``_build_dsa_cp_parallel_metadata``.
 
@@ -798,6 +799,7 @@ class AscendSFAIndexerMetadataBuilder(AttentionMetadataBuilder[AscendSFAIndexerM
             v2_model_runner=use_v2_model_runner(self.vllm_config) is True,
             dp_size=self.vllm_config.parallel_config.data_parallel_size,
             dcp_replicated=enable_sfa_dcp_replicated_indexer(self.vllm_config),
+            for_draft=for_draft,
             full_o_proj=enable_dsa_cp_full_o_proj(),
         )
         if gate is not None:
@@ -1078,6 +1080,7 @@ class AscendSFAIndexerMetadataBuilder(AttentionMetadataBuilder[AscendSFAIndexerM
         use_cached_rope: bool,
         copy_rope: bool,
         draft_index: int | None = None,
+        for_draft: bool = False,
         **kwargs,
     ) -> AscendSFAIndexerMetadata:
         num_reqs = common_attn_metadata.num_reqs
@@ -1132,6 +1135,7 @@ class AscendSFAIndexerMetadataBuilder(AttentionMetadataBuilder[AscendSFAIndexerM
                 num_input_tokens,
                 num_reqs,
                 draft_index,
+                for_draft=for_draft,
             )
             if zigzag is not None:
                 cos, sin, actual_seq_lengths_query, actual_seq_lengths_key, block_table, slot_mapping = zigzag

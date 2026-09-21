@@ -331,6 +331,7 @@ class AscendSFADSACPMetadataBuilder(AscendSFAMetadataBuilder):
         cum_query_lens: torch.Tensor,
         seq_lens: torch.Tensor,
         draft_index: int | None,
+        for_draft: bool = False,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, dict[str, Any]]:
         cos, sin, slot_mapping, extra = super()._prepare_parallel_metadata(
             common_attn_metadata,
@@ -340,6 +341,7 @@ class AscendSFADSACPMetadataBuilder(AscendSFAMetadataBuilder):
             cum_query_lens,
             seq_lens,
             draft_index,
+            for_draft=for_draft,
         )
         global_tp_size = get_tp_group().world_size
         num_tokens = common_attn_metadata.num_input_tokens
@@ -376,6 +378,7 @@ class AscendSFADSACPMetadataBuilder(AscendSFAMetadataBuilder):
             cos=cos,
             sin=sin,
             draft_index=draft_index,
+            for_draft=for_draft,
         )
         if zigzag is not None:
             cos, sin, slot_mapping_cp, plan = zigzag
@@ -457,6 +460,7 @@ class AscendSFADSACPMetadataBuilder(AscendSFAMetadataBuilder):
         cos: torch.Tensor,
         sin: torch.Tensor,
         draft_index: int | None,
+        for_draft: bool = False,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, ZigzagCPPlan] | None:
         """Return the zigzag ``(cos, sin, slot_mapping_cp, plan)`` or None.
 
@@ -484,6 +488,7 @@ class AscendSFADSACPMetadataBuilder(AscendSFAMetadataBuilder):
             dp_size=self.vllm_config.parallel_config.data_parallel_size,
             dcp_replicated=enable_sfa_dcp_replicated_indexer(self.vllm_config),
             full_o_proj=enable_dsa_cp_full_o_proj(),
+            for_draft=for_draft,
         )
         if gate is not None:
             if ascend_envs.VLLM_ASCEND_CP_BALANCE_DEBUG:

@@ -138,6 +138,7 @@ def zigzag_gate_reason(
     dp_size: int,
     dcp_replicated: bool,
     full_o_proj: bool,
+    for_draft: bool = False,
 ) -> str | None:
     """Name the first gate that keeps this batch on continuous DSA-CP."""
     return zigzag_ineligible_reason(
@@ -152,7 +153,10 @@ def zigzag_gate_reason(
         # speculative config alone (deepseek_mtp with enforce_eager) still runs
         # a pure-prefill main forward whose output is gathered back to natural
         # order before the MTP proposer consumes it.
-        speculative=draft_index is not None,
+        # MTP/draft 的 metadata 是 builder.build(..., for_draft=True) 建的，
+        # draft_index 仍为 None；两个信号都要认，否则 draft 步会跟着 target
+        # batch 的 plan 走（plan 是按 target 的 token 张量算出来的）。
+        speculative=draft_index is not None or for_draft,
         v2_model_runner=v2_model_runner,
         dp_size=dp_size,
         dcp_replicated=dcp_replicated,
