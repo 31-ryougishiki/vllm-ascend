@@ -657,7 +657,7 @@ class AscendConfig:
         has_indexer = hasattr(vc.model_config, "hf_text_config") and hasattr(
             vc.model_config.hf_text_config, "index_topk"
         )
-        # DSA-CP 的前提是 indexer + tp>1，不是 SP-MoE：连续切片由 DSA-CP 自己按
+        # DSA-CP 的前提只有"模型带 indexer"（tp>1 才有意义），不是 SP-MoE：连续切片由 DSA-CP 自己按
         # rank 切（sfa_cp 内部 pad+slice），输出也在内部收齐——o_proj.reduce_results
         # 为真（= 模型没做序列并行）时走 tp all_gather 还原成 replicated 状态，
         # 为假时才把 reduce-scatter 交给 decoder 的 SP 路径。

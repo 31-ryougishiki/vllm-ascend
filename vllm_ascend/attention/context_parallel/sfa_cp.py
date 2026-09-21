@@ -827,6 +827,21 @@ class AscendSFADSACPImpl(OProjWeightSwitchMixin, AscendSFAImpl):
         if gather_full_o_proj:
             with self._use_full_o_proj_weights():
                 local_output = self._apply_o_proj_full_weight(attn_output)
+                from vllm_ascend.ascend_forward_context import zigzag_active
+
+                if zigzag_active():
+                    # zigzag：这里的行是这个 rank 的 [prev, next] 块（模型边界已经
+                    # 把 hidden_states 切成 rank-local，patch_deepseek_v2 在层循环
+                    # 之后再做一次 all_gather + 反排列回自然序）。按 rank 连接再取
+                    # 前 L 行会让每个 rank 都拿到 rank0 的数据，所以这里只写本 rank 的
+                    # 投影结果，不参与下面那段连续切片的 gather。
+                    if local_output.shape[0] != output.shape[0]:
+                        raise RuntimeError(
+                            "SFA DSA-CP zigzag o_proj rows do not match the rank-local buffer, "
+                            f"got {tuple(local_output.shape)} and expected {tuple(output.shape)}."
+                        )
+                    output[...] = local_output
+                    return output
                 tp_group = get_tp_group()
                 if not self.o_proj.reduce_results:
                     # The decoder's sequence-parallel path will reduce-scatter
@@ -848,6 +863,12 @@ class AscendSFADSACPImpl(OProjWeightSwitchMixin, AscendSFAImpl):
                     output[...] = full_output[: output.shape[0]]
             return output
 
+        from vllm_ascend.ascend_forward_context import zigzag_active
+
+        if zigzag_active():
+            # zigzag 是纯 prefill 布局，gather_full_o_proj 必为真；真掉到这里说明
+            # 组合不对，宁可报错也不要静默算出错的结果。
+            raise RuntimeError("SFA DSA-CP zigzag requires full o_proj weights (gather_full_o_proj).")
         send = (
             attn_output.view(-1, self.tp_size, self.num_heads * self.v_head_dim)
             .permute(1, 0, 2)
