@@ -11,7 +11,6 @@ from vllm.forward_context import BatchDescriptor, get_forward_context, set_forwa
 from vllm.logger import logger
 
 from vllm_ascend.ascend_config import get_ascend_config, is_mega_moe_supported
-from vllm_ascend.layers.cp_zigzag import zigzag_reorder_moe_aux
 from vllm_ascend.device.hardware_profile import (
     HardwareCapability,
     MoECommPolicy,
@@ -136,13 +135,13 @@ def _find_zigzag_cp_context(attn_metadata: Any):
 def _disable_zigzag_metadata_for_fallback(attn_metadata: Any) -> None:
     """Restore continuous-slice metadata when zigzag has to be disabled.
 
-    The DSA-CP metadata builder decides zigzag before the forward context
-    knows whether the current run is a draft forward, uses the V2 model
-    runner, or has DP > 1.  In those cases ``zigzag_cp_active`` is turned off
-    after the metadata was already built in zigzag layout.  Switch the RoPE
-    tables, KV write slots and zigzag flags back to the stored continuous
-    fallback so attention, KV cache writes and the model boundary all execute
-    the same non-zigzag path.
+    The zigzag plan stored in the metadata is the only description of the row
+    layout, and it is built by the same builder that owns every consumer (the
+    attention kernels and the KV/indexer cache writers).  This helper is the
+    forward-level veto for the cases the builder can be told about separately:
+    a draft forward, the V2 model runner or DP > 1.  Switch the RoPE tables,
+    KV write slots and zigzag flags back to the stored continuous fallback so
+    the whole forward executes the same non-zigzag path.
     """
     for meta in _iter_attn_metadata(attn_metadata):
         if meta is None:
@@ -164,8 +163,7 @@ def _disable_zigzag_metadata_for_fallback(attn_metadata: Any) -> None:
         meta.cos = fallback_cos
         meta.sin = fallback_sin
         # Clearing zigzag_index is what turns the forward back onto the
-        # continuous-slice path: every zigzag consumer keys off it, and
-        # zigzag_active() reads the context flag set by the caller.
+        # continuous-slice path: every zigzag consumer keys off it.
         ctx.zigzag_index = None
         ctx.zigzag_gather_index = None
         ctx.inv_gather_index = None
@@ -263,25 +261,19 @@ def set_ascend_forward_context(
         forward_context.use_mega_moe = use_cann_megamoe(vllm_config)
         forward_context.draft_moe_quant_type = draft_moe_quant_type
 
-        zigzag_cp_context = _find_zigzag_cp_context(attn_metadata)
-        zigzag_cp_active = (
-            zigzag_cp_context is not None
-            # Draft (MTP) steps keep the continuous-slice layout: the drafter
-            # owns its own metadata and never runs the zigzag boundary.
-            and not is_draft_model
-            # The V2 model runner does not publish the zigzag extras, so it
-            # always keeps the original DSA-CP path.
-            and not _USE_V2_EXTRA_KWARGS
-        )
-        if zigzag_cp_context is not None and not zigzag_cp_active:
-            # Metadata was built in zigzag layout before these disables were
-            # known.  Restore the continuous-slice fallback on every metadata
-            # object so the whole forward stays on the non-zigzag path.
+        # The zigzag plan inside the metadata is the layout; the forward level
+        # only vetoes plans for runs the builders cannot be asked about
+        # (a draft model instance, the V2 model runner, DP > 1).
+        zigzag_plan_present = _find_zigzag_cp_context(attn_metadata) is not None
+        zigzag_forbidden = is_draft_model or _USE_V2_EXTRA_KWARGS or get_dp_group().world_size > 1
+        if zigzag_plan_present and zigzag_forbidden:
+            # Metadata was built with a zigzag plan although this forward must
+            # not use one.  Restore the continuous-slice metadata so the
+            # attention and the KV/indexer cache writers stay consistent.
             _disable_zigzag_metadata_for_fallback(attn_metadata)
             if draft_attn_metadatas:
                 for draft_meta in draft_attn_metadatas:
                     _disable_zigzag_metadata_for_fallback(draft_meta)
-            zigzag_cp_context = None
 
         tp_world_size = get_tensor_model_parallel_world_size()
 
@@ -318,12 +310,6 @@ def set_ascend_forward_context(
             num_tokens = attn_metadata.num_actual_tokens
 
         dp_world_size = get_dp_group().world_size
-        if dp_world_size > 1 and zigzag_cp_active:
-            # DP ranks exchange the batch, so the rank-local zigzag order is
-            # not preserved across the DP group.
-            _disable_zigzag_metadata_for_fallback(attn_metadata)
-            zigzag_cp_active = False
-            zigzag_cp_context = None
         if dp_world_size > 1 and forward_context.dp_metadata is not None:
             dp_meta = forward_context.dp_metadata
             max_tokens_across_dp = dp_meta.num_tokens_across_dp_cpu.max().item()
@@ -340,9 +326,6 @@ def set_ascend_forward_context(
 
         forward_context.eplb_heat_collection_status = eplb_heat_collection_status
 
-        _EXTRA_CTX.zigzag_cp_context = zigzag_cp_context
-        _EXTRA_CTX.zigzag_cp_active = zigzag_cp_active
-
         if num_tokens is not None:
             if num_actual_tokens is None:
                 num_actual_tokens = num_tokens
@@ -353,12 +336,6 @@ def set_ascend_forward_context(
                 mc2_mask = reserved_mc2_mask[: forward_context.padded_num_tokens]
                 mc2_mask[:num_actual_tokens] = True
                 mc2_mask[num_actual_tokens:] = False
-                if zigzag_cp_active and zigzag_cp_context is not None:
-                    # The MoE consumes the rank-concatenating zigzag order, so
-                    # its padding mask must use the exact same permutation as
-                    # the model boundary (single source: the plan's
-                    # zigzag_gather_index).
-                    mc2_mask = zigzag_reorder_moe_aux(mc2_mask, zigzag_cp_context)
                 forward_context.mc2_mask = mc2_mask
         try:
             yield
@@ -583,8 +560,6 @@ class _ExtraForwardContextProxy:
         "padded_num_tokens",
         "sinks",
         "eplb_heat_collection_status",
-        "zigzag_cp_active",
-        "zigzag_cp_context",
     )
 
     def check_extra_attr(self, name: str):
@@ -618,18 +593,3 @@ class _ExtraForwardContextProxy:
 
 # usage: from vllm_ascend.ascend_forward_context import _EXTRA_CTX
 _EXTRA_CTX = _ExtraForwardContextProxy()
-
-
-def zigzag_active() -> bool:
-    """Whether the current forward executes the model-level zigzag layout.
-
-    cp_balance must be selected per forward, not per config: the same process
-    runs both layouts (an ineligible batch, a draft step or a profiling run
-    keeps the original continuous-slice behaviour).  A missing or foreign
-    forward context reports False so every cp_balance-specific collective falls
-    back to the original one.
-    """
-    try:
-        return bool(_EXTRA_CTX.zigzag_cp_active)
-    except Exception:  # noqa: BLE001 - AttributeError / no forward context
-        return False

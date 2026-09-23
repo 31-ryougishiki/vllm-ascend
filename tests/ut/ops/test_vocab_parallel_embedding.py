@@ -222,52 +222,73 @@ class TestCustomVocabParallelEmbedding(unittest.TestCase):
                     output = layer.forward(input_)
                 self.assertEqual(output.shape, expected_shape)
 
-    def test_forward_zigzag_local_reduces_the_full_row_set(self):
-        """The zigzag embedding entry must reduce partials of the same rows.
+    def test_disable_tp(self):
+        layer = AscendVocabParallelEmbedding(
+            num_embeddings=self.num_embeddings,
+            embedding_dim=self.embedding_dim,
+            org_num_embeddings=self.org_num_embeddings,
+            padding_size=self.padding_size,
+            quant_config=None,
+            prefix="",
+            disable_tp=True,
+        )
 
-        The embedding weight is vocab-sharded across TP, so a TP all-reduce
-        only reconstructs complete embeddings when every rank contributes the
-        partials of the *same* token ids.  Passing the rank-local zigzag rows
-        and all-reducing sums embeddings of different tokens; therefore the
-        lookup/reduction must run on the full SP-padded row set and only the
-        final shard may be rank-local.
+        self.assertTrue(layer.disable_tp)
+        self.assertIs(layer.comm_group, parallel_state.get_replicated_group())
+        self.assertEqual(layer.tp_size, 1)
+        self.assertEqual(layer.tp_rank, 0)
+
+    def test_dspark_markov_lm_head_replicated(self):
+        """The DSpark markov lm_head is replicated on every rank (vllm#49731).
+
+        vllm's DSparkMarkovHead constructs markov_w2 as a ParallelLMHead with
+        disable_tp=True; its prefix ("layers.N.markov_head.markov_w2")
+        contains "head", so disable_tp must win over the lmhead prefix match
+        even when lmhead_tp is enabled — setUp makes lmhead_tp_enable()
+        return True — and pin the layer to the world_size=1 ReplicatedGroup
+        so every rank holds the full table and forward skips all
+        communication.
         """
-        layer = self._create_layer()
-        layer.tp_size = 2
-
-        # Full SP-padded natural-order token ids (same on every TP rank).
-        full_input_ids = torch.tensor([15, 35, 25, 45])
-        embedding_inputs = []
-
-        def fake_embedding(_, x):
-            embedding_inputs.append(tuple(x.shape))
-            return torch.arange(
-                x.shape[0] * layer.embedding_dim, dtype=torch.float32
-            ).view(x.shape[0], layer.embedding_dim)
-
-        layer.quant_method.embedding = MagicMock(side_effect=fake_embedding)
-        reduced_shapes = []
-
+        markov_group = MagicMock()
+        markov_group.world_size = 1
+        markov_group.rank_in_group = 0
         with (
+            patch("vllm_ascend.ops.vocab_parallel_embedding.get_replicated_group", return_value=markov_group),
+            patch("vllm_ascend.ops.vocab_parallel_embedding.get_tp_group", return_value=MagicMock()),
             patch(
-                "vllm_ascend.ops.vocab_parallel_embedding.tensor_model_parallel_all_reduce",
-                side_effect=lambda x: (reduced_shapes.append(tuple(x.shape)), x)[1],
-            ) as mock_all_reduce,
+                "vllm.model_executor.layers.vocab_parallel_embedding.get_tensor_model_parallel_rank",
+                return_value=0,
+            ),
             patch(
-                "vllm_ascend.layers.cp_zigzag.zigzag_shard_tensor",
-                side_effect=lambda x: x[:2].clone(),
-            ) as mock_shard,
+                "vllm.model_executor.layers.vocab_parallel_embedding.get_tensor_model_parallel_world_size",
+                return_value=2,
+            ),
+            patch(
+                "vllm.model_executor.layers.vocab_parallel_embedding.pad_vocab_size",
+                side_effect=lambda x, y: x + y,
+            ),
+            patch("vllm.model_executor.layers.vocab_parallel_embedding.divide", side_effect=lambda x, y: x // y),
         ):
-            output = layer.forward_zigzag_local(full_input_ids)
+            layer = AscendVocabParallelEmbedding(
+                num_embeddings=self.num_embeddings,
+                embedding_dim=self.embedding_dim,
+                org_num_embeddings=self.org_num_embeddings,
+                padding_size=self.padding_size,
+                quant_config=None,
+                prefix="layers.0.markov_head.markov_w2",
+                disable_tp=True,
+            )
 
-        # Lookup and reduction cover all four rows, never the local two-row
-        # subset that the broken variant would have used.
-        self.assertEqual(embedding_inputs, [(4,)])
-        self.assertEqual(reduced_shapes, [(4, layer.embedding_dim)])
-        mock_all_reduce.assert_called_once()
-        mock_shard.assert_called_once()
-        self.assertEqual(output.shape, (2, layer.embedding_dim))
+        self.assertIs(layer.comm_group, markov_group)
+        self.assertEqual(layer.tp_size, 1)
+        self.assertEqual(layer.tp_rank, 0)
+        self.assertIsNone(layer.forward_type)
 
+        # tp_size==1: shard indices cover the full padded vocab, so each rank
+        # holds the entire markov table (no padding rows reserved for peers).
+        self.assertEqual(layer.num_embeddings_per_partition, layer.num_embeddings_padded)
+        self.assertEqual(layer.num_org_embeddings_per_partition, layer.org_vocab_size_padded)
+        self.assertEqual(layer.num_added_embeddings_per_partition, layer.num_added_embeddings)
 
 
 class TestAscendLogitsProcessor(unittest.TestCase):

@@ -41,67 +41,6 @@ _PURE_PREFILL_ATTENTION_STATES = {
 }
 
 
-def get_zigzag_cp_context():
-    from vllm_ascend.ascend_forward_context import _EXTRA_CTX
-
-    try:
-        return _EXTRA_CTX.zigzag_cp_context
-    except Exception:
-        return None
-
-
-def fixed_order_rank_sum(parts: Sequence[torch.Tensor]) -> torch.Tensor:
-    """Sum one tensor per TP source rank in a fixed, layout-independent order.
-
-    FlashComm row-parallel reductions return the reduced chunk owned by the
-    local rank.  On HCCL the accumulation order inside ``ReduceScatter`` is a
-    property of the *owner chunk*, so permuting token rows between ranks (which
-    is exactly what zigzag CP balance does) changes the rounding of an
-    otherwise per-token identical result.  This helper is the local half of the
-    fix: sum the same per-token partials in source-rank order for every owner,
-    never in an owner-dependent order.
-
-    The row order of every tensor in ``parts`` must be identical.  A clone is
-    accumulated so the caller's buffers stay intact.
-    """
-    if not parts:
-        raise ValueError("fixed_order_rank_sum requires at least one part")
-    result = parts[0].clone()
-    for source_rank, part in enumerate(parts[1:], start=1):
-        if part.shape != result.shape:
-            raise ValueError(
-                "fixed_order_rank_sum shape mismatch at source rank "
-                f"{source_rank}: {tuple(part.shape)} != {tuple(result.shape)}"
-            )
-        result.add_(part)
-    return result
-
-
-def zigzag_reorder_moe_aux(x: torch.Tensor, ctx=None) -> torch.Tensor:
-    """Reorder a full padded MoE-side tensor to rank-concatenating zigzag order.
-
-    MoE prepare all-gathers rank-local zigzag tensors into
-    ``[r0_prev, r0_next, r1_prev, r1_next, ...]``.  ``input_ids`` (hash
-    routing) and ``mc2_mask`` must therefore use the exact same full padded
-    ``zigzag_gather_index``; using the same helper for both guarantees they can
-    never drift apart.  ``set_ascend_forward_context`` applies the reorder to
-    ``input_ids`` once per forward.  Padding rows are reordered as well and
-    are masked downstream (``slot_mapping == -1`` / ``mc2_mask == False``).
-    """
-    if ctx is None:
-        ctx = get_zigzag_cp_context()
-    assert ctx is not None
-    gather_index = getattr(ctx, "zigzag_gather_index", None)
-    if gather_index is None:
-        return x
-    if x.shape[0] != gather_index.shape[0]:
-        raise RuntimeError(
-            f"zigzag MoE reorder expects {gather_index.shape[0]} rows, got "
-            f"{x.shape[0]}"
-        )
-    return x[gather_index]
-
-
 @dataclass(frozen=True)
 class ZigzagPlan:
     """CPU-side zigzag token plan for one prefill batch.
@@ -618,15 +557,6 @@ def zigzag_ineligible_reason(
     if not all(is_prefilling):
         return "not_all_prefilling"
     return None
-
-
-def zigzag_shard_tensor(x: torch.Tensor, dim: int = 0) -> torch.Tensor:
-    """Natural-order full tensor -> rank-local ``[prev_block, next_block]``."""
-    if dim != 0:
-        raise NotImplementedError("zigzag shard currently only supports dim=0")
-    ctx = get_zigzag_cp_context()
-    assert ctx is not None and ctx.zigzag_index is not None
-    return x[ctx.zigzag_index].contiguous()
 
 
 def zigzag_gather_tensor(
