@@ -1042,7 +1042,7 @@ class TestAscendSFAImpl(TestBase):
                 self.impl._get_indexcache_topk_indices = lambda _: torch.zeros(2, 1, dtype=torch.int64)
                 self.impl._execute_sparse_flash_attention_process = lambda *_args: torch.ones(2, 4)
                 self.impl._v_up_proj = lambda x: x
-                self.impl._finalize_o_proj = lambda x, output, _, _inv=None: output.copy_(x)
+                self.impl._finalize_o_proj = lambda x, output, _: output.copy_(x)
                 output = torch.empty_like(hidden)
                 with (
                     patch.object(sfa_v1, "wait_for_kv_layer_from_connector"),

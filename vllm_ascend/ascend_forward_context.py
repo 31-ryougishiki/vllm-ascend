@@ -264,9 +264,9 @@ def set_ascend_forward_context(
         # The zigzag plan inside the metadata is the layout; the forward level
         # only vetoes plans for runs the builders cannot be asked about
         # (a draft model instance, the V2 model runner, DP > 1).
-        zigzag_plan_present = _find_zigzag_cp_context(attn_metadata) is not None
+        zigzag_cp_context = _find_zigzag_cp_context(attn_metadata)
         zigzag_forbidden = is_draft_model or _USE_V2_EXTRA_KWARGS or get_dp_group().world_size > 1
-        if zigzag_plan_present and zigzag_forbidden:
+        if zigzag_cp_context is not None and zigzag_forbidden:
             # Metadata was built with a zigzag plan although this forward must
             # not use one.  Restore the continuous-slice metadata so the
             # attention and the KV/indexer cache writers stay consistent.
@@ -274,6 +274,13 @@ def set_ascend_forward_context(
             if draft_attn_metadatas:
                 for draft_meta in draft_attn_metadatas:
                     _disable_zigzag_metadata_for_fallback(draft_meta)
+            zigzag_cp_context = None
+
+        # Model-boundary handles of the stream order (see layers/cp_zigzag.py):
+        # None keeps the natural-order stream, which is what every forward
+        # without a surviving plan uses.
+        _EXTRA_CTX.zigzag_stream_gather_index = getattr(zigzag_cp_context, "zigzag_gather_index", None)
+        _EXTRA_CTX.zigzag_stream_inv_gather_index = getattr(zigzag_cp_context, "inv_gather_index", None)
 
         tp_world_size = get_tensor_model_parallel_world_size()
 
@@ -560,6 +567,8 @@ class _ExtraForwardContextProxy:
         "padded_num_tokens",
         "sinks",
         "eplb_heat_collection_status",
+        "zigzag_stream_gather_index",
+        "zigzag_stream_inv_gather_index",
     )
 
     def check_extra_attr(self, name: str):

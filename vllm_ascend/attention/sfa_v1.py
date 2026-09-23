@@ -371,10 +371,6 @@ class SFAForwardContext:
     kv_slot_mapping: torch.Tensor
     topk_num_tokens: int
     gather_full_o_proj: bool = False
-    # DSA-CP zigzag: the plan's inverse permutation, i.e. the layer's own row
-    # layout.  None means the contiguous slice.  Always taken from the
-    # metadata this layer builds its forward with, never from a global flag.
-    zigzag_inv_gather_index: torch.Tensor | None = None
 
 
 class AscendSFAMetadataBuilder(MLACommonMetadataBuilder[AscendSFAMetadata]):
@@ -1524,7 +1520,6 @@ class AscendSFAImpl(MLAAttentionImpl):
         attn_output: torch.Tensor,
         output: torch.Tensor,
         gather_full_o_proj: bool,
-        zigzag_inv_gather_index: torch.Tensor | None = None,
     ) -> torch.Tensor:
         output[...] = self.o_proj(attn_output)[0]
         return output
@@ -1848,7 +1843,6 @@ class AscendSFAImpl(MLAAttentionImpl):
             attn_output,
             output,
             parallel_context.gather_full_o_proj,
-            parallel_context.zigzag_inv_gather_index,
         )
 
         maybe_save_kv_layer_to_connector(layer_name, list(kv_cache))

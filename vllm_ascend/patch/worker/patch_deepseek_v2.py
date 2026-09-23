@@ -305,12 +305,33 @@ def _patched_forward(
     intermediate_tensors: IntermediateTensors | None,
     inputs_embeds: torch.Tensor | None = None,
 ) -> torch.Tensor | IntermediateTensors:
+    from vllm_ascend.ascend_forward_context import _EXTRA_CTX
+
+    # DSA-CP zigzag keeps the model stream full, replicated and in the plan's
+    # rank-concatenating order (see layers/cp_zigzag.py).  The boundary is the
+    # only place that pays for that order: feed the embedding the permuted token
+    # ids so every layer sees the plan order, and hand natural order back on the
+    # way out so the runner, the sampler and the MTP drafter are unchanged.
+    # Both handles are None for every forward without a surviving plan.
+    stream_gather_index = _EXTRA_CTX.zigzag_stream_gather_index
+    stream_inv_gather_index = _EXTRA_CTX.zigzag_stream_inv_gather_index
+    if stream_gather_index is not None and positions.shape[0] != stream_gather_index.shape[0]:
+        raise RuntimeError(
+            "DSA-CP zigzag stream expects the plan and the token stream to agree on the "
+            f"padded row count, got {tuple(stream_gather_index.shape)} and {positions.shape[0]}."
+        )
+
     if get_pp_group().is_first_rank:
         if inputs_embeds is not None:
             hidden_states = inputs_embeds
+            if stream_gather_index is not None:
+                hidden_states = hidden_states[stream_gather_index]
         else:
             if input_ids is None:
                 raise ValueError("Either input_ids or inputs_embeds must be provided to DeepseekV2Model.forward")
+            if stream_gather_index is not None:
+                # Row s of the stream holds natural token stream_gather_index[s].
+                input_ids = input_ids[stream_gather_index]
             hidden_states = self.embed_input_ids(input_ids)
         residual = None
     else:
@@ -357,6 +378,11 @@ def _patched_forward(
         aux_hidden_states.append(hidden_states + residual)
 
     hidden_states, _ = self.norm(hidden_states, residual)
+    if stream_inv_gather_index is not None:
+        # hand natural token order back to the runner (once per forward)
+        num_tokens = hidden_states.shape[0]
+        hidden_states = hidden_states[stream_inv_gather_index[:num_tokens]]
+        aux_hidden_states = [aux[stream_inv_gather_index[:num_tokens]] for aux in aux_hidden_states]
     if len(aux_hidden_states) > 0:
         return hidden_states, aux_hidden_states
     return hidden_states

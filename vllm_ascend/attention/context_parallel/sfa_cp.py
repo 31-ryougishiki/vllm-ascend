@@ -44,7 +44,6 @@ from vllm_ascend.attention.sfa_v1 import (
 from vllm_ascend.attention.utils import AscendCommonAttentionMetadata, enable_dcp, split_decodes_and_prefills
 from vllm_ascend.device.device_op import DeviceOperator
 from vllm_ascend.distributed.utils import all_gather_async
-from vllm_ascend.layers.cp_zigzag import zigzag_gather_tensor
 from vllm_ascend.mrv2_utils import use_v2_model_runner
 from vllm_ascend.utils import (
     _round_up,
@@ -130,13 +129,12 @@ class AscendSFAPCPImpl(OProjWeightSwitchMixin, AscendSFAImpl):
         attn_output: torch.Tensor,
         output: torch.Tensor,
         gather_full_o_proj: bool,
-        zigzag_inv_gather_index: torch.Tensor | None = None,
     ) -> torch.Tensor:
         if not self._o_proj_weight_switch_enabled:
-            return super()._finalize_o_proj(attn_output, output, gather_full_o_proj, zigzag_inv_gather_index)
+            return super()._finalize_o_proj(attn_output, output, gather_full_o_proj)
         if gather_full_o_proj:
             with self._use_full_o_proj_weights():
-                return super()._finalize_o_proj(attn_output, output, gather_full_o_proj, zigzag_inv_gather_index)
+                return super()._finalize_o_proj(attn_output, output, gather_full_o_proj)
 
         # Decode tokens are replicated on PCP ranks. Each rank projects only
         # its PCP input slice; PCP all-reduce reconstructs the pre-existing
@@ -632,9 +630,14 @@ class AscendSFADSACPImpl(OProjWeightSwitchMixin, AscendSFAImpl):
     ) -> torch.Tensor:
         context = getattr(attn_metadata, "dsa_cp_context", None)
         assert context is not None, "DSA-CP requires attn_metadata.dsa_cp_context."
-        # The model stream is the full, replicated TP-aligned token stream (the
-        # embedding all-reduces and the attention restores the same layout on
-        # the way out), so the rank-local rows are always selected here.
+        # The model stream is the full, replicated TP-aligned token stream, and
+        # this rank's rows are always a contiguous window of it: for a plain
+        # batch that window is the natural-order slice
+        # [local_start, local_end_with_pad); for a zigzag batch the stream is
+        # stored in plan order (rank-concatenating, see the model boundary), so
+        # the very same window is exactly this rank's [prev, next] rows.  Either
+        # way the KV write slots and the RoPE tables (slot_mapping_cp, metadata
+        # cos/sin) are index-aligned with these rows.
         actual_tokens = hidden_states.shape[0]
         if actual_tokens > context.num_tokens_pad:
             raise RuntimeError(
@@ -643,12 +646,6 @@ class AscendSFADSACPImpl(OProjWeightSwitchMixin, AscendSFAImpl):
             )
         if actual_tokens < context.num_tokens_pad:
             hidden_states = nn.functional.pad(hidden_states, (0, 0, 0, context.num_tokens_pad - actual_tokens))
-        if context.zigzag_index is not None:
-            # zigzag only swaps the contiguous slice for the rank's [prev, next]
-            # blocks of the same padded natural-order tensor, so the KV write
-            # slots and the RoPE tables (`slot_mapping_cp`, metadata cos/sin)
-            # stay index-aligned with these rows.
-            return hidden_states[context.zigzag_index]
         return hidden_states[context.local_start : context.local_end_with_pad]
 
     def _get_parallel_forward_context(
@@ -676,7 +673,6 @@ class AscendSFADSACPImpl(OProjWeightSwitchMixin, AscendSFAImpl):
                 kv_slot_mapping=context.slot_mapping_cp,
                 topk_num_tokens=context.local_end_with_pad - context.local_start,
                 gather_full_o_proj=gather_full_o_proj,
-                zigzag_inv_gather_index=context.inv_gather_index,
             )
         return SFAForwardContext(
             actual_seq_lengths_query=context.actual_seq_lengths_query,
@@ -684,7 +680,6 @@ class AscendSFADSACPImpl(OProjWeightSwitchMixin, AscendSFAImpl):
             kv_slot_mapping=context.slot_mapping_cp,
             topk_num_tokens=context.local_end_with_pad - context.local_start,
             gather_full_o_proj=gather_full_o_proj,
-            zigzag_inv_gather_index=context.inv_gather_index,
         )
 
     def _execute_sparse_flash_attention_process(
@@ -832,37 +827,16 @@ class AscendSFADSACPImpl(OProjWeightSwitchMixin, AscendSFAImpl):
         attn_output,
         output,
         gather_full_o_proj,
-        zigzag_inv_gather_index=None,
     ):
         if not self.enable_dsa_cp_full_o_proj:
             return super()._finalize_o_proj(
                 attn_output,
                 output,
                 gather_full_o_proj,
-                zigzag_inv_gather_index,
             )
         if gather_full_o_proj:
             with self._use_full_o_proj_weights():
                 local_output = self._apply_o_proj_full_weight(attn_output)
-
-                if zigzag_inv_gather_index is not None:
-                    # The full o_proj weight already gives each of this rank's
-                    # [prev, next] rows its complete projection, so the same
-                    # rank-concatenating all-gather as the continuous path is
-                    # enough - only the row order differs, and the layer's own
-                    # inverse permutation reranges it back to the natural-order
-                    # replicated model stream.
-                    full_output = zigzag_gather_tensor(
-                        local_output, zigzag_inv_gather_index, output.shape[0]
-                    )
-                    if full_output.shape[0] != output.shape[0] or full_output.shape[1:] != output.shape[1:]:
-                        raise RuntimeError(
-                            "SFA DSA-CP zigzag gathered output does not match the "
-                            f"replicated model state, got {tuple(full_output.shape)} "
-                            f"and expected {tuple(output.shape)}."
-                        )
-                    output[...] = full_output
-                    return output
                 tp_group = get_tp_group()
                 if not self.o_proj.reduce_results:
                     # The decoder's sequence-parallel path will reduce-scatter
@@ -884,10 +858,6 @@ class AscendSFADSACPImpl(OProjWeightSwitchMixin, AscendSFAImpl):
                     output[...] = full_output[: output.shape[0]]
             return output
 
-        if zigzag_inv_gather_index is not None:
-            # zigzag 是纯 prefill 布局，gather_full_o_proj 必为真；真掉到这里说明
-            # 组合不对，宁可报错也不要静默算出错的结果。
-            raise RuntimeError("SFA DSA-CP zigzag requires full o_proj weights (gather_full_o_proj).")
         send = (
             attn_output.view(-1, self.tp_size, self.num_heads * self.v_head_dim)
             .permute(1, 0, 2)

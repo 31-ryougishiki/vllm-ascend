@@ -1,19 +1,24 @@
 """Zigzag row plan for DSA-CP prefill (cp_balance).
 
-The model stream stays full, natural-ordered and replicated on every TP rank —
-exactly the layout the contiguous DSA-CP slicing runs with.  Zigzag only
-changes *which rows of that stream each rank computes inside the attention*:
+The model stream stays full and replicated on every TP rank, but it is stored in
+the plan's rank-concatenating order: stream row s carries the token at natural
+position zigzag_gather_index[s], and rank r owns the stream rows
+[r * L, (r + 1) * L) in the [prev, next] order of its own plan.  That single
+choice is what makes zigzag free per layer:
 
-* each sequence is cut into ``2 * cp_size`` blocks and rank ``r`` owns block
-  ``r`` plus block ``2 * cp_size - 1 - r``, so the causal attention work is
-  balanced instead of growing with the rank index;
-* the rank-local rows are selected from the padded natural-order stream with
-  :func:`build_zigzag_plan`'s ``zigzag_index`` and the attention output rejoins
-  the model stream through :func:`zigzag_gather_tensor` (rank-concatenating
-  all-gather + ``inv_gather_index``).
+* the attention finds this rank's rows as a plain contiguous window of the
+  stream, exactly like the contiguous-slice DSA-CP path - no row gather;
+* the attention output is all-gathered back into the very same order, so the
+  exit needs no permutation either;
+* every MLP/MoE/norm consumer is row-wise and only needs all ranks to agree on
+  the row order, which they do by construction.
 
-Because the model stream stays replicated, every MLP/MoE collective outside
-the attention keeps its upstream, per-token identical behaviour.
+Only the model boundary pays for the order: it permutes the embedding input
+(input_ids[zigzag_gather_index], a tiny integer gather) and hands the final
+hidden states back in natural order (hidden_states[inv_gather_index], once per
+forward), so the runner, the sampler and the MTP drafter are untouched.  Both
+boundary handles are published per forward by set_ascend_forward_context and
+cleared whenever the plan is vetoed (draft forward, V2 model runner, DP > 1).
 
 The metadata plan built by :func:`build_zigzag_plan` is stored in
 ``DSACPContext`` by ``AscendSFAMetadataBuilder``.  :func:`zigzag_ineligible_reason`
@@ -557,40 +562,3 @@ def zigzag_ineligible_reason(
     if not all(is_prefilling):
         return "not_all_prefilling"
     return None
-
-
-def zigzag_gather_tensor(
-    x: torch.Tensor,
-    inv_gather_index: torch.Tensor,
-    num_tokens: int | None = None,
-) -> torch.Tensor:
-    """Rank-local ``[prev,next]`` tensor -> natural-order tensor.
-
-    ``tensor_model_parallel_all_gather`` concatenates rank-local tensors in rank
-    order: ``[r0_prev, r0_next, r1_prev, r1_next, ...]``. ``inv_gather_index``
-    (the layer's own plan, ``DSACPContext.inv_gather_index``) reranges that
-    concatenation back to ``[token0, token1, ..., token_{T-1}]``.
-
-    ``num_tokens`` trims the trailing SP padding rows exactly like the
-    contiguous-slice path does, so the attention puts the same row count back
-    into the replicated model stream.
-    """
-    rows = int(inv_gather_index.shape[0])
-    input_rows = int(x.shape[0])
-    if input_rows == 0 or rows % input_rows != 0:
-        raise RuntimeError(
-            f"zigzag gather expects num_tokens_pad ({rows}) to be a multiple of "
-            f"the rank-local rows ({input_rows})"
-        )
-    if get_tensor_model_parallel_world_size() == 1:
-        gathered = x
-    else:
-        gathered = tensor_model_parallel_all_gather(x.contiguous(), 0)
-    if int(gathered.shape[0]) != rows:
-        raise RuntimeError(
-            f"zigzag gather got {int(gathered.shape[0])} gathered rows, expected {rows}"
-        )
-    full = gathered[inv_gather_index].contiguous()
-    if num_tokens is not None:
-        full = full[:num_tokens]
-    return full

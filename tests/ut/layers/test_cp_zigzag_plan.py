@@ -84,3 +84,40 @@ def test_single_request_padding_is_owned_by_the_tail_block():
     owner_rows = plans[owners[0]].zigzag_index
     assert set(owner_rows[-len(pad_positions) :]) == pad_positions
     assert all(pos < num_actual_tokens for pos in owner_rows[: -len(pad_positions)])
+
+
+@pytest.mark.parametrize("cp_size", [2, 4, 8])
+@pytest.mark.parametrize(
+    ("query_lens", "prefix_lens", "num_tokens_pad", "num_actual_tokens"),
+    [
+        ([2777], [0], 2784, 2777),
+        ([1200, 1577], [0, 0], 2784, 2777),
+        ([1008, 1008, 1008], [512, 0, 0], 3024, 3024),
+    ],
+)
+def test_stream_window_is_this_rank_rows(cp_size, query_lens, prefix_lens, num_tokens_pad, num_actual_tokens):
+    """Stream stored in plan order: rank r's contiguous window == its plan rows."""
+    plans = _plans(query_lens, prefix_lens, cp_size, num_tokens_pad, num_actual_tokens)
+    local = num_tokens_pad // cp_size
+    stream_rows = [pos for plan in plans for pos in plan.zigzag_index]
+    assert stream_rows == list(plans[0].zigzag_gather_index)
+    for cp_rank, plan in enumerate(plans):
+        window = stream_rows[cp_rank * local : (cp_rank + 1) * local]
+        assert window == list(plan.zigzag_index), cp_rank
+
+
+def test_boundary_permutation_round_trip():
+    """The model boundary's one permutation in and one out cancel out."""
+    cp_size, num_actual_tokens, num_tokens_pad = 4, 29, 32
+    plan = _plans([num_actual_tokens], [0], cp_size, num_tokens_pad, num_actual_tokens)[0]
+    gather_index, inv_gather_index = plan.zigzag_gather_index, plan.inv_gather_index
+
+    # natural order; positions past num_actual_tokens are the padding rows
+    token_ids = list(range(1000, 1000 + num_tokens_pad))
+    stream_ids = [token_ids[pos] for pos in gather_index]  # input_ids[gather_index]
+    assert len(stream_ids) == num_tokens_pad
+    hidden_states = list(range(num_tokens_pad))  # whatever the model produced
+    natural = [hidden_states[row] for row in inv_gather_index[:num_actual_tokens]]
+    assert len(natural) == num_actual_tokens
+    # the stream row that carries natural token p is inv_gather_index[p]
+    assert [stream_ids[row] for row in inv_gather_index[:num_actual_tokens]] == token_ids[:num_actual_tokens]

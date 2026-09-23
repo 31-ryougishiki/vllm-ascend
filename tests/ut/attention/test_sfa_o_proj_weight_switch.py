@@ -255,7 +255,7 @@ class TestAscendSFAOProjWeightSwitch(TestBase):
             )
 
         self.assertIs(result, finalized_output)
-        impl._finalize_o_proj.assert_called_once_with(attn_output, output, True, None)
+        impl._finalize_o_proj.assert_called_once_with(attn_output, output, True)
         notify_cache_written.assert_called_once_with(impl.layer_name)
         record_gate.assert_called_once_with()
         save_layer.assert_called_once_with(impl.layer_name, list(kv_cache))
