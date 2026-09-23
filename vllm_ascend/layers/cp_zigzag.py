@@ -1,17 +1,19 @@
-"""Model-boundary zigzag CP helpers for DSA prefill.
+"""Zigzag row plan for DSA-CP prefill (cp_balance).
 
-These helpers mirror SGLang's NPU legacy DSA-CP flow at the model boundary:
+The model stream stays full, natural-ordered and replicated on every TP rank —
+exactly the layout the contiguous DSA-CP slicing runs with.  Zigzag only
+changes *which rows of that stream each rank computes inside the attention*:
 
-* the full natural-order embedding/positions tensor is sharded once into the
-  rank-local ``[prev_blocks_of_all_seqs, next_blocks_of_all_seqs]`` layout;
-* all FlashComm collectives keep the same local order because they are
-  rank-concatenating all-gather / reduce-scatter pairs.  The reduce-scatter
-  below (``linear_op.SequenceRowParallelOp``) must sum per-token partials in a
-  fixed source-rank order: under a ring HCCL ReduceScatter the rounding is a
-  property of the owner chunk, and zigzag CP deliberately changes which rank
-  owns a token;
-* the local output is gathered once at the model boundary and reranged back
-  to natural token order for logits.
+* each sequence is cut into ``2 * cp_size`` blocks and rank ``r`` owns block
+  ``r`` plus block ``2 * cp_size - 1 - r``, so the causal attention work is
+  balanced instead of growing with the rank index;
+* the rank-local rows are selected from the padded natural-order stream with
+  :func:`build_zigzag_plan`'s ``zigzag_index`` and the attention output rejoins
+  the model stream through :func:`zigzag_gather_tensor` (rank-concatenating
+  all-gather + ``inv_gather_index``).
+
+Because the model stream stays replicated, every MLP/MoE collective outside
+the attention keeps its upstream, per-token identical behaviour.
 
 The metadata plan built by :func:`build_zigzag_plan` is stored in
 ``DSACPContext`` by ``AscendSFAMetadataBuilder``.  :func:`zigzag_ineligible_reason`
@@ -627,38 +629,38 @@ def zigzag_shard_tensor(x: torch.Tensor, dim: int = 0) -> torch.Tensor:
     return x[ctx.zigzag_index].contiguous()
 
 
-def zigzag_gather_tensor(x: torch.Tensor, num_tokens: int | None = None) -> torch.Tensor:
+def zigzag_gather_tensor(
+    x: torch.Tensor,
+    inv_gather_index: torch.Tensor,
+    num_tokens: int | None = None,
+) -> torch.Tensor:
     """Rank-local ``[prev,next]`` tensor -> natural-order tensor.
 
     ``tensor_model_parallel_all_gather`` concatenates rank-local tensors in rank
     order: ``[r0_prev, r0_next, r1_prev, r1_next, ...]``. ``inv_gather_index``
-    reranges that concatenation back to ``[token0, token1, ..., token_{T-1}]``.
+    (the layer's own plan, ``DSACPContext.inv_gather_index``) reranges that
+    concatenation back to ``[token0, token1, ..., token_{T-1}]``.
 
     ``num_tokens`` trims the trailing SP padding rows exactly like the
-    non-zigzag model-boundary gather does, so every consumer sees the same row
-    count as before (natural token order, unpadded).
+    contiguous-slice path does, so the attention puts the same row count back
+    into the replicated model stream.
     """
-    ctx = get_zigzag_cp_context()
-    assert ctx is not None and ctx.inv_gather_index is not None
+    rows = int(inv_gather_index.shape[0])
+    input_rows = int(x.shape[0])
+    if input_rows == 0 or rows % input_rows != 0:
+        raise RuntimeError(
+            f"zigzag gather expects num_tokens_pad ({rows}) to be a multiple of "
+            f"the rank-local rows ({input_rows})"
+        )
     if get_tensor_model_parallel_world_size() == 1:
         gathered = x
     else:
-        gathered = tensor_model_parallel_all_gather(x, 0)
-    full = gathered[ctx.inv_gather_index].contiguous()
+        gathered = tensor_model_parallel_all_gather(x.contiguous(), 0)
+    if int(gathered.shape[0]) != rows:
+        raise RuntimeError(
+            f"zigzag gather got {int(gathered.shape[0])} gathered rows, expected {rows}"
+        )
+    full = gathered[inv_gather_index].contiguous()
     if num_tokens is not None:
         full = full[:num_tokens]
     return full
-
-
-def zigzag_gather_hidden_states_list(hidden_states_list, num_tokens: int | None = None):
-    return [zigzag_gather_tensor(h, num_tokens) for h in hidden_states_list]
-
-
-def zigzag_gather_hidden_states_and_aux(hidden_states, num_tokens: int | None = None):
-    """Model-boundary gather + rerange for ``(hidden_states[, aux_list])``."""
-    if isinstance(hidden_states, tuple):
-        return (
-            zigzag_gather_tensor(hidden_states[0], num_tokens),
-            zigzag_gather_hidden_states_list(hidden_states[1], num_tokens),
-        )
-    return zigzag_gather_tensor(hidden_states, num_tokens)

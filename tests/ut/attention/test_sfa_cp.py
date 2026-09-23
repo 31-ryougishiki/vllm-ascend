@@ -492,7 +492,7 @@ def test_sfa_pcp_prefill_gathers_weight_and_restores_local_view() -> None:
     full_weight = impl.o_proj_weight_state.gather_parts["weight"].full_tensor
     full_weight.copy_(torch.arange(12, dtype=torch.float32).view(3, 4))
 
-    def fake_finalize(_self, _attn_output, output, _gather_full_o_proj):
+    def fake_finalize(_self, _attn_output, output, _gather_full_o_proj, _inv_gather_index=None):
         assert impl.o_proj.weight.data_ptr() == full_weight.data_ptr()
         output.fill_(7)
         return output

@@ -9,7 +9,6 @@ from vllm.distributed import (
     get_tensor_model_parallel_world_size,
     tensor_model_parallel_all_gather,
 )
-from vllm.distributed.parallel_state import get_tp_group
 from vllm.model_executor.layers.layernorm import RMSNorm
 from vllm.model_executor.layers.linear import (
     ColumnParallelLinear,
@@ -33,8 +32,6 @@ from vllm.model_executor.models.deepseek_v2 import (
 from vllm.model_executor.models.utils import extract_layer_index
 from vllm.sequence import IntermediateTensors
 
-from vllm_ascend import envs as ascend_envs
-from vllm_ascend.layers.cp_zigzag import zigzag_shard_tensor
 from vllm_ascend.utils import is_mtp_layer
 
 
@@ -308,81 +305,19 @@ def _patched_forward(
     intermediate_tensors: IntermediateTensors | None,
     inputs_embeds: torch.Tensor | None = None,
 ) -> torch.Tensor | IntermediateTensors:
-    from vllm_ascend.ascend_forward_context import _EXTRA_CTX
-
-    zigzag_active = bool(_EXTRA_CTX.zigzag_cp_active)
-    # Natural-order, SP-padded token count of the incoming stream.  The model
-    # boundary must hand the runner exactly this many rows, like the
-    # non-zigzag gather does, so logits/sampling indices stay valid.
-    full_num_tokens = positions.shape[0]
-
-    hidden_is_zigzag_local = False
-    use_embed_local = (
-        zigzag_active
-        and ascend_envs.VLLM_ASCEND_CP_BALANCE_EMBED_LOCAL
-        and hasattr(self.embed_tokens, "forward_zigzag_local")
-    )
-    tp_size = get_tensor_model_parallel_world_size()
-    tp_rank = get_tp_group().rank_in_group
-    expected_local_tokens = positions.shape[0] // tp_size if zigzag_active else None
-
     if get_pp_group().is_first_rank:
         if inputs_embeds is not None:
             hidden_states = inputs_embeds
         else:
             if input_ids is None:
                 raise ValueError("Either input_ids or inputs_embeds must be provided to DeepseekV2Model.forward")
-            if use_embed_local:
-                # Experimental path (VLLM_ASCEND_CP_BALANCE_EMBED_LOCAL=1):
-                # every rank feeds the same full SP-padded token ids to the
-                # vocab-parallel embedding, which all-reduces the sharded
-                # partials into complete embeddings and returns only this
-                # rank's zigzag rows.  Never pass the rank-local ids here: the
-                # TP all-reduce would sum embeddings of different tokens.
-                if input_ids.shape[0] != positions.shape[0]:
-                    raise RuntimeError(
-                        f"[CP_BALANCE][EMBED] rank={tp_rank} zigzag "
-                        f"input_ids shape {tuple(input_ids.shape)} is not the "
-                        f"full padded stream {tuple(positions.shape)}"
-                    )
-                hidden_states = self.embed_tokens.forward_zigzag_local(input_ids)
-                hidden_is_zigzag_local = True
-            else:
-                hidden_states = self.embed_input_ids(input_ids)
+            hidden_states = self.embed_input_ids(input_ids)
         residual = None
-        if zigzag_active and not hidden_is_zigzag_local:
-            if hidden_states.shape[0] != positions.shape[0]:
-                # AscendVocabParallelEmbedding under FlashComm/SP ends with
-                # maybe_pad_and_reduce: it returns a TP-reduce-scattered
-                # rank-local continuous slice, NOT the full padded
-                # natural-order embedding.  zigzag_shard_tensor indexes with
-                # global natural positions, so it must consume the full
-                # tensor.  Gather the embedding back to full padded length
-                # before applying the zigzag shard.  ``positions`` is still
-                # the full padded tensor, so the shape check also avoids a
-                # double gather when embedding already returns full rows.
-                hidden_states = tensor_model_parallel_all_gather(hidden_states, 0)
-            hidden_states = zigzag_shard_tensor(hidden_states)
-            if hidden_states.shape[0] != expected_local_tokens:
-                raise RuntimeError(
-                    f"[CP_BALANCE][EMBED] rank={tp_rank} zigzag hidden "
-                    f"shard shape {tuple(hidden_states.shape)} != expected "
-                    f"{expected_local_tokens}"
-                )
     else:
         assert intermediate_tensors is not None
         hidden_states = intermediate_tensors["hidden_states"]
         residual = intermediate_tensors["residual"]
-        # The previous PP stage already returned the rank-local zigzag order.
 
-    if zigzag_active:
-        positions = zigzag_shard_tensor(positions)
-        if positions.shape[0] != expected_local_tokens:
-            raise RuntimeError(
-                f"[CP_BALANCE][EMBED] rank={tp_rank} zigzag positions "
-                f"shape {tuple(positions.shape)} != expected "
-                f"{expected_local_tokens}"
-            )
     llama_4_scaling_config = getattr(self.config, "llama_4_scaling", None)
     llama_4_scaling: torch.Tensor | None
     if llama_4_scaling_config is not None:
@@ -401,7 +336,7 @@ def _patched_forward(
     ):
         if idx in self.aux_hidden_state_layers:
             aux_hidden_state = hidden_states + residual
-            if not zigzag_active and aux_hidden_state.shape[0] != positions.shape[0]:
+            if aux_hidden_state.shape[0] != positions.shape[0]:
                 aux_hidden_state = tensor_model_parallel_all_gather(aux_hidden_state, 0)
                 aux_hidden_state = aux_hidden_state[: positions.shape[0]]
             aux_hidden_states.append(aux_hidden_state)
@@ -410,7 +345,7 @@ def _patched_forward(
     if not get_pp_group().is_last_rank:
         return IntermediateTensors({"hidden_states": hidden_states, "residual": residual})
 
-    if not zigzag_active and hidden_states.shape[0] != positions.shape[0]:
+    if hidden_states.shape[0] != positions.shape[0]:
         combined_states = torch.cat([hidden_states, residual], dim=-1)
         combined_states = tensor_model_parallel_all_gather(combined_states, 0)
         combined_states = combined_states[: positions.shape[0]]
@@ -422,29 +357,16 @@ def _patched_forward(
         aux_hidden_states.append(hidden_states + residual)
 
     hidden_states, _ = self.norm(hidden_states, residual)
-    if zigzag_active:
-        # The runner no longer owns the model-boundary gather (FlashComm v1 was
-        # removed), so the zigzag layout has to undo itself here: one TP
-        # all-gather of the rank-local [prev, next] rows followed by the
-        # inverse permutation back to natural token order.
-        from vllm_ascend.layers.cp_zigzag import zigzag_gather_hidden_states_and_aux
-
-        if len(aux_hidden_states) > 0:
-            return zigzag_gather_hidden_states_and_aux(
-                (hidden_states, aux_hidden_states), full_num_tokens
-            )
-        hidden_states = zigzag_gather_hidden_states_and_aux(hidden_states, full_num_tokens)
     if len(aux_hidden_states) > 0:
         return hidden_states, aux_hidden_states
     return hidden_states
 
 
-# DeepseekV2DecoderLayer.forward is deliberately NOT patched: the zigzag
-# layout keeps every token rank-local, so the upstream sequence-parallel
-# branches (input all_gather / post-attention reduce_scatter, both guarded by
-# ``self.use_sequence_parallel_moe``) must simply not fire.  They cannot:
-# ``parallel_config.use_sequence_parallel_moe`` requires data_parallel_size > 1
-# (vllm/config/parallel.py:653-668) and the zigzag eligibility gate rejects
-# dp_size > 1 (layers/cp_zigzag.py:zigzag_ineligible_reason).  If that gate
-# ever loosens, this file has to patch the layer again.
+# cp_balance never changes this model boundary: the zigzag layout is an
+# attention-internal row ownership
+# (`AscendSFADSACPImpl._prepare_native_hidden_states` selects this rank's rows,
+# `_finalize_o_proj` gathers the replicated natural-order stream back).  Every
+# layer therefore sees the same full replicated token stream as the
+# continuous-slice DSA-CP layout, so MLP/MoE collectives stay per-token
+# identical between B and C.
 DeepseekV2Model.forward = _patched_forward

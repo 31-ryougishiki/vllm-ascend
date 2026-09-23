@@ -1,18 +1,20 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vllm-ascend project
-"""Model-level zigzag CP balance planning for the DSA-CP metadata paths.
+"""Zigzag CP balance planning for the DSA-CP metadata paths.
 
 The SFA metadata builder and the indexer metadata builder both shard the
 scheduled tokens over the TP group, and both have to agree on the exact token
-order of one prefill batch: the model boundary, the KV/indexer cache writes and
-the attention kernels all consume the rank-local rows.  This module is the
+order of one prefill batch: the attention kernels and the KV/indexer cache
+writes of the rank all consume the same rank-local rows.  This module is the
 single place that turns a batch into that order, so the two builders cannot
 drift apart.
 
-Zigzag replaces the contiguous ``[local_start, local_end_with_pad)`` slice with
-a head/tail pairing per sequence: every sequence is cut into ``2 * cp_size``
-blocks and rank ``r`` owns block ``r`` and block ``2 * cp_size - 1 - r``.  The
-per-rank row count stays exactly ``num_tokens_pad / cp_size`` (see
+The model stream itself stays full, natural-ordered and replicated, exactly
+like the contiguous-slice layout; zigzag only replaces the
+``[local_start, local_end_with_pad)`` work window with a head/tail pairing per
+sequence: every sequence is cut into ``2 * cp_size`` blocks and rank ``r`` owns
+block ``r`` and block ``2 * cp_size - 1 - r``.  The per-rank row count stays
+exactly ``num_tokens_pad / cp_size`` (see
 :func:`vllm_ascend.layers.cp_zigzag.build_zigzag_plan`), so every collective
 keeps its shape while the causal attention work is balanced.
 """
