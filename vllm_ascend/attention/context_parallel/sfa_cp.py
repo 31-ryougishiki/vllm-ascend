@@ -847,22 +847,14 @@ class AscendSFADSACPImpl(OProjWeightSwitchMixin, AscendSFAImpl):
 
                 if zigzag_inv_gather_index is not None:
                     # The full o_proj weight already gives each of this rank's
-                    # [prev, next] rows its complete projection, so the same
-                    # rank-concatenating all-gather as the continuous path is
-                    # enough - only the row order differs, and the layer's own
-                    # inverse permutation reranges it back to the natural-order
-                    # replicated model stream.
-                    full_output = zigzag_gather_tensor(
-                        local_output, zigzag_inv_gather_index, output.shape[0]
+                    # [prev, next] rows its complete projection. The exit is written
+                    # straight into the replicated stream buffer with the plan's
+                    # inverse permutation fused into that single write (see
+                    # zigzag_gather_tensor), so it costs the same as the
+                    # contiguous-slice path.
+                    return zigzag_gather_tensor(
+                        local_output, zigzag_inv_gather_index, output.shape[0], out=output
                     )
-                    if full_output.shape[0] != output.shape[0] or full_output.shape[1:] != output.shape[1:]:
-                        raise RuntimeError(
-                            "SFA DSA-CP zigzag gathered output does not match the "
-                            f"replicated model state, got {tuple(full_output.shape)} "
-                            f"and expected {tuple(output.shape)}."
-                        )
-                    output[...] = full_output
-                    return output
                 tp_group = get_tp_group()
                 if not self.o_proj.reduce_results:
                     # The decoder's sequence-parallel path will reduce-scatter

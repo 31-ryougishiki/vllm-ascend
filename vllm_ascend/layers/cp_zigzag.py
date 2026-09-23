@@ -29,8 +29,12 @@ from typing import Any, Sequence
 
 import torch
 from vllm.distributed import get_tensor_model_parallel_world_size, tensor_model_parallel_all_gather
+from vllm.logger import init_logger
 
 from vllm_ascend import envs as ascend_envs
+
+logger = init_logger(__name__)
+
 
 # Attention states in which every scheduled token belongs to a prompt.  Mixed
 # prefill/decode and speculative states are intentionally excluded.
@@ -562,18 +566,23 @@ def zigzag_ineligible_reason(
 def zigzag_gather_tensor(
     x: torch.Tensor,
     inv_gather_index: torch.Tensor,
-    num_tokens: int | None = None,
+    num_tokens: int,
+    out: torch.Tensor,
 ) -> torch.Tensor:
-    """Rank-local ``[prev,next]`` tensor -> natural-order tensor.
+    """Write this rank's ``[prev,next]`` rows into ``out`` in natural order.
 
     ``tensor_model_parallel_all_gather`` concatenates rank-local tensors in rank
-    order: ``[r0_prev, r0_next, r1_prev, r1_next, ...]``. ``inv_gather_index``
-    (the layer's own plan, ``DSACPContext.inv_gather_index``) reranges that
-    concatenation back to ``[token0, token1, ..., token_{T-1}]``.
+    order: ``[r0_prev, r0_next, r1_prev, r1_next, ...]`` and
+    ``inv_gather_index`` (the layer's own plan, ``DSACPContext.inv_gather_index``)
+    maps natural position -> row of that concatenation.  Instead of building the
+    reranged tensor and copying it into ``out`` (two extra full-size passes), the
+    permutation is fused into the single write into ``out`` with
+    ``index_select(..., out=)``; the copy fallback keeps the same result on
+    backends without the out variant.
 
-    ``num_tokens`` trims the trailing SP padding rows exactly like the
-    contiguous-slice path does, so the attention puts the same row count back
-    into the replicated model stream.
+    ``num_tokens`` is the replicated stream row count (``out.shape[0]``): the
+    trailing SP padding rows are dropped exactly like the contiguous-slice path
+    does.
     """
     rows = int(inv_gather_index.shape[0])
     input_rows = int(x.shape[0])
@@ -581,6 +590,11 @@ def zigzag_gather_tensor(
         raise RuntimeError(
             f"zigzag gather expects num_tokens_pad ({rows}) to be a multiple of "
             f"the rank-local rows ({input_rows})"
+        )
+    if int(out.shape[0]) != num_tokens or num_tokens > rows:
+        raise RuntimeError(
+            f"zigzag gather expects an output buffer of {min(num_tokens, rows)} rows "
+            f"for num_tokens={num_tokens} of {rows} padded rows, got {tuple(out.shape)}"
         )
     if get_tensor_model_parallel_world_size() == 1:
         gathered = x
@@ -590,7 +604,13 @@ def zigzag_gather_tensor(
         raise RuntimeError(
             f"zigzag gather got {int(gathered.shape[0])} gathered rows, expected {rows}"
         )
-    full = gathered[inv_gather_index].contiguous()
-    if num_tokens is not None:
-        full = full[:num_tokens]
-    return full
+    index = inv_gather_index[:num_tokens]
+    try:
+        torch.index_select(gathered, 0, index, out=out)
+    except (RuntimeError, NotImplementedError):
+        logger.warning_once(
+            "zigzag gather: index_select(out=) unavailable on this device; "
+            "falling back to gather+copy"
+        )
+        out.copy_(gathered[index])
+    return out
