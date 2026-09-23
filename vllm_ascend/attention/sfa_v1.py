@@ -1720,6 +1720,10 @@ class AscendSFAImpl(MLAAttentionImpl):
         else:
             assert self.fused_qkv_a_proj is not None, "q lora is required for DSA."
             hidden_states = self._prepare_native_hidden_states(hidden_states, attn_metadata)
+            if self.g_proj is not None:
+                # DSA-CP narrows the stream to this rank's rows here, so the
+                # gate projection has to consume the same rows as the query.
+                gate_hidden_states = hidden_states
             qkv_lora = self.fused_qkv_a_proj(hidden_states)[0]
             q_c, kv_no_split = qkv_lora.split(
                 [self.q_lora_rank, self.kv_lora_rank + self.qk_rope_head_dim],
